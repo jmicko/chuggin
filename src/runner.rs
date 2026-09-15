@@ -151,7 +151,7 @@ pub fn init(path: &Path, repo: &Path, goal: &str) -> Result<()> {
         path,
         &json!({
             "repo":repo,"goal":goal,"checks":[{"argv":argv,"timeout_seconds":120}],
-            "state_dir":".lupin"
+            "state_dir":".chuggin"
         }),
     )?;
     crate::events::log(format!(
@@ -193,7 +193,7 @@ fn checks(
                     .is_some_and(|n| n > 0)
             })
         {
-            result.output.push_str("\nLupin: ZERO tests executed. New .rs files are not compiled automatically. Wire modules from src/lib.rs (pub mod ...) or src/main.rs (mod ...), then run checks again. A green empty suite does not verify new source files.\n");
+            result.output.push_str("\nChuggin: ZERO tests executed. New .rs files are not compiled automatically. Wire modules from src/lib.rs (pub mod ...) or src/main.rs (mod ...), then run checks again. A green empty suite does not verify new source files.\n");
         }
     }
     Ok(results)
@@ -464,7 +464,7 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
     emit(
         art,
         "run",
-        &json!({"lupin_version":env!("CARGO_PKG_VERSION"),"started_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),"base_commit":s.accepted_ref}),
+        &json!({"chuggin_version":env!("CARGO_PKG_VERSION"),"started_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),"base_commit":s.accepted_ref}),
     )?;
     emit(art, "prompt-version", &crate::prompts::VERSION)?;
     let mut research = crate::web_tools::Research::default();
@@ -535,7 +535,7 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
     crate::events::log(format!("Cycle {}: {}", s.cycle, task.title));
     normalize_task(&mut task);
     emit(art, "task", &task)?;
-    let branch = format!("codex/lupin-{}-{}", s.run_id, s.cycle);
+    let branch = format!("codex/chuggin-{}-{}", s.run_id, s.cycle);
     let workspace = art.join("workspace");
     project::git(
         &c.repo,
@@ -865,16 +865,16 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
             &workspace,
             &[
                 "-c",
-                "user.name=Lupin",
+                "user.name=Chuggin",
                 "-c",
-                "user.email=lupin@localhost",
+                "user.email=chuggin@localhost",
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
                 "commit.gpgsign=false",
                 "commit",
                 "-m",
-                &format!("lupin: {}", project::excerpt(&task.title, 100)),
+                &format!("chuggin: {}", project::excerpt(&task.title, 100)),
             ],
         )?;
         s.accepted_ref = project::git(&workspace, &["rev-parse", "HEAD"])?;
@@ -922,7 +922,7 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
         use std::os::fd::AsRawFd;
         anyhow::ensure!(
             unsafe { libc::flock(_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "Another Lupin process is already running this project"
+            "Another Chuggin process is already running this project"
         );
     }
     let state_path = state_dir.join("state.json");
@@ -1107,7 +1107,7 @@ mod scope_tests {
         );
         assert!(extend_source_access(&mut task, dir.path(), ".git/config", "dependency").is_err());
         assert!(
-            extend_source_access(&mut task, dir.path(), "lupin.json", "change checks").is_err()
+            extend_source_access(&mut task, dir.path(), "chuggin.json", "change checks").is_err()
         );
         assert!(
             extend_source_access(&mut task, dir.path(), "src/missing.rs", "dependency").is_err()
@@ -1344,7 +1344,7 @@ fn independent_probe(
             "Probe must be a bounded Rust test"
         );
         syn::parse_file(&probe.code).context("Probe did not contain valid Rust syntax")?;
-        let path = format!("tests/lupin_regression_{cycle}.rs");
+        let path = format!("tests/chuggin_regression_{cycle}.rs");
         anyhow::ensure!(!workspace.join(&path).exists(), "Probe path already exists");
         project::write(workspace, &path, &probe.code)?;
         let mut bounded = c.clone();
@@ -1353,7 +1353,7 @@ fn independent_probe(
                 "cargo".into(),
                 "test".into(),
                 "--test".into(),
-                format!("lupin_regression_{cycle}"),
+                format!("chuggin_regression_{cycle}"),
                 "--".into(),
                 "--nocapture".into(),
             ],

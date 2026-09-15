@@ -40,7 +40,26 @@ pub fn settings_path() -> Result<PathBuf> {
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
         .context("Cannot locate user configuration directory")?;
-    Ok(base.join("lupin/settings.json"))
+    migrate_settings(&base)?;
+    Ok(base.join("chuggin/settings.json"))
+}
+fn migrate_settings(base: &Path) -> Result<()> {
+    let old = base.join("lupin");
+    let new = base.join("chuggin");
+    if !new.exists() && old.join("settings.json").is_file() {
+        fs::create_dir_all(&new)?;
+        // Never overwrite a new installation or reimport a key the user removed.
+        if let Ok(key) = fs::read_to_string(old.join("brave.key"))
+            && !key.trim().is_empty()
+        {
+            crate::web_tools::save_key(&new.join("brave.key"), &key)?;
+        }
+        save(
+            &new.join("settings.json"),
+            &serde_json::from_slice::<Settings>(&fs::read(old.join("settings.json"))?)?,
+        )?;
+    }
+    Ok(())
 }
 pub fn settings() -> Result<Settings> {
     let p = settings_path()?;
@@ -107,7 +126,7 @@ pub fn configure(show: bool) -> Result<()> {
         return Ok(());
     }
     crate::ui::notice(
-        "Lupin · Shared settings\nThese defaults apply to every project unless overridden."
+        "Chuggin · Shared settings\nThese defaults apply to every project unless overridden."
             .to_string(),
     );
     loop {
@@ -189,9 +208,11 @@ pub fn configure(show: bool) -> Result<()> {
 pub fn find_project() -> Result<Option<PathBuf>> {
     let cwd = std::env::current_dir()?;
     for p in cwd.ancestors() {
-        let config = p.join("lupin.json");
-        if config.is_file() {
-            return Ok(Some(config));
+        for name in ["chuggin.json", "lupin.json"] {
+            let config = p.join(name);
+            if config.is_file() {
+                return Ok(Some(config));
+            }
         }
         if p.join(".git").exists() {
             break;
@@ -212,13 +233,13 @@ struct GoalReply {
 }
 pub fn wizard() -> Result<PathBuf> {
     let root = std::env::current_dir()?;
-    let config = root.join("lupin.json");
+    let config = root.join("chuggin.json");
     anyhow::ensure!(
-        !config.exists(),
-        "Project already configured; run lupin to resume."
+        !config.exists() && !root.join("lupin.json").exists(),
+        "Project already configured; run chuggin to resume."
     );
     crate::ui::notice(format!(
-        "\nLupin · Get started\nProject: {}\n",
+        "\nChuggin · Get started\nProject: {}\n",
         root.display()
     ));
     if !settings_path()?.exists() || settings()?.model.trim().is_empty() {
@@ -229,7 +250,7 @@ pub fn wizard() -> Result<PathBuf> {
         "Using {} on {} (change from Settings on the home menu).",
         s.model, s.ollama_url
     ));
-    let draft_path = root.join(".lupin/goal-draft.json");
+    let draft_path = root.join(".chuggin/goal-draft.json");
     let mut draft = if draft_path.exists() {
         crate::ui::notice("Resuming your unfinished goal draft.".to_string());
         serde_json::from_slice::<Draft>(&fs::read(&draft_path)?)?
@@ -301,7 +322,7 @@ pub fn wizard() -> Result<PathBuf> {
         draft.feedback = action;
         save(&draft_path, &draft)?;
     }
-    crate::ui::notice("\nChoose a check Lupin must pass before accepting changes.\nFor a new Rust project, cargo test starts failing until the project is created.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
+    crate::ui::notice("\nChoose a check Chuggin must pass before accepting changes.\nFor a new Rust project, cargo test starts failing until the project is created.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
     let check = loop {
         let text = ask("Validation command", "cargo test")?;
         match shell_words::split(&text) {
@@ -326,7 +347,7 @@ pub fn wizard() -> Result<PathBuf> {
         &["rev-parse", "--git-path", "info/exclude"],
     )?);
     let mut ignored = fs::read_to_string(&exclude).unwrap_or_default();
-    for entry in ["/.lupin/", "/lupin.json"] {
+    for entry in ["/.chuggin/", "/chuggin.json", "/.lupin/", "/lupin.json"] {
         if !ignored.lines().any(|line| line == entry) {
             ignored.push_str(&format!("\n{entry}\n"));
         }
@@ -336,7 +357,13 @@ pub fn wizard() -> Result<PathBuf> {
     }
     fs::write(exclude, ignored)?;
     if project::git(&root, &["rev-parse", "HEAD"]).is_err() {
-        let scope = [".", ":(exclude).lupin", ":(exclude)lupin.json"];
+        let scope = [
+            ".",
+            ":(exclude).chuggin",
+            ":(exclude)chuggin.json",
+            ":(exclude).lupin",
+            ":(exclude)lupin.json",
+        ];
         let mut list = vec![
             "ls-files",
             "--cached",
@@ -354,7 +381,7 @@ pub fn wizard() -> Result<PathBuf> {
             .map(|p| format!(":(literal){p}"))
             .collect();
         if has_files {
-            crate::ui::notice("\nThis project has no commits yet. Lupin can commit all project files as its starting point. Git-ignored files and Lupin's local state are excluded.\n".to_string());
+            crate::ui::notice("\nThis project has no commits yet. Chuggin can commit all project files as its starting point. Git-ignored files and Chuggin's local state are excluded.\n".to_string());
             for file in files.split('\0').filter(|s| !s.is_empty()).take(40) {
                 crate::ui::notice(format!("  {file}"));
             }
@@ -382,9 +409,9 @@ pub fn wizard() -> Result<PathBuf> {
         }
         let mut commit = vec![
             "-c",
-            "user.name=Lupin",
+            "user.name=Chuggin",
             "-c",
-            "user.email=lupin@localhost",
+            "user.email=chuggin@localhost",
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
@@ -392,7 +419,7 @@ pub fn wizard() -> Result<PathBuf> {
             "commit",
             "--allow-empty",
             "-m",
-            "Initialize Lupin project",
+            "Initialize Chuggin project",
         ];
         if has_files {
             commit.extend(["--only", "--"]);
@@ -406,7 +433,7 @@ pub fn wizard() -> Result<PathBuf> {
     }
     save(
         &config,
-        &json!({"repo":".","goal":draft.goal,"state_dir":".lupin",
+        &json!({"repo":".","goal":draft.goal,"state_dir":".chuggin",
         "checks":[{"argv":check,"timeout_seconds":timeout}]}),
     )?;
     // Check merged project/global settings before starting.
@@ -585,7 +612,7 @@ pub fn settings_menu() -> Result<()> {
 }
 
 fn draft_recovery(root: &Path, detail: &str) -> Result<()> {
-    let log = root.join(".lupin/goal-error.txt");
+    let log = root.join(".chuggin/goal-error.txt");
     fs::write(&log, detail)?;
     crate::ui::notice(format!(
         "\nCouldn't finish drafting your goal. Your pitch and any earlier draft are saved.\nDetails: {}",

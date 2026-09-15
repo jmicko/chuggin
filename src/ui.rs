@@ -144,7 +144,7 @@ pub fn notice(text: String) {
     let _ = draw(|f| {
         base(f);
         let a = f.area().inner(Margin::new(3, 2));
-        f.render_widget(p(text).block(panel("LUPIN · Working")), a);
+        f.render_widget(p(text).block(panel("CHUGGIN · Working")), a);
     });
 }
 pub fn clear_notes() {
@@ -171,7 +171,7 @@ fn cancelled(k: event::KeyEvent) -> bool {
         || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
 }
 
-const LOGO: &str = "██╗     ██╗   ██╗██████╗ ██╗███╗   ██╗\n██║     ██║   ██║██╔══██╗██║████╗  ██║\n██║     ██║   ██║██████╔╝██║██╔██╗ ██║\n██║     ██║   ██║██╔═══╝ ██║██║╚██╗██║\n███████╗╚██████╔╝██║    ██║██║ ╚████║\n╚══════╝ ╚═════╝ ╚═╝    ╚═╝╚═╝  ╚═══╝";
+const LOGO: &str = " ██████╗██╗  ██╗██╗   ██╗ ██████╗  ██████╗ ██╗███╗   ██╗\n██╔════╝██║  ██║██║   ██║██╔════╝ ██╔════╝ ██║████╗  ██║\n██║     ███████║██║   ██║██║  ███╗██║  ███╗██║██╔██╗ ██║\n██║     ██╔══██║██║   ██║██║   ██║██║   ██║██║██║╚██╗██║\n╚██████╗██║  ██║╚██████╔╝╚██████╔╝╚██████╔╝██║██║ ╚████║\n ╚═════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝  ╚═════╝ ╚═╝╚═╝  ╚═══╝";
 fn splash(
     f: &mut Frame,
     items: &[String],
@@ -188,10 +188,10 @@ fn splash(
         Constraint::Length(2),
     ])
     .split(area);
-    let logo = if area.height >= 28 && area.width >= 42 {
+    let logo = if area.height >= 28 && area.width >= 58 {
         LOGO
     } else {
-        "L U P I N"
+        "C H U G G I N"
     };
     let logo_width = Text::raw(logo).width().min(rows[0].width as usize) as u16;
     let logo_area = Rect::new(
@@ -298,7 +298,7 @@ pub fn select(title: &str, items: &[String], default: usize) -> Result<Option<us
             ])
             .split(a);
             f.render_widget(
-                Paragraph::new("LUPIN  /  ".to_owned() + title)
+                Paragraph::new("CHUGGIN  /  ".to_owned() + title)
                     .fg(ACCENT)
                     .bold(),
                 r[0],
@@ -420,7 +420,7 @@ fn ask_field(label: &str, default: &str, secret: bool) -> Result<String> {
             ])
             .split(f.area().inner(Margin::new(3, 1)));
             f.render_widget(
-                Paragraph::new("LUPIN  /  ".to_owned() + label)
+                Paragraph::new("CHUGGIN  /  ".to_owned() + label)
                     .fg(ACCENT)
                     .bold(),
                 r[0],
@@ -664,7 +664,7 @@ impl Dashboard {
         }
         d.push(
             Kind::Activity,
-            "Session started. Full diagnostic history remains in .lupin/.".into(),
+            "Session started. Full diagnostic history remains in .chuggin/.".into(),
         );
         d
     }
@@ -859,7 +859,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     base(f);
     let a = f.area().inner(Margin::new(1, 0));
     if a.height < 14 || a.width < 44 {
-        f.render_widget(p("LUPIN\n\nResize to at least 46 × 14 to view the dashboard.\nThe agent continues working.\n\nCtrl+C: finish cycle; again: force stop").fg(ACCENT),a);
+        f.render_widget(p("CHUGGIN\n\nResize to at least 46 × 14 to view the dashboard.\nThe agent continues working.\n\nCtrl+C: finish cycle; again: force stop").fg(ACCENT),a);
         return;
     }
     let r = Layout::vertical([
@@ -880,7 +880,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" LUPIN ", Style::default().fg(BG).bg(ACCENT).bold()),
+            Span::styled(" CHUGGIN ", Style::default().fg(BG).bg(ACCENT).bold()),
             Span::styled(
                 format!("  {state}  ·  cycle {}", d.cycle),
                 Style::default().fg(if stopping { GOLD } else { CYAN }),
@@ -1055,7 +1055,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     }
     let health = if d.resources.total_gib > 0. {
         format!(
-            " Local CPU {:>3.0}%  ·  RAM {:.0}% of {:.1} GiB  ·  Lupin {:.0} MiB  │  Ollama: {}",
+            " Local CPU {:>3.0}%  ·  RAM {:.0}% of {:.1} GiB  ·  Chuggin {:.0} MiB  │  Ollama: {}",
             d.resources.cpu,
             d.resources.memory,
             d.resources.total_gib,
@@ -1106,7 +1106,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             a.height * 2 / 3,
         );
         f.render_widget(Clear, area);
-        f.render_widget(p("Observe without interrupting work\n\n↑ / ↓ or mouse wheel    Scroll a few lines\nPgUp / PgDn             Scroll a page\nHome / End              Oldest / latest output\nF                       Resume live following\n1–4 or Tab              Live, model, checks, goal\n/                       Search the current view\nEsc                     Clear search / close help\nCtrl+C or Q             Finish this cycle, then stop\nCtrl+C again            Force stop immediately\n\nScrollback is bounded; complete logs stay in .lupin/.\nResources describe this computer, not the remote GPU.\nContext and token speed update after each model response.").block(panel("Keyboard guide · ? / Esc closes")),area);
+        f.render_widget(p("Observe without interrupting work\n\n↑ / ↓ or mouse wheel    Scroll a few lines\nPgUp / PgDn             Scroll a page\nHome / End              Oldest / latest output\nF                       Resume live following\n1–4 or Tab              Live, model, checks, goal\n/                       Search the current view\nEsc                     Clear search / close help\nCtrl+C or Q             Finish this cycle, then stop\nCtrl+C again            Force stop immediately\n\nScrollback is bounded; complete logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.\nContext and token speed update after each model response.").block(panel("Keyboard guide · ? / Esc closes")),area);
     }
 }
 
@@ -1295,7 +1295,7 @@ pub fn busy<T: Send + 'static>(
                         "{spinner} {label} · {}\n\n{tail}",
                         duration(started.elapsed().as_secs())
                     ))
-                    .block(panel("LUPIN · Working")),
+                    .block(panel("CHUGGIN · Working")),
                     area,
                 );
             })?;
@@ -1332,7 +1332,7 @@ mod tests {
         assert_eq!(e.value, "héllo\nworld");
     }
     fn config() -> runner::Config {
-        runner::Config {repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/lupin-ui-tests".into(),retry_seconds:10}
+        runner::Config {repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10}
     }
     fn screen_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();
@@ -1376,7 +1376,7 @@ mod tests {
             if w == 120 {
                 let text = screen_text(&t);
                 assert!(text.contains("Resume project"));
-                if let Ok(dir) = std::env::var("LUPIN_UI_SNAPSHOTS") {
+                if let Ok(dir) = std::env::var("CHUGGIN_UI_SNAPSHOTS") {
                     fs::create_dir_all(&dir).unwrap();
                     fs::write(Path::new(&dir).join("splash.txt"), text).unwrap();
                 }
@@ -1404,7 +1404,7 @@ mod tests {
             }
             if w == 120 {
                 assert!(text.contains("following live"));
-                if let Ok(dir) = std::env::var("LUPIN_UI_SNAPSHOTS") {
+                if let Ok(dir) = std::env::var("CHUGGIN_UI_SNAPSHOTS") {
                     fs::write(Path::new(&dir).join("dashboard.txt"), text).unwrap();
                 }
             }

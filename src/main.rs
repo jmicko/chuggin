@@ -41,7 +41,7 @@ enum Command {
     },
     /// Write a project configuration without interactive goal drafting.
     Init {
-        #[arg(long, default_value = "lupin.json")]
+        #[arg(long, default_value = "chuggin.json")]
         config: PathBuf,
         #[arg(long)]
         repo: PathBuf,
@@ -50,7 +50,7 @@ enum Command {
     },
     /// Run a bounded experiment, or use --forever.
     Run {
-        #[arg(long, default_value = "lupin.json")]
+        #[arg(long, default_value = "chuggin.json")]
         config: PathBuf,
         #[arg(long, default_value_t = 1)]
         cycles: u64,
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
         if !active.load(Ordering::SeqCst) || flag.swap(true, Ordering::SeqCst) {
             ui::restore();
             project::kill_active_check();
-            eprintln!("Stopped. Run lupin again to resume from saved progress.");
+            eprintln!("Stopped. Run chuggin again to resume from saved progress.");
             std::process::exit(130);
         }
         events::log("Stop requested: finishing this loop, then saving and exiting. Press Ctrl-C again to stop immediately.".into());
@@ -89,7 +89,7 @@ fn main() -> Result<()> {
         Some(Command::Status { config }) => {
             let path = config
                 .or(setup::find_project()?)
-                .unwrap_or(PathBuf::from("lupin.json"));
+                .unwrap_or(PathBuf::from("chuggin.json"));
             runner::status(&path)
         }
         Some(Command::Run {
@@ -102,6 +102,11 @@ fn main() -> Result<()> {
                 "Use --forever or a positive --cycles count"
             );
             running.store(true, Ordering::SeqCst);
+            let config = if config == std::path::Path::new("chuggin.json") && !config.exists() {
+                setup::find_project()?.unwrap_or(config)
+            } else {
+                config
+            };
             runner::run(&config, if forever { None } else { Some(cycles) }, stopped)
         }
     }

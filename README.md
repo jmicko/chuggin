@@ -1,4 +1,4 @@
-# Lupin
+# Chuggin
 
 A Rust terminal tool for building large projects with small local models through
 an indefinite sequence of focused tasks.
@@ -7,7 +7,7 @@ an indefinite sequence of focused tasks.
 
 ## Install from source
 
-Lupin is currently tested on Linux. Install a recent stable Rust toolchain and
+Chuggin is currently tested on Linux. Install a recent stable Rust toolchain and
 Git, and have an Ollama server with a tool-capable chat model available.
 From a checkout of this repository:
 
@@ -17,14 +17,14 @@ cargo install --path . --locked
 
 This installs one Rust executable into Cargo's bin directory (normally
 ~/.cargo/bin). Make sure that directory is on PATH. No Python runtime is used.
-This project is not published on crates.io; the existing package named
-`lupin` is a different project. Use the source-install command above.
+The first crates.io release is being prepared. Until it is published, use the
+source-install command above.
 
 ## Start
 
 ~~~sh
 cd your-project
-lupin
+chuggin
 ~~~
 
 The arrow-key menu highlights **Set up this project** or **Resume project**.
@@ -58,7 +58,7 @@ disk. Narrow windows hide the side panel, and resizing does not stop the run.
 Shell settings and the previous terminal screen are restored on exit.
 
 Updating the executable does not change an already-running process. The new UI
-appears the next time you launch Lupin. Explicit `lupin run` commands retain plain
+appears the next time you launch Chuggin. Explicit `chuggin run` commands retain plain
 output for scripts and redirected logs.
 
 New installations default to **http://localhost:11434**, with no model preselected.
@@ -71,7 +71,7 @@ Setup expands your elevator pitch into a project goal. Accept it or request
 changes; drafts persist across revisions and restarts. Choose a validation
 command, then Resume. Empty projects get an initial Git commit. For existing
 files without commits, setup offers to commit project files while respecting
-Git ignores and excluding Lupin's state.
+Git ignores and excluding Chuggin's state.
 
 First Ctrl-C finishes the current cycle and returns to the menu. Second Ctrl-C
 stops immediately. Subsequent runs resume saved progress with fresh conversations.
@@ -87,7 +87,7 @@ During setup, a single Ctrl-C exits.
    restart with current files, the task, and the latest check results. Passing
    new tests trigger an early handoff to verification rather than more tinkering.
 4. The harness runs the operator's configured checks. For changed Rust code, a
-   fresh stage proposes an extra public-API regression test. Lupin runs that test
+   fresh stage proposes an extra public-API regression test. Chuggin runs that test
    explicitly, retains valid tests, and gives compile errors one fresh test-only
    repair. Remaining noncompiling or timed-out probes are logged and removed. A valid failing test blocks acceptance and carries into repair.
 5. A fresh reviewer examines the task, diff, files, and actual results.
@@ -123,7 +123,7 @@ a file, make an exact targeted edit, and run configured checks. Long reads inclu
 continuation positions. Unique-match edits prevent accidental broad replacement.
 It can request an existing Rust dependency file when a necessary supporting change
 was omitted from the plan. The reason and expanded scope are logged and supplied
-to review; this does not permit changing Lupin configuration or Git control files.
+to review; this does not permit changing Chuggin configuration or Git control files.
 When an implementer repeatedly reads without editing, a fresh patch request asks
 for literal source replacements. The harness applies valid edits and reruns checks;
 a claim that something was fixed never substitutes for changes on disk.
@@ -145,7 +145,7 @@ Goal-drafting failures preserve the pitch and offer Retry, Settings, or Back.
 Implementation can use **run_command** with an executable and argument array,
 for example `["cargo", "test", "unicode"]` or `["cargo", "fmt"]`. Commands run
 in the attempt's workspace, with no implicit shell and no interactive stdin.
-The default timeout is 120 seconds; a call can select 1–600 seconds. Lupin
+The default timeout is 120 seconds; a call can select 1–600 seconds. Chuggin
 returns the exit code, timeout status, a bounded output tail, and a log ID.
 **read_command_log** retrieves the full log in chunks. Commands and checks share
 the live output view and process-group cleanup on completion, timeout, or force stop.
@@ -157,7 +157,7 @@ not execute tests. Command success does not substitute for the configured final
 checks or acceptance review; command-produced file changes still undergo scope review.
 Like configured checks, commands execute with the user's OS permissions. A Git
 worktree isolates project revisions; it is not an OS sandbox. The model is
-instructed to keep commands within its task and leave Git commits/state to Lupin.
+instructed to keep commands within its task and leave Git commits/state to Chuggin.
 
 Both discovery and implementation have **lookup_symbol**. It finds Rust types,
 functions, private/public methods, and name-based reference candidates, with
@@ -172,7 +172,7 @@ Open **Settings → Brave API key → Enter or replace key**. Entry is masked.
 Saving a key enables the web tools; the toggle can disable them without deleting
 it. **Test Brave connection** performs a real search and reports errors.
 
-The key is stored separately in ~/.config/lupin/brave.key (or the corresponding
+The key is stored separately in ~/.config/chuggin/brave.key (or the corresponding
 XDG directory) with owner-only permissions. It is not included in project
 configuration, prompts, or request logs. It is sent only to Brave's search API.
 
@@ -187,8 +187,8 @@ quotas apply to searches; keys are optional and web tools default to disabled.
 
 ## Settings and history
 
-Shared settings: ~/.config/lupin/settings.json, or
-$XDG_CONFIG_HOME/lupin/settings.json. Project-local lupin.json contains the accepted
+Shared settings: ~/.config/chuggin/settings.json, or
+$XDG_CONFIG_HOME/chuggin/settings.json. Project-local chuggin.json contains the accepted
 goal, repository, checks, and state location. Project overrides take precedence;
 shared settings are reloaded when starting a run.
 
@@ -197,8 +197,8 @@ Defaults: 32,768 context tokens, 4,096 output tokens, thinking disabled, and up 
 budget. Reaching the budget proceeds to verification and review, not a permanent
 pause. Model requests have a ten-minute timeout; checks have individual timeouts.
 
-.lupin/state.json points at the accepted commit and private workspace. Accepted
-branches are named codex/lupin-.... The original checkout is not overwritten or
+.chuggin/state.json points at the accepted commit and private workspace. Accepted
+branches are named codex/chuggin-.... The original checkout is not overwritten or
 automatically merged.
 Interrupted candidates with saved tasks are eligible for the same bounded,
 freshly verified recovery as rejected attempts.
@@ -225,7 +225,7 @@ All implementation and tests are Rust. Installation is one executable.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build --release
-install -m 755 target/release/lupin ~/.local/bin/lupin
+install -m 755 target/release/chuggin ~/.local/bin/chuggin
 ~~~
 
 Git and the target project's build/test tools must be on PATH. Ollama can run on
@@ -253,3 +253,11 @@ across longer runs before treating these changes as a performance improvement.
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
+
+## Upgrading from Lupin
+
+Chuggin also discovers existing `lupin.json` projects and resumes their original
+`.lupin` state in place. Historical worktrees and branch names stay valid. New
+projects use `chuggin.json` and `.chuggin`. Shared settings and Brave credentials
+are copied once from the old config directory on first use; existing Chuggin
+settings take precedence. The old files are left intact.

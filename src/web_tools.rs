@@ -262,7 +262,7 @@ fn fetch(raw: &str) -> Result<Value> {
             .timeout(Duration::from_secs(20))
             .redirect(Policy::none())
             .resolve_to_addrs(host, &addresses)
-            .user_agent("Lupin/0.4 documentation reader")
+            .user_agent("Chuggin/0.4 documentation reader")
             .build()?
             .get(url.clone())
             .send()?;

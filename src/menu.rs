@@ -33,7 +33,7 @@ pub fn pause() -> Result<()> {
 pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
     anyhow::ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
-        "Open lupin in a terminal to use the menu. For unattended runs use lupin run --forever."
+        "Open chuggin in a terminal to use the menu. For unattended runs use chuggin run --forever."
     );
     let _screen = crate::ui::Screen::enter()?;
     loop {
@@ -75,7 +75,7 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                 })
                 .unwrap_or("Goal accepted. Ready for the first cycle.".into())
         } else {
-            "A fresh project. Start with a goal; Lupin will help shape it.".into()
+            "A fresh project. Start with a goal; Chuggin will help shape it.".into()
         };
         let Some(choice) = crate::ui::home_select(&items, &root, model, &status)? else {
             return Ok(());

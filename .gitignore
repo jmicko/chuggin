@@ -1,8 +1,10 @@
 /target
-/.lupin/
-/lupin.json
+/.chuggin/
+/chuggin.json
 .env
 .env.*
 !.env.example
 brave.key
 brave.key.tmp
+/.lupin/
+/lupin.json

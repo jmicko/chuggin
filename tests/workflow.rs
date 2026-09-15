@@ -12,7 +12,7 @@ use std::{
     thread,
     time::Duration,
 };
-const BIN: &str = env!("CARGO_BIN_EXE_lupin");
+const BIN: &str = env!("CARGO_BIN_EXE_chuggin");
 
 struct Server {
     url: String,
@@ -153,7 +153,7 @@ fn fixture(root: &Path, url: &str, pass: bool) -> std::path::PathBuf {
     } else {
         vec!["git", "rev-parse", "--verify", "nonexistent-ref"]
     };
-    let config = root.join("lupin.json");
+    let config = root.join("chuggin.json");
     fs::write(&config,json!({"repo":repo,"goal":"Improve value incrementally","ollama_url":url,"model":"fake",
         "context_tokens":32768,"output_tokens":4096,"implementation_calls":16,
         "checks":[{"argv":argv,"timeout_seconds":5}],"state_dir":root.join("state"),"retry_seconds":1}).to_string()).unwrap();
@@ -162,7 +162,7 @@ fn fixture(root: &Path, url: &str, pass: bool) -> std::path::PathBuf {
 fn command(root: &Path) -> Command {
     let mut c = Command::new(BIN);
     c.current_dir(root)
-        .env("XDG_CONFIG_HOME", root.join(".lupin/global"));
+        .env("XDG_CONFIG_HOME", root.join(".chuggin/global"));
     c
 }
 fn pipeline(pass: bool) {
@@ -271,10 +271,10 @@ git rev-parse HEAD
         String::from_utf8_lossy(&out.stdout)
     );
     let config: Value =
-        serde_json::from_slice(&fs::read(root.path().join("lupin.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
     assert!(config["goal"].as_str().unwrap().contains("Draft 2"));
     assert!(config.get("ollama_url").is_none());
-    let settings = root.path().join(".lupin/global/lupin/settings.json");
+    let settings = root.path().join(".chuggin/global/chuggin/settings.json");
     assert!(settings.exists());
     let calls = server.requests.lock().unwrap();
     assert_eq!(calls.len(), 2);
@@ -283,7 +283,7 @@ git rev-parse HEAD
     let second_dir = tempfile::tempdir().unwrap();
     let second = second_dir.path().to_path_buf();
     let mut c = command(&second);
-    c.env("XDG_CONFIG_HOME", root.path().join(".lupin/global"));
+    c.env("XDG_CONFIG_HOME", root.path().join(".chuggin/global"));
     let mut child = c
         .arg("setup")
         .stdin(Stdio::piped())
@@ -367,14 +367,14 @@ fn soft_stop_finishes_cycle_and_force_stop_releases_lock() {
 fn setup_offers_first_commit_and_respects_ignored_files() {
     for accept in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        fs::create_dir_all(root.path().join(".lupin/global/lupin")).unwrap();
+        fs::create_dir_all(root.path().join(".chuggin/global/chuggin")).unwrap();
         fs::write(
-            root.path().join(".lupin/global/lupin/settings.json"),
+            root.path().join(".chuggin/global/chuggin/settings.json"),
             json!({"model":"fake","ollama_url":"http://127.0.0.1:1"}).to_string(),
         )
         .unwrap();
         fs::write(
-            root.path().join(".lupin/goal-draft.json"),
+            root.path().join(".chuggin/goal-draft.json"),
             json!({"pitch":"Editor","goal":"Build an editor","feedback":""}).to_string(),
         )
         .unwrap();
@@ -383,7 +383,7 @@ fn setup_offers_first_commit_and_respects_ignored_files() {
         fs::write(root.path().join("ignored.txt"), "ignored data").unwrap();
         git(root.path(), &["init"]);
         // Even previously staged runtime files must stay out of the source baseline.
-        git(root.path(), &["add", ".lupin/goal-draft.json"]);
+        git(root.path(), &["add", ".chuggin/goal-draft.json"]);
         let mut child = command(root.path())
             .arg("setup")
             .stdin(Stdio::piped())
@@ -411,7 +411,7 @@ fn setup_offers_first_commit_and_respects_ignored_files() {
         if accept {
             let files = git(root.path(), &["ls-tree", "-r", "--name-only", "HEAD"]);
             assert_eq!(files, ".gitignore\nmain.rs");
-            assert!(root.path().join("lupin.json").exists());
+            assert!(root.path().join("chuggin.json").exists());
         } else {
             assert!(
                 !Command::new("git")
@@ -423,8 +423,8 @@ fn setup_offers_first_commit_and_respects_ignored_files() {
                     .status
                     .success()
             );
-            assert!(!root.path().join("lupin.json").exists());
-            assert!(root.path().join(".lupin/goal-draft.json").exists());
+            assert!(!root.path().join("chuggin.json").exists());
+            assert!(root.path().join(".chuggin/goal-draft.json").exists());
         }
         assert_eq!(
             fs::read_to_string(root.path().join("main.rs")).unwrap(),
@@ -683,11 +683,11 @@ mod terminal_ui {
         ui.send(b"q");
         ui.restored();
         let saved: Value = serde_json::from_slice(
-            &fs::read(root.path().join(".lupin/global/lupin/settings.json")).unwrap(),
+            &fs::read(root.path().join(".chuggin/global/chuggin/settings.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(saved["ollama_url"], "http://localhost:11434");
-        assert!(!root.path().join("lupin.json").exists());
+        assert!(!root.path().join("chuggin.json").exists());
     }
     #[test]
     fn brave_key_entry_is_masked_and_stored_separately() {
@@ -710,7 +710,7 @@ mod terminal_ui {
         ui.wait("Set up this project");
         ui.send(b"q");
         ui.restored();
-        let global = root.path().join(".lupin/global/lupin");
+        let global = root.path().join(".chuggin/global/chuggin");
         assert_eq!(
             fs::read_to_string(global.join("brave.key")).unwrap(),
             "fake-brave-secret"
@@ -756,7 +756,7 @@ mod terminal_ui {
     fn goal_setup_uses_full_screen_drafting_and_persists_the_result() {
         let server = Server::new(true, true);
         let root = tempfile::tempdir().unwrap();
-        let settings = root.path().join(".lupin/global/lupin/settings.json");
+        let settings = root.path().join(".chuggin/global/chuggin/settings.json");
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(
             settings,
@@ -780,7 +780,7 @@ mod terminal_ui {
         ui.send(b"q");
         ui.restored();
         let config: Value =
-            serde_json::from_slice(&fs::read(root.path().join("lupin.json")).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
         assert_eq!(config["goal"], "Build a useful editor. Draft 1.");
     }
 }
@@ -890,7 +890,7 @@ fn regression_probe(mode: u8) {
         }
     );
     assert_eq!(
-        art.join("workspace/tests/lupin_regression_1.rs").exists(),
+        art.join("workspace/tests/chuggin_regression_1.rs").exists(),
         mode != 1
     );
     assert_eq!(outcome["disposition"] == "accepted", mode != 0, "{outcome}");
@@ -972,4 +972,46 @@ fn execution_diagnostics_and_lookup_work_in_the_real_pipeline() {
 #[test]
 fn successful_command_cannot_override_failing_final_checks() {
     regression_probe(4);
+}
+
+#[test]
+fn legacy_project_and_settings_resume_without_moving_state() {
+    let server = Server::new(false, false);
+    let root = tempfile::tempdir().unwrap();
+    let config = fixture(root.path(), &server.url, true);
+    let legacy = root.path().join("lupin.json");
+    fs::rename(&config, &legacy).unwrap();
+    let global = root.path().join(".chuggin/global");
+    fs::create_dir_all(global.join("lupin")).unwrap();
+    fs::write(
+        global.join("lupin/settings.json"),
+        json!({"ollama_url":server.url,"model":"fake","web_enabled":false}).to_string(),
+    )
+    .unwrap();
+    fs::write(global.join("lupin/brave.key"), "migration-fixture-key").unwrap();
+    let output = command(root.path())
+        .args(["run", "--cycles", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(legacy.exists());
+    assert!(!config.exists());
+    assert!(root.path().join("state/state.json").exists());
+    assert!(global.join("chuggin/settings.json").is_file());
+    assert_eq!(
+        fs::read_to_string(global.join("chuggin/brave.key")).unwrap(),
+        "migration-fixture-key"
+    );
+    fs::remove_file(global.join("chuggin/brave.key")).unwrap();
+    let output = command(root.path()).args(["status"]).output().unwrap();
+    assert!(output.status.success());
+    assert!(
+        !global.join("chuggin/brave.key").exists(),
+        "Do not reimport a deliberately removed credential"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("migration-fixture-key"));
 }
