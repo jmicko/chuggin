@@ -5,11 +5,23 @@ an indefinite sequence of focused tasks.
 
 **The program loops indefinitely. Model conversations do not.**
 
-## Install from source
+## Install
 
 Chuggin is currently tested on Linux. Install a recent stable Rust toolchain and
 Git, and have an Ollama server with a tool-capable chat model available.
-From a checkout of this repository:
+
+Chuggin uses your configured Git `user.name` and `user.email` for commits,
+including repository overrides of global settings. If either is missing,
+interactive setup or resume asks for it and saves it in the project's Git
+configuration before starting work. Noninteractive runs stop with setup
+instructions. Use a GitHub verified email or your GitHub noreply email for
+GitHub attribution; GitHub login is not required for local commits.
+
+~~~sh
+cargo install chuggin --locked
+~~~
+
+Or install from a checkout of this repository:
 
 ~~~sh
 cargo install --path . --locked
@@ -17,8 +29,6 @@ cargo install --path . --locked
 
 This installs one Rust executable into Cargo's bin directory (normally
 ~/.cargo/bin). Make sure that directory is on PATH. No Python runtime is used.
-The first crates.io release is being prepared. Until it is published, use the
-source-install command above.
 
 ## Start
 

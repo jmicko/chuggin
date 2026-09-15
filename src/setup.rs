@@ -231,8 +231,36 @@ struct Draft {
 struct GoalReply {
     goal: String,
 }
+pub fn ensure_git_identity(root: &Path) -> Result<()> {
+    for (key, label) in [
+        ("user.name", "Git author name"),
+        ("user.email", "Git author email"),
+    ] {
+        if project::git(root, &["config", "--get", key]).is_ok_and(|value| !value.trim().is_empty())
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            io::stdin().is_terminal() || crate::ui::active(),
+            "Git identity is missing {key}. Open chuggin interactively to set it up, or set git config --global {key} before continuing. Use an email associated with GitHub if you want GitHub attribution."
+        );
+        crate::ui::notice(format!(
+            "Git needs {key} before Chuggin can continue. Enter your commit identity (a GitHub verified or noreply email enables GitHub attribution). This setting will be saved for this project."
+        ));
+        let value = ask(label, "")?;
+        // A new project may not have a repository yet. Initialize it only after
+        // the operator has supplied an identity, without creating a commit.
+        if project::git(root, &["rev-parse", "--git-dir"]).is_err() {
+            project::git(root, &["init"])?;
+        }
+        project::git(root, &["config", "--local", key, &value])?;
+    }
+    Ok(())
+}
+
 pub fn wizard() -> Result<PathBuf> {
     let root = std::env::current_dir()?;
+    ensure_git_identity(&root)?;
     let config = root.join("chuggin.json");
     anyhow::ensure!(
         !config.exists() && !root.join("lupin.json").exists(),
@@ -408,10 +436,6 @@ pub fn wizard() -> Result<PathBuf> {
             project::git(&root, &add)?;
         }
         let mut commit = vec![
-            "-c",
-            "user.name=Chuggin",
-            "-c",
-            "user.email=chuggin@localhost",
             "-c",
             "core.hooksPath=/dev/null",
             "-c",

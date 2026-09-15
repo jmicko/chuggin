@@ -160,10 +160,41 @@ fn fixture(root: &Path, url: &str, pass: bool) -> std::path::PathBuf {
     config
 }
 fn command(root: &Path) -> Command {
+    fs::create_dir_all(root.join(".chuggin")).unwrap();
+    let identity = root.join(".chuggin/test-gitconfig");
+    fs::write(
+        &identity,
+        "[user]\nname = Test Operator\nemail = operator@example.com\n",
+    )
+    .unwrap();
     let mut c = Command::new(BIN);
     c.current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", identity)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("XDG_CONFIG_HOME", root.join(".chuggin/global"));
     c
+}
+
+#[test]
+fn missing_git_identity_blocks_before_model_requests() {
+    let server = Server::new(false, false);
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    for key in ["user.name", "user.email"] {
+        let mut cmd = command(root.path());
+        let identity = root.path().join(".chuggin/test-gitconfig");
+        let remaining = if key == "user.name" {
+            "[user]\nemail = operator@example.com\n"
+        } else {
+            "[user]\nname = Test Operator\n"
+        };
+        fs::write(identity, remaining).unwrap();
+        let out = cmd.args(["run", "--cycles", "1"]).output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("missing {key}")));
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert!(!root.path().join("state/state.json").exists());
+    }
 }
 fn pipeline(pass: bool) {
     let server = Server::new(false, false);
@@ -199,6 +230,18 @@ fn pipeline(pass: bool) {
     assert_eq!(git(&root.path().join("repo"), &["rev-parse", "HEAD"]), head);
     if pass {
         assert_ne!(state["accepted_ref"], head);
+        assert_eq!(
+            git(
+                &root.path().join("repo"),
+                &[
+                    "log",
+                    "-1",
+                    "--format=%an <%ae>|%cn <%ce>",
+                    state["accepted_ref"].as_str().unwrap()
+                ]
+            ),
+            "Test Operator <operator@example.com>|Test Operator <operator@example.com>"
+        );
         assert_eq!(
             fs::read_to_string(
                 Path::new(state["accepted_workspace"].as_str().unwrap()).join("value.txt")

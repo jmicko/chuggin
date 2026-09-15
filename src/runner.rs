@@ -865,10 +865,6 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
             &workspace,
             &[
                 "-c",
-                "user.name=Chuggin",
-                "-c",
-                "user.email=chuggin@localhost",
-                "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
                 "commit.gpgsign=false",
@@ -903,6 +899,7 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
 }
 pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()> {
     let c = load(path)?;
+    crate::setup::ensure_git_identity(&c.repo)?;
     anyhow::ensure!(
         c.checks
             .iter()
