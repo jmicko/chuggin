@@ -2,6 +2,7 @@
 name = "lupin"
 version = "0.5.3"
 edition = "2024"
+license = "Apache-2.0"
 description = "A terminal harness for persistent coding projects with fresh-context local model stages"
 readme = "README.md"
 include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE*"]

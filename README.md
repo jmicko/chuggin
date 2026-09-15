@@ -249,3 +249,7 @@ A fresh regression writer is still the same model: it can miss defects or invent
 an invalid test. Successful cycles and passing tests do not establish completion
 of a broad product goal. Compare prompt-version logs and real accepted diffs
 across longer runs before treating these changes as a performance improvement.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
