@@ -615,6 +615,7 @@ struct Dashboard {
     searching: bool,
     help: bool,
     finished: Option<String>,
+    finished_at: Option<Instant>,
     tail: Option<Tail>,
     partial_model: String,
     partial_check: String,
@@ -653,6 +654,7 @@ impl Dashboard {
             searching: false,
             help: false,
             finished: None,
+            finished_at: None,
             tail: None,
             partial_model: String::new(),
             partial_check: String::new(),
@@ -933,6 +935,18 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
 fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stopping: bool) {
     base(f);
     let a = f.area().inner(Margin::new(1, 0));
+    if d.finished.is_some() && (a.height < 20 || a.width < 44) {
+        f.render_widget(
+            p(format!(
+                "WORK PAUSED\nNo work is running.\n\n{}\n\nR resume · Enter / Q home",
+                d.finished.as_deref().unwrap_or("")
+            ))
+            .fg(GOLD)
+            .bold(),
+            a,
+        );
+        return;
+    }
     if a.height < 14 || a.width < 44 {
         f.render_widget(p("CHUGGIN\n\nResize to at least 46 × 14 to view the dashboard.\nThe agent continues working.\n\nCtrl+C: finish cycle; again: force stop").fg(ACCENT),a);
         return;
@@ -943,11 +957,11 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         Constraint::Length(3),
         Constraint::Min(4),
         Constraint::Length(2),
-        Constraint::Length(1),
+        Constraint::Length(if d.finished.is_some() { 6 } else { 1 }),
     ])
     .split(a);
     let state = if d.finished.is_some() {
-        "FINISHED"
+        "PAUSED"
     } else if stopping {
         "DRAINING"
     } else {
@@ -979,7 +993,11 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         steps.push(Span::styled(
             s.to_string(),
             Style::default()
-                .fg(if d.phase.starts_with(s) { BG } else { MUTED })
+                .fg(if d.finished.is_none() && d.phase.starts_with(s) {
+                    BG
+                } else {
+                    MUTED
+                })
                 .bg(if d.phase.starts_with(s) { CYAN } else { BG })
                 .add_modifier(if d.phase.starts_with(s) {
                     Modifier::BOLD
@@ -991,12 +1009,28 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     f.render_widget(
         Paragraph::new(Line::from(steps)).block(panel(&format!(
             "{} · {}",
-            d.phase,
-            duration(d.phase_started.elapsed().as_secs())
+            if d.finished.is_some() {
+                "Last stage"
+            } else {
+                &d.phase
+            },
+            duration(
+                d.finished_at
+                    .unwrap_or_else(Instant::now)
+                    .saturating_duration_since(d.phase_started)
+                    .as_secs()
+            )
         ))),
         r[1],
     );
-    f.render_widget(p(d.task.clone()).block(panel("Current task")), r[2]);
+    f.render_widget(
+        p(d.task.clone()).block(panel(if d.finished.is_some() {
+            "Last task"
+        } else {
+            "Current task"
+        })),
+        r[2],
+    );
     let wide = f.area().width >= 100;
     let body = Layout::horizontal(if wide {
         vec![Constraint::Min(40), Constraint::Length(29)]
@@ -1020,7 +1054,9 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         .divider(" │ "),
         log[0],
     );
-    let label = if d.searching {
+    let label = if d.finished.is_some() && !d.searching && d.filter.is_empty() {
+        "Saved output · scroll to review".into()
+    } else if d.searching {
         format!("Search: {}▏", d.filter)
     } else if !d.filter.is_empty() {
         format!("Filter: {} · Esc clears", d.filter)
@@ -1079,7 +1115,9 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         let model = vec![
             Line::from("MODEL").fg(CYAN).bold(),
             Line::from(d.active_model.clone()),
-            Line::from(if d.request_active {
+            Line::from(if d.finished.is_some() {
+                "○ Idle · no work running"
+            } else if d.request_active {
                 "● Receiving response"
             } else {
                 "○ Between requests"
@@ -1111,7 +1149,12 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             Line::from(format!("{} accepted · {} retries", d.accepted, d.retried)),
             Line::from(format!(
                 "Elapsed {}",
-                duration(d.started.elapsed().as_secs())
+                duration(
+                    d.finished_at
+                        .unwrap_or_else(Instant::now)
+                        .saturating_duration_since(d.started)
+                        .as_secs()
+                )
             )),
             Line::from(format!(
                 "Last activity {}s ago",
@@ -1120,6 +1163,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             Line::from(match d.last_check {
                 Some(true) => "✓ Latest checks passed",
                 Some(false) => "× Latest checks failed",
+                None if d.finished.is_some() => "No check result recorded",
                 None => "Checks pending / running",
             })
             .fg(match d.last_check {
@@ -1190,10 +1234,29 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     } else {
         "↑↓ / wheel scroll · PgUp/PgDn · F follow · 1–5 views · / search · ? help · Ctrl+C finish cycle".into()
     };
-    f.render_widget(
-        Paragraph::new(footer).fg(if stopping { GOLD } else { MUTED }),
-        r[5],
-    );
+    if let Some(reason) = &d.finished {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from("WORK PAUSED").bold(),
+                Line::from("No work is running."),
+                Line::from(reason.clone()),
+                Line::from("R resume work  ·  Enter / Q return home"),
+            ])
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(GOLD).bg(Color::Rgb(42, 34, 20)))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(GOLD)),
+            ),
+            r[5],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(footer).fg(if stopping { GOLD } else { MUTED }),
+            r[5],
+        );
+    }
     if d.help {
         let area = Rect::new(
             a.x + a.width / 8,
@@ -1242,6 +1305,7 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
             if d.finished.is_none()
                 && let Ok(result) = done_rx.try_recv()
             {
+                d.finished_at = Some(Instant::now());
                 d.finished = Some(match result {
                     Ok(()) => "Run saved".into(),
                     Err(e) => format!("Stopped: {e}"),
@@ -1628,6 +1692,36 @@ mod tests {
         assert!(text.contains("Time limit reached"));
         assert!(text.contains("Finishing this cycle"));
         assert!(d.finished.is_none());
+    }
+
+    #[test]
+    fn stopped_dashboard_clearly_labels_saved_work_and_freezes_elapsed_time() {
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        let end = Instant::now();
+        d.started = end - Duration::from_secs(65);
+        d.phase_started = end - Duration::from_secs(10);
+        d.finished_at = Some(end);
+        d.finished = Some("Run saved".into());
+        d.task = "Last completed task".into();
+        for (width, height) in [(110, 36), (80, 24), (40, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| render_dashboard(f, &mut d, &c, false))
+                .unwrap();
+            let text = screen_text(&terminal);
+            assert!(text.contains("WORK PAUSED"));
+            assert!(text.contains("No work is running."));
+            assert!(text.contains("R resume"));
+            assert!(!text.contains("Current task"));
+            assert!(!text.contains("following live"));
+            assert!(!text.contains("agent continues working"));
+            if width >= 100 {
+                assert!(text.contains("Last task"));
+                assert!(text.contains("Elapsed 00:01:05"));
+                assert!(text.contains("Idle · no work running"));
+            }
+        }
     }
     #[test]
     fn terminal_control_sequences_do_not_escape_the_output_widget() {
