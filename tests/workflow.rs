@@ -319,6 +319,36 @@ fn plain_text_project_uses_its_own_validation_without_rust_tools() {
         }
     }
 }
+
+#[test]
+fn duration_limit_finishes_cycle_and_resets_on_resume() {
+    let server = Server::new(false, true);
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["run_duration_seconds"] = json!(1);
+    fs::write(&path, config.to_string()).unwrap();
+    for cycle in [1, 2] {
+        let output = command(root.path())
+            .args(["run", "--forever"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Run duration reached"));
+        let state: Value =
+            serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["cycle"], cycle);
+        assert_eq!(
+            state["recent"].as_array().unwrap().last().unwrap()["disposition"],
+            "accepted"
+        );
+    }
+}
 #[test]
 fn fresh_cycles_and_checkout_isolation() {
     pipeline(true);

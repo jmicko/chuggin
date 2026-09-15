@@ -613,6 +613,30 @@ pub fn settings_menu() -> Result<()> {
     }
 }
 
+pub fn run_duration(path: &Path) -> Result<()> {
+    let mut config: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let seconds = config["run_duration_seconds"].as_u64().unwrap_or(0);
+    crate::ui::notice("Set the duration of each run in hours (0 means unlimited). The current cycle finishes before stopping. Resuming starts a new timer. This setting applies only to this project.".into());
+    loop {
+        let text = ask(
+            "Run duration (hours)",
+            &format!("{}", seconds as f64 / 3600.0),
+        )?;
+        if let Ok(hours) = text.parse::<f64>()
+            && hours.is_finite()
+            && (0.0..=8760.0).contains(&hours)
+            && (hours == 0.0 || hours * 3600.0 >= 1.0)
+        {
+            config["run_duration_seconds"] = json!((hours * 3600.0).round() as u64);
+            save(path, &config)?;
+            return Ok(());
+        }
+        crate::ui::notice(
+            "Enter 0 for unlimited, or a duration between one second and 8760 hours.".into(),
+        );
+    }
+}
+
 fn draft_recovery(root: &Path, detail: &str) -> Result<()> {
     let log = root.join(".chuggin/goal-error.txt");
     fs::write(&log, detail)?;

@@ -89,6 +89,14 @@ request, or press R on the finished screen to continue from saved progress.
 Second Ctrl-C stops immediately. Subsequent runs resume with fresh conversations.
 During setup, a single Ctrl-C exits.
 
+Choose **Run duration** from the home menu to set a project-specific duration
+in hours (fractional hours work; 0 means unlimited). The observation view shows
+the time remaining. When the limit is reached, Chuggin finishes the current cycle,
+saves its outcome, and stops before starting another. This is a soft limit, so
+the run can exceed the chosen duration by the remaining cycle time. Resuming
+starts a new timer. The setting persists as `run_duration_seconds` in `chuggin.json`
+and also applies to command-line runs.
+
 ## Persistent project, fresh stages
 
 1. Discovery picks the next useful gap from the main goal and current evidence.

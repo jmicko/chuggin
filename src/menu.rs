@@ -50,6 +50,7 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             "Progress".into(),
             "Choose model".into(),
             "Settings".into(),
+            "Run duration".into(),
             "Quit".into(),
         ];
         let root = std::env::current_dir()?.display().to_string();
@@ -119,11 +120,18 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                 }
                 3 => setup::choose_model()?,
                 4 => setup::settings_menu()?,
+                5 => {
+                    if let Some(path) = project.as_ref() {
+                        setup::run_duration(path)?;
+                    } else {
+                        crate::ui::show("Run duration", "Set up this project first.")?;
+                    }
+                }
                 _ => {}
             }
             Ok(())
         })();
-        if choice == 5 {
+        if choice == 6 {
             return Ok(());
         }
         if let Err(e) = action {

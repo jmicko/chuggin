@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -28,6 +28,8 @@ pub struct Config {
     pub checks: Vec<Check>,
     pub state_dir: PathBuf,
     pub retry_seconds: u64,
+    #[serde(default)]
+    pub run_duration_seconds: u64,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct State {
@@ -1040,6 +1042,9 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
 pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()> {
     let c = load(path)?;
     crate::setup::ensure_git_identity(&c.repo)?;
+    let started = Instant::now();
+    let time_up =
+        || c.run_duration_seconds > 0 && started.elapsed().as_secs() >= c.run_duration_seconds;
     anyhow::ensure!(
         c.checks
             .iter()
@@ -1127,7 +1132,7 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
     }
     save(&state_path, &state)?;
     let mut completed = 0;
-    while !stop.load(Ordering::SeqCst) && count.is_none_or(|n| completed < n) {
+    while !stop.load(Ordering::SeqCst) && !time_up() && count.is_none_or(|n| completed < n) {
         state.cycle += 1;
         crate::events::send(crate::events::Event::Cycle(state.cycle));
         completed += 1;
@@ -1159,16 +1164,19 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
             state.recent.remove(0);
         }
         save(&state_path, &state)?;
-        if count.is_some_and(|n| completed >= n) {
+        if time_up() || count.is_some_and(|n| completed >= n) {
             break;
         }
         crate::events::send(crate::events::Event::Phase("Between cycles".into()));
         for _ in 0..c.retry_seconds {
-            if stop.load(Ordering::SeqCst) {
+            if stop.load(Ordering::SeqCst) || time_up() {
                 break;
             }
             thread::sleep(Duration::from_secs(1));
         }
+    }
+    if time_up() {
+        crate::events::log("Run duration reached; completed the current cycle and saved progress. Resume starts a new timer.".into());
     }
     crate::events::log(format!(
         "Accepted branch: {}\nArtifacts: {}",

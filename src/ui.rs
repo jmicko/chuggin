@@ -226,7 +226,12 @@ fn splash(
         .map(|(i, item)| {
             ListItem::new(vec![
                 Line::from(item.clone()).bold(),
-                Line::from(descriptions[i]).fg(MUTED),
+                Line::from(match item.as_str() {
+                    "Run duration" => "Finish the current cycle when time is up",
+                    "Quit" => "Return to your shell",
+                    _ => descriptions.get(i).copied().unwrap_or(""),
+                })
+                .fg(MUTED),
             ])
         })
         .collect();
@@ -1089,8 +1094,19 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     }
     let footer = if let Some(s) = &d.finished {
         format!("{s} · R resume · Enter / q returns home")
+    } else if c.run_duration_seconds > 0 && d.started.elapsed().as_secs() >= c.run_duration_seconds
+    {
+        "Time limit reached · Finishing this cycle, then saving".into()
     } else if stopping {
         "Finishing this cycle · R resume · Ctrl+C again force-stops".into()
+    } else if c.run_duration_seconds > 0 {
+        format!(
+            "Time left {} · Ctrl+C finish cycle · ? help",
+            duration(
+                c.run_duration_seconds
+                    .saturating_sub(d.started.elapsed().as_secs())
+            )
+        )
     } else {
         "↑↓ / wheel scroll · PgUp/PgDn · F follow · 1–4 views · / search · ? help · Ctrl+C finish cycle".into()
     };
@@ -1343,7 +1359,7 @@ mod tests {
         assert_eq!(e.value, "héllo\nworld");
     }
     fn config() -> runner::Config {
-        runner::Config {repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10}
+        runner::Config {repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0}
     }
     fn screen_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();
@@ -1453,6 +1469,27 @@ mod tests {
         }
         assert_eq!(d.entries.len(), 2000);
         assert!(d.dropped > 0);
+    }
+
+    #[test]
+    fn duration_is_visible_and_expiry_keeps_the_cycle_running() {
+        let mut c = config();
+        c.run_duration_seconds = 36000;
+        let mut d = Dashboard::new(&c);
+        let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        assert!(screen_text(&terminal).contains("Time left 10:00:00"));
+        c.run_duration_seconds = 1;
+        d.started = Instant::now() - Duration::from_secs(2);
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.contains("Time limit reached"));
+        assert!(text.contains("Finishing this cycle"));
+        assert!(d.finished.is_none());
     }
     #[test]
     fn terminal_control_sequences_do_not_escape_the_output_widget() {
