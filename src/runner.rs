@@ -1,5 +1,5 @@
 use crate::{
-    model::{Model, tools},
+    model::Model,
     project::{self, Check, CheckResult},
 };
 use anyhow::{Context, Result};
@@ -433,10 +433,6 @@ fn partial_allowed(
             .iter()
             .enumerate()
             .any(|(i, _)| criterion_satisfied(task, review, i))
-        && test_names(results)
-            .difference(&test_names(baseline))
-            .next()
-            .is_some()
         && test_names(baseline).is_subset(&test_names(results))
 }
 fn validate_task(task: &Task, root: &Path) -> Result<()> {
@@ -471,8 +467,8 @@ fn extend_source_access(task: &mut Task, root: &Path, path: &str, reason: &str) 
         "Explain the dependency change needed for this task"
     );
     anyhow::ensure!(
-        Path::new(path).extension().is_some_and(|e| e == "rs"),
-        "Additional access is for existing Rust source files"
+        !matches!(path, "chuggin.json"),
+        "Project control files cannot be added to task scope"
     );
     let content = project::read(root, path)?;
     if !task.files.iter().any(|p| p == path) {
@@ -502,7 +498,7 @@ fn concrete_patch(
     art: &Path,
     step: u32,
 ) -> Result<()> {
-    let plan: PatchPlan=m.structured("Produce concrete source edits, not a summary or plan. Return JSON {edits:[{path,old_text,new_text}]}. Make 1-4 small edits that advance the task. If checks fail, fix the first compiler or test error. Otherwise add the missing focused implementation/test. old_text must match an exact unique existing substring, with no line-number prefixes. Use empty old_text only for a NEW file. Use only the supplied allowed paths. Preserve existing behavior and tests. Do not claim edits were made; the harness will apply these literal replacements and run checks. Rust ownership errors generally need clones of owned values, not Copy on types containing Strings. Integration tests import through the library crate name. Choose a complete small patch rather than further inspection.",json!({"task":task,"allowed_paths":task.files,"files":project::context(workspace,&task.files,24000),"actual_checks":results}))?;
+    let plan: PatchPlan=m.structured("Produce concrete file edits, not a summary or plan. Return JSON {edits:[{path,old_text,new_text}]}. Make 1-4 small edits that advance the task. If checks fail, fix the first validation failure. Otherwise add the missing behavior and a relevant validation. old_text must match an exact unique existing substring, with no line-number prefixes. Use empty old_text only for a NEW file. Use only the supplied allowed paths. Preserve existing behavior and tests. Do not claim edits were made; the harness will apply these literal replacements and run checks. Choose a complete small patch rather than further inspection.",json!({"task":task,"allowed_paths":task.files,"files":project::context(workspace,&task.files,24000),"actual_checks":results}))?;
     emit(art, &format!("patch-{step}"), &plan)?;
     anyhow::ensure!(
         !plan.edits.is_empty() && plan.edits.len() <= 4,
@@ -547,7 +543,7 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
         serde_json::from_slice::<Task>(&fs::read(prior.artifact_dir.join("task.json"))?)?
     } else {
         let mut inspection_sequence = 0;
-        let discovery:Discovery=m.investigate(crate::prompts::DISCOVERY,discovery_input(c,s)?,crate::model::inspection_tools(),|name,args|{
+        let discovery:Discovery=m.investigate(crate::prompts::DISCOVERY,discovery_input(c,s)?,crate::model::inspection_tools(&s.accepted_workspace),|name,args|{
             let result=inspect_tool(&s.accepted_workspace,name,args,&mut research);
             inspection_sequence += 1;
             emit(art,&format!("inspection-{inspection_sequence:03}"),&json!({"tool":name,"arguments":args,"result":result.as_ref().ok(),"error":result.as_ref().err().map(|e|e.to_string())}))?;
@@ -646,11 +642,12 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
         .unwrap_or_default();
     let mut messages = vec![
         json!({"role":"system","content":crate::prompts::IMPLEMENT}),
-        json!({"role":"user","content":json!({"main_goal":c.goal,"task":task,"current_checks":working_checks,"repair_note":repair_note,"recovery_origin":recovery.as_ref().map(|o|o.cycle),"instruction":"When checks fail, fix the first compiler/test error with a targeted edit before doing any broader work. Then add the missing focused tests.","current_files":project::context(&workspace,&task.files,18000)}).to_string()}),
+        json!({"role":"user","content":json!({"main_goal":c.goal,"task":task,"current_checks":working_checks,"repair_note":repair_note,"recovery_origin":recovery.as_ref().map(|o|o.cycle),"instruction":"When checks fail, fix the first validation failure with a targeted edit before doing any broader work. Then validate the requested outcome.","current_files":project::context(&workspace,&task.files,18000)}).to_string()}),
     ];
     let mut notes = String::new();
     let mut last_result = String::new();
     let mut latest_checks = working_checks;
+    let mut validated_snapshot = None;
     let mut response_errors = 0;
     let mut observations = 0;
     let mut edited = false;
@@ -663,7 +660,7 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
             messages.push(json!({"role":"user","content":json!({"task":task,"repair_note":repair_note,"current_files":project::context(&workspace,&task.files,12000),"latest_result":last_result,"latest_checks":latest_checks,"instruction":"Fresh implementation session, same task and files. Continue the existing work. Do not re-plan the project. Implement the missing behavior and run checks."}).to_string()}));
             emit(art, &format!("context-refresh-{step}"), &messages)?;
         }
-        let response = match m.chat(&messages, Some(tools()), false) {
+        let response = match m.chat(&messages, Some(crate::model::tools_for(&workspace)), false) {
             Ok(r) => r,
             Err(e) => {
                 response_errors += 1;
@@ -713,7 +710,7 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                     }
                 }
                 messages.truncate(1);
-                messages.push(json!({"role":"user","content":json!({"task":task,"repair_note":repair_note,"current_files":project::context(&workspace,&task.files,18000),"current_checks":latest_checks,"instruction":"These are the actual files and checks after the patch. Add any missing tests or fix the remaining error using tools. Do not claim unperformed actions."}).to_string()}));
+                messages.push(json!({"role":"user","content":json!({"task":task,"repair_note":repair_note,"current_files":project::context(&workspace,&task.files,18000),"current_checks":latest_checks,"instruction":"These are the actual files and checks after the patch. Add any missing validation or fix the remaining failure using tools. Do not claim unperformed actions."}).to_string()}));
                 continue;
             }
             notes = response["content"].as_str().unwrap_or("").into();
@@ -827,6 +824,7 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                 "run_checks" => {
                     latest_checks =
                         checks(c, &workspace, art, &format!("tool-{step}-{index}"), stop)?;
+                    validated_snapshot = Some(project::snapshot(&workspace)?);
                     Ok(serde_json::to_string(&latest_checks)?)
                 }
                 _ => anyhow::bail!("Unknown tool: {name}"),
@@ -895,14 +893,14 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
             messages.push(tool_reply);
         }
         observations += 1;
-        if latest_checks.iter().all(|r| r.passed)
-            && test_names(&latest_checks)
-                .difference(&test_names(&baseline))
-                .next()
-                .is_some()
-            && project::snapshot(&workspace)? != before
+        if !latest_checks.is_empty()
+            && latest_checks.iter().all(|r| r.passed)
+            && validated_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot != &before)
+            && validated_snapshot == Some(project::snapshot(&workspace)?)
         {
-            notes="Implementation has passing new tests; handing off to independent verification and review.".into();
+            notes="Implementation changes passed configured validation; handing off to independent verification and review.".into();
             break;
         }
         if observations >= 4 {
@@ -925,7 +923,7 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                     emit(art, &format!("patch-error-{step}"), &format!("{e:#}"))?;
                 }
             }
-            messages.push(json!({"role":"user","content":"Stop re-exploring unchanged files. If checks pass and the requested behavior is complete, finish with a short summary. Otherwise make the next corrective edit using the source already supplied. Rust integration tests import the library by its Cargo package name, not crate::."}));
+            messages.push(json!({"role":"user","content":"Stop re-exploring unchanged files. If checks pass and the requested behavior is complete, finish with a short summary. Otherwise make the next corrective edit using the source already supplied."}));
             observations = 0;
         }
     }
@@ -1241,6 +1239,17 @@ mod scope_tests {
                 .is_ok()
         );
         assert!(task.files.contains(&"src/run.rs".to_string()));
+        fs::write(dir.path().join("NOTES.md"), "Document conventions").unwrap();
+        assert!(
+            extend_source_access(
+                &mut task,
+                dir.path(),
+                "NOTES.md",
+                "Keep documentation consistent"
+            )
+            .is_ok()
+        );
+        assert!(task.files.contains(&"NOTES.md".to_string()));
         assert!(
             extend_source_access(&mut task, dir.path(), "../outside.rs", "dependency").is_err()
         );
@@ -1402,7 +1411,7 @@ mod recovery_tests {
 mod partial_tests {
     use super::*;
     #[test]
-    fn partial_progress_needs_new_tests_and_preserves_old_ones() {
+    fn partial_progress_uses_validation_and_preserves_observed_tests() {
         let task = Task {
             title: "slice".into(),
             objective: "one useful slice".into(),
@@ -1426,7 +1435,7 @@ mod partial_tests {
             timed_out: false,
             output: "test existing ... ok\n".into(),
         };
-        assert!(!partial_allowed(
+        assert!(partial_allowed(
             &task,
             &review,
             std::slice::from_ref(&baseline),

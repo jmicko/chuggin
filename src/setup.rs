@@ -283,7 +283,7 @@ pub fn wizard() -> Result<PathBuf> {
             let input = json!({"pitch":draft.pitch,"current_draft":draft.goal,"requested_changes":draft.feedback});
             let result = crate::ui::busy("Drafting your project goal", move || {
                 model.structured::<GoalReply>(
-                "Help define a software project goal. Return JSON {goal: string}. Expand the user's pitch into a clear goal with concrete capabilities, quality expectations, constraints, and observable success criteria. Preserve the user's ambition and explicit version/feature targets; do not silently narrow them to an MVP. Do not invent user requirements: label assumptions and leave genuinely unspecified choices flexible. Incorporate requested revisions. Keep under 700 words. This is goal drafting only, not implementation.",
+                "Help define a project goal for software, documents, data, or other artifacts as appropriate to the user’s pitch. Return JSON {goal: string}. Expand the user's pitch into a clear goal with concrete capabilities, quality expectations, constraints, and observable success criteria. Preserve the user's ambition and explicit version/feature targets; do not silently narrow them to an MVP. Do not invent user requirements: label assumptions and leave genuinely unspecified choices flexible. Incorporate requested revisions. Keep under 700 words. This is goal drafting only, not implementation.",
                 input)
             });
             match result {
@@ -329,9 +329,14 @@ pub fn wizard() -> Result<PathBuf> {
         draft.feedback = action;
         save(&draft_path, &draft)?;
     }
-    crate::ui::notice("\nChoose a check Chuggin must pass before accepting changes.\nFor a new Rust project, cargo test starts failing until the project is created.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
+    crate::ui::notice("\nChoose a check Chuggin must pass before accepting changes.\nChoose validation appropriate to this project: tests, a document linter, a data checker, or your own validation script.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
     let check = loop {
-        let text = ask("Validation command", "cargo test")?;
+        let default_check = if root.join("Cargo.toml").is_file() {
+            "cargo test"
+        } else {
+            ""
+        };
+        let text = ask("Validation command", default_check)?;
         match shell_words::split(&text) {
             Ok(argv) if !argv.is_empty() => break argv,
             _ => crate::ui::notice("Enter a valid command with balanced quotes.".to_string()),

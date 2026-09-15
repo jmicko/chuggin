@@ -1,6 +1,6 @@
 # Chuggin
 
-A Rust terminal tool for building large projects with small local models through
+A Rust terminal tool for advancing software, document, and data projects with local models through
 an indefinite sequence of focused tasks.
 
 **The program loops indefinitely. Model conversations do not.**
@@ -55,6 +55,7 @@ tool actions, check output, recovery messages, and recent outcomes.
 - **/** searches the current output view; **Esc** clears the filter.
 - **?** opens the keyboard guide.
 - **Ctrl+C / Q:** finish the current cycle. **Ctrl+C again:** force stop.
+- **R:** cancel a pending stop or resume directly after the run finishes.
   When the run finishes, Enter returns to the splash screen.
 
 The side panel shows request counts, recent acceptance outcomes, context usage,
@@ -83,19 +84,20 @@ command, then Resume. Empty projects get an initial Git commit. For existing
 files without commits, setup offers to commit project files while respecting
 Git ignores and excluding Chuggin's state.
 
-First Ctrl-C finishes the current cycle and returns to the menu. Second Ctrl-C
-stops immediately. Subsequent runs resume saved progress with fresh conversations.
+First Ctrl-C requests a stop after the current cycle. Press R to cancel that
+request, or press R on the finished screen to continue from saved progress.
+Second Ctrl-C stops immediately. Subsequent runs resume with fresh conversations.
 During setup, a single Ctrl-C exits.
 
 ## Persistent project, fresh stages
 
 1. Discovery picks the next useful gap from the main goal and current evidence.
 2. Task shaping specifies a small behavior, writable paths, and acceptance
-   criteria. A slice keeps implementation, dependency wiring, and focused tests
+   criteria. A slice keeps implementation, dependency wiring, and relevant validation
    together; oversized proposals are narrowed to one complete behavior.
 3. Implementation edits a private Git worktree. Long or stalled conversations
    restart with current files, the task, and the latest check results. Passing
-   new tests trigger an early handoff to verification rather than more tinkering.
+   configured checks on the current changed files trigger a handoff to verification.
 4. The harness runs the operator's configured checks. For changed Rust code, a
    fresh stage proposes an extra public-API regression test. Chuggin runs that test
    explicitly, retains valid tests, and gives compile errors one fresh test-only
@@ -118,32 +120,35 @@ validation results take precedence. A new task starts with an empty note.
 Each cycle saves `repair-note.json` alongside its other diagnostic artifacts.
 
 Full acceptance requires passing checks, preservation of previously reported
-passing Rust test names, scope compliance, and reviewer evidence
+passing test names when recognizable in check output, scope compliance, and reviewer evidence
 for every criterion. Markdown formatting and whitespace differences in copied
 criteria do not cause rejection. New reviews reference stable C1/C2 IDs, so they
 do not have to reproduce long criterion sentences.
 
 A reviewer may explicitly accept **partial progress** when a task bundled too much:
 the delivered subset must be independently useful, pass all checks, preserve all
-previously reported passing test names, and add at least one newly passing test.
-Unmet criteria remain in the review and progress record. This currently recognizes
-Rust-style test output; other runners retain full-acceptance behavior.
+previously reported passing test names when available, and provide concrete evidence
+for the completed criteria. Unmet criteria remain in the review and progress record.
+Neither full nor partial acceptance requires a particular test-output format.
 
 ## Tools and recovery
 
-Discovery has read-only inspection tools and a bounded Rust API/module index,
-including which files appear reachable from default entry points. This is an
-orientation aid; compiler and test results remain authoritative. Stage prompts
-explicitly favor reusing existing types and connecting useful behavior.
+Discovery has read-only inspection tools and a bounded inventory of all project
+files. Rust declarations and module reachability supplement the inventory when
+present. Other formats use file reading and text search. Stage prompts describe
+project outcomes and evidence rather than assuming a language or test framework.
+Setup asks for a validation command appropriate to the project; it only suggests
+`cargo test` when a Cargo manifest exists. Documents and data can use linters,
+consistency checkers, or custom scripts. A validation command is still required.
 
 The model can list files, search literal text, read numbered line ranges, replace
 a file, make an exact targeted edit, and run configured checks. Long reads include
 continuation positions. Unique-match edits prevent accidental broad replacement.
-It can request an existing Rust dependency file when a necessary supporting change
+It can request an existing supporting file of any text format when a necessary supporting change
 was omitted from the plan. The reason and expanded scope are logged and supplied
 to review; this does not permit changing Chuggin configuration or Git control files.
 When an implementer repeatedly reads without editing, a fresh patch request asks
-for literal source replacements. The harness applies valid edits and reruns checks;
+for literal file replacements. The harness applies valid edits and reruns checks;
 a claim that something was fixed never substitutes for changes on disk.
 
 Rust tasks can wire new modules through existing parent modules, src/lib.rs, and
@@ -169,7 +174,7 @@ returns the exit code, timeout status, a bounded output tail, and a log ID.
 the live output view and process-group cleanup on completion, timeout, or force stop.
 Application runs are bounded foreground runs, not persistent interactive sessions.
 
-**compiler_diagnostics** runs Cargo check for all targets and returns grouped
+When a Cargo manifest exists, **compiler_diagnostics** runs Cargo check for all targets and returns grouped
 errors/warnings, source locations, nearby code, and compiler suggestions. It does
 not execute tests. Command success does not substitute for the configured final
 checks or acceptance review; command-produced file changes still undergo scope review.
@@ -177,7 +182,7 @@ Like configured checks, commands execute with the user's OS permissions. A Git
 worktree isolates project revisions; it is not an OS sandbox. The model is
 instructed to keep commands within its task and leave Git commits/state to Chuggin.
 
-Both discovery and implementation have **lookup_symbol**. It finds Rust types,
+When Rust files exist, discovery and implementation have **lookup_symbol**. It finds Rust types,
 functions, private/public methods, and name-based reference candidates, with
 paths, line numbers, source snippets, and pagination. It parses Rust syntax, so
 comments and string contents do not appear as references. This is not a language

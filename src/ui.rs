@@ -1088,9 +1088,9 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         );
     }
     let footer = if let Some(s) = &d.finished {
-        format!("{s} · Enter / q returns home")
+        format!("{s} · R resume · Enter / q returns home")
     } else if stopping {
-        "Finishing this cycle, then returning home · Ctrl+C again force-stops".into()
+        "Finishing this cycle · R resume · Ctrl+C again force-stops".into()
     } else {
         "↑↓ / wheel scroll · PgUp/PgDn · F follow · 1–4 views · / search · ? help · Ctrl+C finish cycle".into()
     };
@@ -1106,11 +1106,16 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             a.height * 2 / 3,
         );
         f.render_widget(Clear, area);
-        f.render_widget(p("Observe without interrupting work\n\n↑ / ↓ or mouse wheel    Scroll a few lines\nPgUp / PgDn             Scroll a page\nHome / End              Oldest / latest output\nF                       Resume live following\n1–4 or Tab              Live, model, checks, goal\n/                       Search the current view\nEsc                     Clear search / close help\nCtrl+C or Q             Finish this cycle, then stop\nCtrl+C again            Force stop immediately\n\nScrollback is bounded; complete logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.\nContext and token speed update after each model response.").block(panel("Keyboard guide · ? / Esc closes")),area);
+        f.render_widget(p("Observe without interrupting work\n\n↑ / ↓ or mouse wheel    Scroll a few lines\nPgUp / PgDn             Scroll a page\nHome / End              Oldest / latest output\nF                       Resume live following\n1–4 or Tab              Live, model, checks, goal\n/                       Search the current view\nEsc                     Clear search / close help\nCtrl+C or Q             Finish this cycle, then stop\nR                       Cancel stop / resume saved run\nCtrl+C again            Force stop immediately\n\nScrollback is bounded; complete logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.\nContext and token speed update after each model response.").block(panel("Keyboard guide · ? / Esc closes")),area);
     }
 }
 
 pub fn dashboard(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
+    while dashboard_session(path, stop.clone(), running.clone())? {}
+    Ok(())
+}
+
+fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<bool> {
     let config = runner::load(path)?;
     let mut d = Dashboard::new(&config);
     let rx = events::subscribe();
@@ -1128,7 +1133,7 @@ pub fn dashboard(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -
         };
         let _ = done_tx.send(result);
     });
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<bool> {
         loop {
             for e in rx.try_iter().take(4096) {
                 d.apply(e);
@@ -1191,6 +1196,12 @@ pub fn dashboard(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -
                         continue;
                     }
                     match k.code {
+                        KeyCode::Char('r' | 'R') if d.finished.is_some() => return Ok(true),
+                        KeyCode::Char('r' | 'R') => {
+                            if stop.swap(false, Ordering::SeqCst) {
+                                events::log("Stop cancelled; continuing normally.".into());
+                            }
+                        }
                         KeyCode::Enter | KeyCode::Char('q') if d.finished.is_some() => break,
                         KeyCode::Char('q') => {
                             stop.store(true, Ordering::SeqCst);
@@ -1225,10 +1236,10 @@ pub fn dashboard(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -
                 }
             }
         }
-        Ok(())
+        Ok(false)
     })();
     events::unsubscribe();
-    if worker.is_finished() {
+    if d.finished.is_some() || worker.is_finished() {
         let _ = worker.join();
     } else if result.is_err() {
         stop.store(true, Ordering::SeqCst);

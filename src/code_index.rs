@@ -134,7 +134,7 @@ pub fn index(root: &Path) -> Result<Value> {
         rows.push(json!({"path":path,"reachable_from_default_entrypoints":active.contains(path),"parse_ok":parsed.is_ok(),"api":declarations}));
     }
     Ok(
-        json!({"note":"Index of on-disk declarations, not claims of correctness. Reachability is a static hint for default Cargo entrypoints; cfg/custom targets may differ. Read source and run checks to verify behavior. Existing types should be reused rather than duplicated.","files":rows}),
+        json!({"project_files":files.iter().take(200).collect::<Vec<_>>(),"project_files_truncated":files.len()>200,"note":"Project inventory plus optional Rust declarations. An empty Rust index does not mean the project is empty. Use list_files, search and read_file for other formats. Index of on-disk declarations, not claims of correctness. Reachability is a static hint for default Cargo entrypoints; cfg/custom targets may differ. Read source and run checks to verify behavior. Existing types should be reused rather than duplicated.","files":rows}),
     )
 }
 #[cfg(test)]

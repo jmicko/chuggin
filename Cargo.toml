@@ -1,9 +1,9 @@
 [package]
 name = "chuggin"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 license = "Apache-2.0"
-description = "A terminal harness for persistent coding projects with fresh-context local model stages"
+description = "A terminal harness for persistent projects with fresh-context local model stages"
 readme = "README.md"
 repository = "https://github.com/jmicko/chuggin"
 include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE*"]

@@ -76,7 +76,7 @@ fn main() -> Result<()> {
             eprintln!("Stopped. Run chuggin again to resume from saved progress.");
             std::process::exit(130);
         }
-        events::log("Stop requested: finishing this loop, then saving and exiting. Press Ctrl-C again to stop immediately.".into());
+        events::log("Stop requested: finishing this loop, then saving. In the dashboard, press R to resume; Ctrl-C again stops immediately.".into());
     })?;
     match cli.command {
         None => menu::home(stopped, running),

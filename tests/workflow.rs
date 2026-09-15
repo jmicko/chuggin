@@ -274,6 +274,51 @@ fn pipeline(pass: bool) {
             .success()
     );
 }
+
+#[test]
+fn plain_text_project_uses_its_own_validation_without_rust_tools() {
+    let server = Server::new(false, false);
+    let root = tempfile::tempdir().unwrap();
+    let config_path = fixture(root.path(), &server.url, true);
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["goal"] = json!("Update the numeric value in a plain text artifact.");
+    config["checks"] =
+        json!([{"argv":["sh","-c","test \"$(cat value.txt)\" = 1"],"timeout_seconds":5}]);
+    fs::write(&config_path, config.to_string()).unwrap();
+    let out = command(root.path())
+        .args(["run", "--cycles", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let state: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
+    assert_eq!(state["recent"][0]["disposition"], "accepted");
+    assert_eq!(
+        fs::read_to_string(
+            Path::new(state["accepted_workspace"].as_str().unwrap()).join("value.txt")
+        )
+        .unwrap(),
+        "1"
+    );
+    assert!(
+        !root
+            .path()
+            .join("state/cycle-000001/probe-outcome.json")
+            .exists()
+    );
+    for request in server.requests.lock().unwrap().iter() {
+        if let Some(tools) = request["tools"].as_array() {
+            assert!(!tools.iter().any(|tool| matches!(
+                tool["function"]["name"].as_str(),
+                Some("compiler_diagnostics" | "lookup_symbol")
+            )));
+        }
+    }
+}
 #[test]
 fn fresh_cycles_and_checkout_isolation() {
     pipeline(true);
@@ -712,6 +757,20 @@ mod terminal_ui {
                 .unwrap();
         assert_eq!(state["cycle"], 1);
         assert_eq!(state["recent"][0]["disposition"], "accepted");
+        // Resume directly after the worker has actually stopped.
+        ui.send(b"r");
+        ui.wait("cycle 2");
+        ui.send(b"\x03");
+        ui.wait("Finishing this cycle");
+        ui.send(b"r");
+        ui.wait("Stop cancelled");
+        ui.wait("cycle 3");
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        let resumed: Value =
+            serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(resumed["cycle"], 3);
         ui.send(b"\r");
         ui.wait("Resume project");
         ui.send(b"q");
@@ -824,7 +883,7 @@ mod terminal_ui {
         ui.wait("Build a useful editor. Draft 1.");
         ui.send(b"\r");
         ui.wait("Validation command");
-        ui.send(b"\r");
+        ui.send(b"git rev-parse HEAD\r");
         ui.wait("Check timeout (seconds)");
         ui.send(b"\r");
         ui.wait("Resume project");

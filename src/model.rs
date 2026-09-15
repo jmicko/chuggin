@@ -314,8 +314,8 @@ fn repetitive(s: &str) -> bool {
 pub fn tools() -> Value {
     let mut tools = json!([
      {"type":"function","function":{"name":"save_progress_note","description":"Replace a short task-local handoff note preserved across fresh contexts and same-task repairs. Record observed failure, attempted fix, constraints learned, and next action; cite files or check evidence. This is an advisory note, not proof of success. Maximum 1600 bytes; empty clears it.","parameters":{"type":"object","properties":{"note":{"type":"string"}},"required":["note"]}}},
-     {"type":"function","function":{"name":"project_map","description":"Inspect existing Rust types, public methods, file paths, and module reachability. Use before creating a new type or guessing an existing API. The index describes code, not correctness.","parameters":{"type":"object","properties":{}}}},
-     {"type":"function","function":{"name":"request_file_access","description":"Request access to an existing Rust source dependency omitted from task.files. Explain the minimal supporting change, such as adding an accessor needed by the new type. The harness grants safe source paths and records the exception for review. Preserve existing APIs and tests.","parameters":{"type":"object","properties":{"path":{"type":"string"},"reason":{"type":"string"}},"required":["path","reason"]}}},
+     {"type":"function","function":{"name":"project_map","description":"Inspect project file paths plus optional Rust declarations and module reachability. For other formats use search and read_file to inspect content. The map is inventory, not proof of correctness.","parameters":{"type":"object","properties":{}}}},
+     {"type":"function","function":{"name":"request_file_access","description":"Request access to an existing supporting file omitted from task.files, in any language or text format. Explain the minimal supporting change. The harness grants safe paths and records the exception for review. Preserve existing behavior and validation.","parameters":{"type":"object","properties":{"path":{"type":"string"},"reason":{"type":"string"}},"required":["path","reason"]}}},
      {"type":"function","function":{"name":"read_file","description":"Read numbered lines. Follow the continuation start_line to read the rest, rather than repeating the same request.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"line_count":{"type":"integer"}},"required":["path"]}}},
      {"type":"function","function":{"name":"edit_file","description":"Replace an exact, unique old_text occurrence with new_text. Supply file text without line-number prefixes.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}}},
      {"type":"function","function":{"name":"list_files","description":"List project paths.","parameters":{"type":"object","properties":{}}}},
@@ -336,9 +336,26 @@ pub fn tools() -> Value {
     }
     tools
 }
-pub fn inspection_tools() -> Value {
+pub fn tools_for(root: &std::path::Path) -> Value {
+    let mut available = tools();
+    let rust = crate::project::inventory(root)
+        .unwrap_or_default()
+        .iter()
+        .any(|p| p.ends_with(".rs"));
+    available
+        .as_array_mut()
+        .unwrap()
+        .retain(|t| match t["function"]["name"].as_str() {
+            Some("compiler_diagnostics") => root.join("Cargo.toml").is_file(),
+            Some("lookup_symbol") => rust,
+            _ => true,
+        });
+    available
+}
+
+pub fn inspection_tools(root: &std::path::Path) -> Value {
     json!(
-        tools()
+        tools_for(root)
             .as_array()
             .unwrap()
             .iter()
