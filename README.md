@@ -109,6 +109,14 @@ not prior conversations or unverified reviewer claims. The latest rejected
 attempt can be retried from the same accepted baseline; repeated unsuccessful
 repairs return to task planning without resurrecting older broken candidates.
 
+Implementation keeps a bounded, task-local repair note across context resets
+and eligible retries of the same task. It records recent actions and failures;
+the model can use `save_progress_note` to replace a short factual handoff about
+what it tried, constraints it found, and its next action. These notes work with
+any project language or file type. They are advisory: current files and actual
+validation results take precedence. A new task starts with an empty note.
+Each cycle saves `repair-note.json` alongside its other diagnostic artifacts.
+
 Full acceptance requires passing checks, preservation of previously reported
 passing Rust test names, scope compliance, and reviewer evidence
 for every criterion. Markdown formatting and whitespace differences in copied

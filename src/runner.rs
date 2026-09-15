@@ -84,6 +84,75 @@ struct Criterion {
     passed: bool,
     evidence: String,
 }
+
+/// Bounded, task-local evidence survives resets without retaining a transcript.
+#[derive(Default, Serialize, Deserialize)]
+struct RepairNote {
+    model_note: String,
+    recent_actions: Vec<String>,
+    last_failure: String,
+}
+impl RepairNote {
+    fn record(&mut self, action: &str, result: &str, failed: bool) {
+        let entry = project::excerpt(&format!("{action}: {result}"), 700);
+        if failed {
+            self.last_failure = entry.clone();
+        }
+        self.recent_actions.push(entry);
+        if self.recent_actions.len() > 4 {
+            self.recent_actions.remove(0);
+        }
+    }
+    fn set_note(&mut self, note: &str) -> Result<()> {
+        anyhow::ensure!(
+            note.len() <= 1600,
+            "Keep the progress note within 1600 bytes"
+        );
+        self.model_note = note.trim().into();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod repair_note_tests {
+    use super::*;
+
+    #[test]
+    fn failed_attempt_survives_later_actions_and_disk_round_trip() {
+        let mut note = RepairNote::default();
+        note.set_note("Keep the existing column names; fix the new formula instead.")
+            .unwrap();
+        note.record("validate report", "unknown column: Revenue", true);
+        for n in 0..20 {
+            note.record("edit report", &format!("attempt {n}"), false);
+        }
+        let saved = serde_json::to_vec(&note).unwrap();
+        let restored: RepairNote = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.recent_actions.len(), 4);
+        assert!(restored.last_failure.contains("unknown column"));
+        assert!(restored.model_note.contains("existing column names"));
+        assert!(
+            !restored
+                .recent_actions
+                .iter()
+                .any(|v| v.ends_with("attempt 0"))
+        );
+    }
+
+    #[test]
+    fn notes_are_replaced_bounded_and_clearable() {
+        let mut note = RepairNote::default();
+        note.set_note("Previous observation").unwrap();
+        assert!(note.set_note(&"x".repeat(1601)).is_err());
+        assert_eq!(note.model_note, "Previous observation");
+        note.set_note("New observation").unwrap();
+        note.record("check", &"界".repeat(2000), true);
+        assert!(note.last_failure.len() < 750);
+        note.set_note("").unwrap();
+        assert!(note.model_note.is_empty());
+        assert!(RepairNote::default().last_failure.is_empty());
+    }
+}
 fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
@@ -570,9 +639,14 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
         baseline.clone()
     };
     crate::events::send(crate::events::Event::Phase("Implement".into()));
+    let mut repair_note: RepairNote = recovery
+        .as_ref()
+        .and_then(|prior| fs::read(prior.artifact_dir.join("repair-note.json")).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
     let mut messages = vec![
         json!({"role":"system","content":crate::prompts::IMPLEMENT}),
-        json!({"role":"user","content":json!({"main_goal":c.goal,"task":task,"current_checks":working_checks,"recovery_origin":recovery.as_ref().map(|o|o.cycle),"instruction":"When checks fail, fix the first compiler/test error with a targeted edit before doing any broader work. Then add the missing focused tests.","current_files":project::context(&workspace,&task.files,18000)}).to_string()}),
+        json!({"role":"user","content":json!({"main_goal":c.goal,"task":task,"current_checks":working_checks,"repair_note":repair_note,"recovery_origin":recovery.as_ref().map(|o|o.cycle),"instruction":"When checks fail, fix the first compiler/test error with a targeted edit before doing any broader work. Then add the missing focused tests.","current_files":project::context(&workspace,&task.files,18000)}).to_string()}),
     ];
     let mut notes = String::new();
     let mut last_result = String::new();
@@ -586,7 +660,7 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
             > (c.context_tokens.saturating_sub(c.output_tokens + 2048) as usize).min(48000)
         {
             messages.truncate(1);
-            messages.push(json!({"role":"user","content":json!({"task":task,"current_files":project::context(&workspace,&task.files,12000),"latest_result":last_result,"latest_checks":latest_checks,"instruction":"Fresh implementation session, same task and files. Continue the existing work. Do not re-plan the project. Implement the missing behavior and run checks."}).to_string()}));
+            messages.push(json!({"role":"user","content":json!({"task":task,"repair_note":repair_note,"current_files":project::context(&workspace,&task.files,12000),"latest_result":last_result,"latest_checks":latest_checks,"instruction":"Fresh implementation session, same task and files. Continue the existing work. Do not re-plan the project. Implement the missing behavior and run checks."}).to_string()}));
             emit(art, &format!("context-refresh-{step}"), &messages)?;
         }
         let response = match m.chat(&messages, Some(tools()), false) {
@@ -594,12 +668,14 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
             Err(e) => {
                 response_errors += 1;
                 notes = format!("Model response failed: {e:#}");
+                repair_note.record("model response", &notes, true);
+                emit(art, "repair-note", &repair_note)?;
                 emit(art, &format!("response-error-{step}"), &notes)?;
                 if response_errors >= 3 {
                     break;
                 }
                 messages.truncate(1);
-                messages.push(json!({"role":"user","content":json!({"task":task,"current_files":project::context(&workspace,&task.files,12000),"recovery":"Previous response failed. Work already written remains. Make a small targeted edit now; keep each response short."}).to_string()}));
+                messages.push(json!({"role":"user","content":json!({"task":task,"repair_note":repair_note,"current_files":project::context(&workspace,&task.files,12000),"latest_checks":latest_checks,"recovery":"Previous response failed. Work already written remains. Make a small targeted edit now; keep each response short."}).to_string()}));
                 continue;
             }
         };
@@ -622,14 +698,22 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                     Ok(()) => {
                         edited = true;
                         latest_checks =
-                            checks(c, &workspace, art, &format!("patch-check-{step}"), stop)?
+                            checks(c, &workspace, art, &format!("patch-check-{step}"), stop)?;
+                        repair_note.record(
+                            "applied patch and checked",
+                            &serde_json::to_string(&latest_checks)?,
+                            latest_checks.iter().any(|r| !r.passed),
+                        );
+                        emit(art, "repair-note", &repair_note)?;
                     }
                     Err(e) => {
+                        repair_note.record("patch attempt", &format!("{e:#}"), true);
+                        emit(art, "repair-note", &repair_note)?;
                         emit(art, &format!("patch-error-{step}"), &format!("{e:#}"))?;
                     }
                 }
                 messages.truncate(1);
-                messages.push(json!({"role":"user","content":json!({"task":task,"current_files":project::context(&workspace,&task.files,18000),"current_checks":latest_checks,"instruction":"These are the actual files and checks after the patch. Add any missing tests or fix the remaining error using tools. Do not claim unperformed actions."}).to_string()}));
+                messages.push(json!({"role":"user","content":json!({"task":task,"repair_note":repair_note,"current_files":project::context(&workspace,&task.files,18000),"current_checks":latest_checks,"instruction":"These are the actual files and checks after the patch. Add any missing tests or fix the remaining error using tools. Do not claim unperformed actions."}).to_string()}));
                 continue;
             }
             notes = response["content"].as_str().unwrap_or("").into();
@@ -645,6 +729,10 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                 args["path"].as_str().unwrap_or("")
             )));
             let result: Result<String> = (|| match name {
+                "save_progress_note" => {
+                    repair_note.set_note(args["note"].as_str().context("Missing note")?)?;
+                    Ok("Task-local note saved; verify it against current files and checks.".into())
+                }
                 "project_map" => Ok(crate::code_index::index(&workspace)?.to_string()),
                 "lookup_symbol" => Ok(crate::symbols::lookup(&workspace, args)?.to_string()),
                 "run_command" => {
@@ -743,12 +831,58 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                 }
                 _ => anyhow::bail!("Unknown tool: {name}"),
             })();
+            let command_failed = matches!(name, "run_command" | "compiler_diagnostics")
+                && result
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                    .is_some_and(|v| {
+                        v["passed"] == false
+                            || v["timed_out"] == true
+                            || v["exit_code"].as_i64().is_some_and(|code| code != 0)
+                    });
             let value = match result {
                 Ok(v) => json!({"ok":true,"result":project::excerpt(&v,12000)}),
                 Err(e) => json!({"ok":false,"error":e.to_string()}),
             };
             emit(art, &format!("tool-{step}-{index}"), &value)?;
             last_result = project::excerpt(&value.to_string(), 4000);
+            if matches!(
+                name,
+                "edit_file" | "write_file" | "run_command" | "run_checks" | "compiler_diagnostics"
+            ) || value["ok"] == false
+            {
+                let failed = value["ok"] == false
+                    || command_failed
+                    || (name == "run_checks" && latest_checks.iter().any(|r| !r.passed));
+                let evidence = if name == "run_checks" && !failed {
+                    "Configured checks passed; any earlier failure may now be resolved.".to_string()
+                } else if name == "run_checks" {
+                    serde_json::to_string(
+                        &latest_checks
+                            .iter()
+                            .filter(|r| !r.passed)
+                            .collect::<Vec<_>>(),
+                    )?
+                } else {
+                    value.to_string()
+                };
+                repair_note.record(
+                    &format!(
+                        "{name} {}",
+                        args["path"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| args
+                                .get("argv")
+                                .map(Value::to_string)
+                                .unwrap_or_default())
+                    ),
+                    &evidence,
+                    failed,
+                );
+            }
+            emit(art, "repair-note", &repair_note)?;
             if (name == "write_file" || name == "edit_file") && value["ok"] == true {
                 observations = 0;
                 edited = true;
@@ -777,9 +911,17 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                     edited = true;
                     latest_checks =
                         checks(c, &workspace, art, &format!("patch-check-{step}"), stop)?;
-                    messages.push(json!({"role":"user","content":json!({"applied_patch":true,"current_files":project::context(&workspace,&task.files,16000),"current_checks":latest_checks}).to_string()}));
+                    repair_note.record(
+                        "applied patch and checked",
+                        &serde_json::to_string(&latest_checks)?,
+                        latest_checks.iter().any(|r| !r.passed),
+                    );
+                    emit(art, "repair-note", &repair_note)?;
+                    messages.push(json!({"role":"user","content":json!({"repair_note":repair_note,"applied_patch":true,"current_files":project::context(&workspace,&task.files,16000),"current_checks":latest_checks}).to_string()}));
                 }
                 Err(e) => {
+                    repair_note.record("patch attempt", &format!("{e:#}"), true);
+                    emit(art, "repair-note", &repair_note)?;
                     emit(art, &format!("patch-error-{step}"), &format!("{e:#}"))?;
                 }
             }

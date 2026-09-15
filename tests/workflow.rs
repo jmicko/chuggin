@@ -84,7 +84,7 @@ impl Server {
                         match stage {
                             0 => (json!({"gap":"Improve value","why_now":"Next increment","files":["value.txt"]}).to_string(),json!([])),
                             1 => (json!({"title":format!("Increment {cycle}"),"objective":"Improve value","acceptance":["Value updated"],"files":["value.txt"],"out_of_scope":["Other files"]}).to_string(),json!([])),
-                            2 => ("".into(),json!([{"function":{"name":"write_file","arguments":{"path":"value.txt","content":cycle.to_string()}}}])),
+                            2 => ("".into(),json!([{"function":{"name":"save_progress_note","arguments":{"note":format!("Task-local observation for cycle {cycle}")}}},{"function":{"name":"write_file","arguments":{"path":"value.txt","content":cycle.to_string()}}}])),
                             3 => ("PRIVATE_IMPLEMENTATION_TRANSCRIPT".into(),json!([])),
                             _ => (json!({"decision":"accept","reason":"Diff changes value","criteria":[{"criterion":"Value updated","passed":true,"evidence":"value.txt diff"}]}).to_string(),json!([])),
                         }
@@ -208,8 +208,16 @@ fn pipeline(pass: bool) {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let state: Value =
         serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
+    let note: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000001/repair-note.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(note["model_note"], "Task-local observation for cycle 1");
     let requests = server.requests.lock().unwrap();
     assert_eq!(requests.len(), 10);
+    let next_input: Value =
+        serde_json::from_str(requests[7]["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(next_input["repair_note"]["model_note"], "");
     for n in [0, 1, 4, 5, 6, 9] {
         assert_eq!(requests[n]["messages"].as_array().unwrap().len(), 2);
     }
