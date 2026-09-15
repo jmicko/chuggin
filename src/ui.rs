@@ -203,7 +203,7 @@ fn splash(
     f.render_widget(Paragraph::new(logo).fg(ACCENT), logo_area);
     if rows[0].height > 7 {
         f.render_widget(
-            Paragraph::new("Small models. Fresh starts. Lasting progress.")
+            Paragraph::new("Just chuggin along...")
                 .fg(MUTED)
                 .alignment(Alignment::Center),
             Rect::new(rows[0].x, rows[0].y + 8, rows[0].width, 1),
