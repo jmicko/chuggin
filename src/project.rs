@@ -42,10 +42,9 @@ pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     anyhow::ensure!(!relative.is_empty(), "Empty path");
     for c in path.components() {
         match c {
-            Component::Normal(n) => anyhow::ensure!(
-                n != ".git" && n != ".chuggin" && n != ".lupin",
-                "Reserved path"
-            ),
+            Component::Normal(n) => {
+                anyhow::ensure!(n != ".git" && n != ".chuggin", "Reserved path")
+            }
             _ => bail!("Only relative paths without traversal are allowed"),
         }
     }
@@ -88,7 +87,6 @@ pub fn inventory(root: &Path) -> Result<Vec<String>> {
             if [
                 ".git",
                 ".chuggin",
-                ".lupin",
                 "target",
                 "node_modules",
                 ".venv",

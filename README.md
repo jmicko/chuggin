@@ -263,11 +263,3 @@ across longer runs before treating these changes as a performance improvement.
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
-
-## Upgrading from Lupin
-
-Chuggin also discovers existing `lupin.json` projects and resumes their original
-`.lupin` state in place. Historical worktrees and branch names stay valid. New
-projects use `chuggin.json` and `.chuggin`. Shared settings and Brave credentials
-are copied once from the old config directory on first use; existing Chuggin
-settings take precedence. The old files are left intact.

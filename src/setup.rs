@@ -40,26 +40,7 @@ pub fn settings_path() -> Result<PathBuf> {
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
         .context("Cannot locate user configuration directory")?;
-    migrate_settings(&base)?;
     Ok(base.join("chuggin/settings.json"))
-}
-fn migrate_settings(base: &Path) -> Result<()> {
-    let old = base.join("lupin");
-    let new = base.join("chuggin");
-    if !new.exists() && old.join("settings.json").is_file() {
-        fs::create_dir_all(&new)?;
-        // Never overwrite a new installation or reimport a key the user removed.
-        if let Ok(key) = fs::read_to_string(old.join("brave.key"))
-            && !key.trim().is_empty()
-        {
-            crate::web_tools::save_key(&new.join("brave.key"), &key)?;
-        }
-        save(
-            &new.join("settings.json"),
-            &serde_json::from_slice::<Settings>(&fs::read(old.join("settings.json"))?)?,
-        )?;
-    }
-    Ok(())
 }
 pub fn settings() -> Result<Settings> {
     let p = settings_path()?;
@@ -208,11 +189,9 @@ pub fn configure(show: bool) -> Result<()> {
 pub fn find_project() -> Result<Option<PathBuf>> {
     let cwd = std::env::current_dir()?;
     for p in cwd.ancestors() {
-        for name in ["chuggin.json", "lupin.json"] {
-            let config = p.join(name);
-            if config.is_file() {
-                return Ok(Some(config));
-            }
+        let config = p.join("chuggin.json");
+        if config.is_file() {
+            return Ok(Some(config));
         }
         if p.join(".git").exists() {
             break;
@@ -263,7 +242,7 @@ pub fn wizard() -> Result<PathBuf> {
     ensure_git_identity(&root)?;
     let config = root.join("chuggin.json");
     anyhow::ensure!(
-        !config.exists() && !root.join("lupin.json").exists(),
+        !config.exists(),
         "Project already configured; run chuggin to resume."
     );
     crate::ui::notice(format!(
@@ -375,7 +354,7 @@ pub fn wizard() -> Result<PathBuf> {
         &["rev-parse", "--git-path", "info/exclude"],
     )?);
     let mut ignored = fs::read_to_string(&exclude).unwrap_or_default();
-    for entry in ["/.chuggin/", "/chuggin.json", "/.lupin/", "/lupin.json"] {
+    for entry in ["/.chuggin/", "/chuggin.json"] {
         if !ignored.lines().any(|line| line == entry) {
             ignored.push_str(&format!("\n{entry}\n"));
         }
@@ -385,13 +364,7 @@ pub fn wizard() -> Result<PathBuf> {
     }
     fs::write(exclude, ignored)?;
     if project::git(&root, &["rev-parse", "HEAD"]).is_err() {
-        let scope = [
-            ".",
-            ":(exclude).chuggin",
-            ":(exclude)chuggin.json",
-            ":(exclude).lupin",
-            ":(exclude)lupin.json",
-        ];
+        let scope = [".", ":(exclude).chuggin", ":(exclude)chuggin.json"];
         let mut list = vec![
             "ls-files",
             "--cached",
