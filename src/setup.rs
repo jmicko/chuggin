@@ -637,6 +637,40 @@ pub fn run_duration(path: &Path) -> Result<()> {
     }
 }
 
+pub fn save_live_setting(path: &Path, field: usize, input: &str) -> Result<()> {
+    let mut config: Value = serde_json::from_slice(&fs::read(path)?)?;
+    match field {
+        0 => {
+            let name = input.trim();
+            anyhow::ensure!(
+                !name.is_empty() && !name.chars().any(char::is_whitespace),
+                "Enter an exact model name without spaces"
+            );
+            config["model"] = json!(name);
+        }
+        1 | 2 => {
+            let value: f64 = input
+                .trim()
+                .parse()
+                .context("Enter a number; 0 means unlimited")?;
+            let seconds = value * if field == 1 { 60.0 } else { 3600.0 };
+            anyhow::ensure!(
+                seconds.is_finite()
+                    && (0.0..=31536000.0).contains(&seconds)
+                    && (seconds == 0.0 || seconds >= 1.0),
+                "Choose 0 (unlimited) or between one second and one year"
+            );
+            config[if field == 1 {
+                "request_timeout_seconds"
+            } else {
+                "run_duration_seconds"
+            }] = json!(seconds.round() as u64);
+        }
+        _ => anyhow::bail!("Unknown project setting"),
+    }
+    save(path, &config)
+}
+
 fn draft_recovery(root: &Path, detail: &str) -> Result<()> {
     let log = root.join(".chuggin/goal-error.txt");
     fs::write(&log, detail)?;

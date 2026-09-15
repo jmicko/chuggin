@@ -25,6 +25,9 @@ impl Server {
         Self::with_probe(wizard, delay, None)
     }
     fn with_probe(wizard: bool, delay: bool, probe: Option<u8>) -> Self {
+        Self::serve(wizard, delay, probe, false)
+    }
+    fn serve(wizard: bool, delay: bool, probe: Option<u8>, timeout_review: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -70,8 +73,12 @@ impl Server {
                     if delay {
                         thread::sleep(Duration::from_millis(500));
                     }
-                    let stage = n % 5;
-                    let cycle = n / 5 + 1;
+                    if timeout_review && n == 4 {
+                        thread::sleep(Duration::from_millis(1200));
+                    }
+                    let logical = n - usize::from(timeout_review && n > 4);
+                    let stage = logical % 5;
+                    let cycle = logical / 5 + 1;
                     let (content, tools) = if wizard {
                         (
                             json!({"goal":format!("Build a useful editor. Draft {}.", n+1)})
@@ -348,6 +355,34 @@ fn duration_limit_finishes_cycle_and_resets_on_resume() {
             "accepted"
         );
     }
+}
+
+#[test]
+fn timed_out_review_retries_without_repeating_implementation() {
+    let server = Server::serve(false, false, None, true);
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["request_timeout_seconds"] = json!(1);
+    fs::write(&path, config.to_string()).unwrap();
+    let output = command(root.path())
+        .args(["run", "--cycles", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
+    assert_eq!(state["recent"][0]["disposition"], "accepted");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert_eq!(
+        requests[4], requests[5],
+        "Retry exactly the failed review, not earlier stages"
+    );
 }
 #[test]
 fn fresh_cycles_and_checkout_isolation() {
@@ -828,6 +863,44 @@ mod terminal_ui {
         .unwrap();
         assert_eq!(saved["ollama_url"], "http://localhost:11434");
         assert!(!root.path().join("chuggin.json").exists());
+    }
+
+    #[test]
+    fn observation_settings_apply_without_interrupting_active_requests() {
+        let server = Server::new(false, true);
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"\r");
+        ui.wait("Receiving response");
+        ui.send(b"5");
+        ui.wait("PROJECT SETTINGS");
+        ui.send(b"\r\x15fake-next\r");
+        ui.send(b"\x1b[B\r\x150\r");
+        // Reduce an initially unlimited run to one second from its original start.
+        ui.send(b"\x1b[B\r\x150.0003\r");
+        ui.wait("Time limit reached");
+        ui.wait("Run saved");
+        let config: Value =
+            serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
+        assert_eq!(config["model"], "fake-next");
+        assert_eq!(config["request_timeout_seconds"], 0);
+        assert_eq!(config["run_duration_seconds"], 1);
+        let state: Value =
+            serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["cycle"], 1);
+        assert_eq!(state["recent"][0]["disposition"], "accepted");
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[0]["model"], "fake");
+        assert!(requests[1..].iter().all(|r| r["model"] == "fake-next"));
+        drop(requests);
+        ui.send(b"q");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
     }
     #[test]
     fn brave_key_entry_is_masked_and_stored_separately() {

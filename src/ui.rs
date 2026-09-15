@@ -603,6 +603,10 @@ struct Dashboard {
     last_activity: Instant,
     resources: Resource,
     tab: usize,
+    active_model: String,
+    settings_selected: usize,
+    settings_edit: Option<String>,
+    settings_error: String,
     follow: bool,
     scroll: usize,
     rows: usize,
@@ -637,6 +641,10 @@ impl Dashboard {
             last_activity: Instant::now(),
             resources: Resource::new(),
             tab: 0,
+            active_model: config.model.clone(),
+            settings_selected: 0,
+            settings_edit: None,
+            settings_error: String::new(),
             follow: true,
             scroll: 0,
             rows: 1,
@@ -727,6 +735,8 @@ impl Dashboard {
     fn apply(&mut self, event: Event) {
         self.last_activity = Instant::now();
         match event {
+            Event::RequestModel(name) => self.active_model = name,
+            Event::RequestFinished => self.request_active = false,
             Event::Log(s) => self.push(Kind::Activity, s),
             Event::Phase(s) => {
                 self.request_active = false;
@@ -860,6 +870,66 @@ impl Dashboard {
 fn duration(s: u64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
+fn setting_value(c: &runner::Config, field: usize) -> String {
+    match field {
+        0 => c.model.clone(),
+        1 => format!("{}", c.request_timeout_seconds as f64 / 60.0),
+        _ => format!("{}", c.run_duration_seconds as f64 / 3600.0),
+    }
+}
+fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from("PROJECT SETTINGS").fg(ACCENT).bold(),
+        Line::from("Only this project; saved automatically."),
+        Line::from(""),
+    ];
+    for (index, label) in [
+        "Model (exact installed name)",
+        "Request timeout (minutes; 0 unlimited)",
+        "Run duration (hours; 0 unlimited)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let value = if index == d.settings_selected {
+            d.settings_edit
+                .clone()
+                .unwrap_or_else(|| setting_value(c, index))
+        } else {
+            setting_value(c, index)
+        };
+        lines.push(
+            Line::from(format!(
+                "{} {label}: {value}{}",
+                if index == d.settings_selected {
+                    "›"
+                } else {
+                    " "
+                },
+                if index == d.settings_selected && d.settings_edit.is_some() {
+                    "▏"
+                } else {
+                    ""
+                }
+            ))
+            .fg(if index == d.settings_selected {
+                ACCENT
+            } else {
+                FG
+            }),
+        );
+        lines.push(Line::from(""));
+    }
+    lines.extend([
+        Line::from("↑↓ select · Enter edit/save · Ctrl+U clear · Esc cancel"),
+        Line::from("Model and timeout apply to the NEXT request."),
+        Line::from(format!("Current/last request model: {}", d.active_model)),
+        Line::from("Timer changes apply now, measured from this run's start."),
+        Line::from("An expired timer finishes the cycle; it never cancels a call."),
+        Line::from(d.settings_error.clone()).fg(GOLD),
+    ]);
+    lines
+}
 fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stopping: bool) {
     base(f);
     let a = f.area().inner(Margin::new(1, 0));
@@ -937,11 +1007,17 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     .split(r[3]);
     let log = Layout::vertical([Constraint::Length(1), Constraint::Min(2)]).split(body[0]);
     f.render_widget(
-        Tabs::new(vec!["1 Live", "2 Model", "3 Checks", "4 Goal"])
-            .select(d.tab)
-            .style(Style::default().fg(MUTED))
-            .highlight_style(Style::default().fg(ACCENT).bold())
-            .divider(" │ "),
+        Tabs::new(vec![
+            "1 Live",
+            "2 Model",
+            "3 Checks",
+            "4 Goal",
+            "5 Settings",
+        ])
+        .select(d.tab)
+        .style(Style::default().fg(MUTED))
+        .highlight_style(Style::default().fg(ACCENT).bold())
+        .divider(" │ "),
         log[0],
     );
     let label = if d.searching {
@@ -956,7 +1032,11 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     let block = panel(&label);
     let inner = block.inner(log[1]);
     f.render_widget(block, log[1]);
-    let lines = d.lines(inner.width.saturating_sub(1) as usize, &c.goal);
+    let lines = if d.tab == 4 {
+        settings_lines(d, c)
+    } else {
+        d.lines(inner.width.saturating_sub(1) as usize, &c.goal)
+    };
     d.total_rows = lines.len();
     d.rows = inner.height as usize;
     if d.follow {
@@ -998,7 +1078,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         .split(inner);
         let model = vec![
             Line::from("MODEL").fg(CYAN).bold(),
-            Line::from(c.model.clone()),
+            Line::from(d.active_model.clone()),
             Line::from(if d.request_active {
                 "● Receiving response"
             } else {
@@ -1108,7 +1188,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             )
         )
     } else {
-        "↑↓ / wheel scroll · PgUp/PgDn · F follow · 1–4 views · / search · ? help · Ctrl+C finish cycle".into()
+        "↑↓ / wheel scroll · PgUp/PgDn · F follow · 1–5 views · / search · ? help · Ctrl+C finish cycle".into()
     };
     f.render_widget(
         Paragraph::new(footer).fg(if stopping { GOLD } else { MUTED }),
@@ -1122,7 +1202,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             a.height * 2 / 3,
         );
         f.render_widget(Clear, area);
-        f.render_widget(p("Observe without interrupting work\n\n↑ / ↓ or mouse wheel    Scroll a few lines\nPgUp / PgDn             Scroll a page\nHome / End              Oldest / latest output\nF                       Resume live following\n1–4 or Tab              Live, model, checks, goal\n/                       Search the current view\nEsc                     Clear search / close help\nCtrl+C or Q             Finish this cycle, then stop\nR                       Cancel stop / resume saved run\nCtrl+C again            Force stop immediately\n\nScrollback is bounded; complete logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.\nContext and token speed update after each model response.").block(panel("Keyboard guide · ? / Esc closes")),area);
+        f.render_widget(p("Observe without interrupting work\n\n↑ / ↓ or mouse wheel    Scroll a few lines\nPgUp / PgDn             Scroll a page\nHome / End              Oldest / latest output\nF                       Resume live following\n1–5 or Tab              Live, model, checks, goal, settings\n/                       Search the current view\nEsc                     Clear search / close help\nCtrl+C or Q             Finish this cycle, then stop\nR                       Cancel stop / resume saved run\nCtrl+C again            Force stop immediately\n\nScrollback is bounded; complete logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.\nContext and token speed update after each model response.").block(panel("Keyboard guide · ? / Esc closes")),area);
     }
 }
 
@@ -1132,7 +1212,7 @@ pub fn dashboard(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -
 }
 
 fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<bool> {
-    let config = runner::load(path)?;
+    let mut config = runner::load(path)?;
     let mut d = Dashboard::new(&config);
     let rx = events::subscribe();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1156,6 +1236,9 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
             }
             d.poll_tail();
             d.resources.refresh();
+            if let Ok(updated) = runner::load(path) {
+                config = updated;
+            }
             if d.finished.is_none()
                 && let Ok(result) = done_rx.try_recv()
             {
@@ -1187,6 +1270,61 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                             std::process::exit(130);
                         }
                         continue;
+                    }
+                    if d.tab == 4 {
+                        if let Some(text) = d.settings_edit.as_mut() {
+                            match k.code {
+                                KeyCode::Esc => {
+                                    d.settings_edit = None;
+                                    d.settings_error.clear();
+                                }
+                                KeyCode::Enter => {
+                                    let value = text.clone();
+                                    match crate::setup::save_live_setting(
+                                        path,
+                                        d.settings_selected,
+                                        &value,
+                                    ) {
+                                        Ok(()) => {
+                                            d.settings_edit = None;
+                                            d.settings_error.clear();
+                                            events::log("Project setting saved. Timer changes apply now; request settings apply on the next call.".into());
+                                        }
+                                        Err(e) => d.settings_error = e.to_string(),
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    text.pop();
+                                }
+                                KeyCode::Char('u')
+                                    if k.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    text.clear()
+                                }
+                                KeyCode::Char(ch)
+                                    if !k.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    text.push(ch)
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        match k.code {
+                            KeyCode::Up => {
+                                d.settings_selected = (d.settings_selected + 2) % 3;
+                                continue;
+                            }
+                            KeyCode::Down => {
+                                d.settings_selected = (d.settings_selected + 1) % 3;
+                                continue;
+                            }
+                            KeyCode::Enter => {
+                                d.settings_edit = Some(setting_value(&config, d.settings_selected));
+                                continue;
+                            }
+                            _ => {}
+                        }
                     }
                     if d.searching {
                         match k.code {
@@ -1233,11 +1371,11 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                         }
                         KeyCode::End | KeyCode::Char('f') => d.follow = true,
                         KeyCode::Tab => {
-                            d.tab = (d.tab + 1) % 4;
+                            d.tab = (d.tab + 1) % 5;
                             d.follow = d.tab != 3;
                             d.scroll = 0;
                         }
-                        KeyCode::Char(c @ '1'..='4') => {
+                        KeyCode::Char(c @ '1'..='5') => {
                             d.tab = (c as u8 - b'1') as usize;
                             d.follow = d.tab != 3;
                             d.scroll = 0;
@@ -1359,7 +1497,7 @@ mod tests {
         assert_eq!(e.value, "héllo\nworld");
     }
     fn config() -> runner::Config {
-        runner::Config {repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0}
+        runner::Config {repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,request_timeout_seconds:1800}
     }
     fn screen_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();

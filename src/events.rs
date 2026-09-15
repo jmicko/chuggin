@@ -13,6 +13,8 @@ pub enum Event {
     Cycle(u64),
     Task(String),
     Request,
+    RequestModel(String),
+    RequestFinished,
     Delta(String),
     Metrics {
         prompt: u64,

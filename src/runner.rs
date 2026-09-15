@@ -30,7 +30,13 @@ pub struct Config {
     pub retry_seconds: u64,
     #[serde(default)]
     pub run_duration_seconds: u64,
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_seconds: u64,
 }
+pub fn default_request_timeout() -> u64 {
+    1800
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     run_id: String,
@@ -1043,8 +1049,14 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
     let c = load(path)?;
     crate::setup::ensure_git_identity(&c.repo)?;
     let started = Instant::now();
-    let time_up =
-        || c.run_duration_seconds > 0 && started.elapsed().as_secs() >= c.run_duration_seconds;
+    let time_up = || {
+        let limit = fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|v| v["run_duration_seconds"].as_u64())
+            .unwrap_or(c.run_duration_seconds);
+        limit > 0 && started.elapsed().as_secs() >= limit
+    };
     anyhow::ensure!(
         c.checks
             .iter()
@@ -1105,13 +1117,14 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
     };
     // A soft stop is observed only between cycles. Stage work must finish normally.
     let stage_stop = Arc::new(AtomicBool::new(false));
-    let m = Model::new(
+    let mut m = Model::new(
         &c.ollama_url,
         &c.model,
         c.context_tokens,
         c.output_tokens,
         stage_stop.clone(),
     )?;
+    m.use_project_settings(path);
     if state.cycle > 0 && !state.recent.iter().any(|o| o.cycle == state.cycle) {
         let art = state_dir.join(format!("cycle-{:06}", state.cycle));
         if let Ok(bytes) = fs::read(art.join("task.json"))

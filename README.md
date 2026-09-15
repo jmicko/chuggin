@@ -48,7 +48,7 @@ splash screen, in-place settings and goal drafting, and a live run dashboard.
 The dashboard shows the current task and stage, model output as it arrives,
 tool actions, check output, recovery messages, and recent outcomes.
 
-- **1–4 / Tab:** switch between live activity, model output, checks, and the goal.
+- **1–5 / Tab:** switch between live activity, model output, checks, the goal, and local settings.
 - **Arrow keys / mouse wheel / Page Up / Page Down:** scroll without pausing work.
   Scrolling back to the bottom automatically resumes following live output.
 - **Home:** oldest retained output. **End / F:** follow live output again.
@@ -96,6 +96,20 @@ saves its outcome, and stops before starting another. This is a soft limit, so
 the run can exceed the chosen duration by the remaining cycle time. Resuming
 starts a new timer. The setting persists as `run_duration_seconds` in `chuggin.json`
 and also applies to command-line runs.
+
+## Live project settings
+
+Tab **5 Settings** in the observation view edits the exact model name, request
+timeout in minutes (0 means unlimited), and run duration in hours (0 means
+unlimited). Use arrows to select, Enter to edit/save, Ctrl+U to clear, and Esc
+to cancel. Changes persist only in this project’s `chuggin.json`.
+
+Model and request-timeout changes are snapshotted at the next model call, including
+a retry; the active call finishes with its original settings. The panel shows the
+current/last request model separately from the next selected model. Timer edits
+apply immediately against elapsed time since this run started. Shortening the
+duration below elapsed time requests a stop after the current cycle; extending
+it allows additional time. Resuming a stopped run starts a new timer.
 
 ## Persistent project, fresh stages
 
@@ -226,7 +240,12 @@ shared settings are reloaded when starting a run.
 Defaults: 32,768 context tokens, 4,096 output tokens, thinking disabled, and up to
 48 implementation responses per task. Fresh-context refreshes happen within that
 budget. Reaching the budget proceeds to verification and review, not a permanent
-pause. Model requests have a ten-minute timeout; checks have individual timeouts.
+pause. Model requests default to a 30-minute total timeout; set it to 0 for no
+request deadline. Connection establishment remains bounded to ten seconds.
+Checks have their own individual timeouts. A timeout or connection failure retries
+the same model request once, retaining completed edits and validation instead of
+restarting earlier stages. If the retry fails, normal cycle recovery applies.
+Request settings and failed attempts are recorded alongside the response traces.
 
 .chuggin/state.json points at the accepted commit and private workspace. Accepted
 branches are named codex/chuggin-.... The original checkout is not overwritten or

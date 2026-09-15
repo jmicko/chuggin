@@ -21,6 +21,7 @@ pub struct Model {
     stop: Arc<AtomicBool>,
     trace: RefCell<Option<PathBuf>>,
     sequence: Cell<u32>,
+    settings_path: Option<PathBuf>,
 }
 impl Model {
     pub fn new(
@@ -33,7 +34,6 @@ impl Model {
         Ok(Self {
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(600))
                 .build()?,
             url: format!("{}/api/chat", url.trim_end_matches('/')),
             name: name.into(),
@@ -42,7 +42,11 @@ impl Model {
             stop,
             trace: RefCell::new(None),
             sequence: Cell::new(0),
+            settings_path: None,
         })
+    }
+    pub fn use_project_settings(&mut self, path: &Path) {
+        self.settings_path = Some(path.to_owned());
     }
     pub fn trace_to(&self, path: &Path) {
         *self.trace.borrow_mut() = Some(path.into());
@@ -62,6 +66,60 @@ impl Model {
         tools: Option<Value>,
         format: Option<Value>,
     ) -> Result<Value> {
+        for attempt in 0..2 {
+            let result = self.chat_format_once(messages, tools.clone(), format.clone());
+            if let Err(error) = &result {
+                crate::events::send(crate::events::Event::RequestFinished);
+                let transient = error.chain().any(|e| {
+                    e.downcast_ref::<reqwest::Error>()
+                        .is_some_and(|e| e.is_timeout() || e.is_connect())
+                });
+                if let Some(path) = self.trace.borrow().as_ref() {
+                    std::fs::write(
+                        path.join(format!(
+                            "request-failure-{:03}.json",
+                            self.sequence.get().saturating_sub(1)
+                        )),
+                        serde_json::to_vec_pretty(
+                            &json!({"error":format!("{error:#}"),"retry_same_stage":transient && attempt == 0}),
+                        )?,
+                    )?;
+                }
+                if transient && attempt == 0 && !self.stop.load(Ordering::SeqCst) {
+                    crate::events::log("Model request timed out or failed to connect; retrying the same stage once with current settings. Completed edits and checks are retained.".into());
+                    continue;
+                }
+            }
+            return result;
+        }
+        unreachable!()
+    }
+
+    fn chat_format_once(
+        &self,
+        messages: &[Value],
+        tools: Option<Value>,
+        format: Option<Value>,
+    ) -> Result<Value> {
+        // Snapshot settings once; edits never alter an in-flight request.
+        let live = self
+            .settings_path
+            .as_ref()
+            .map(|p| crate::runner::load(p))
+            .transpose()?;
+        let name = live
+            .as_ref()
+            .map(|c| c.model.as_str())
+            .unwrap_or(&self.name);
+        let url = live
+            .as_ref()
+            .map(|c| format!("{}/api/chat", c.ollama_url.trim_end_matches('/')))
+            .unwrap_or_else(|| self.url.clone());
+        let timeout = live
+            .as_ref()
+            .map(|c| c.request_timeout_seconds)
+            .unwrap_or(1800);
+        crate::events::send(crate::events::Event::RequestModel(name.to_owned()));
         crate::events::send(crate::events::Event::Request);
         anyhow::ensure!(!self.stop.load(Ordering::SeqCst), "Stopped by operator");
         // Conservative byte budget; token counts vary by model/tokenizer.
@@ -73,7 +131,7 @@ impl Model {
             "Stage input exceeds conservative context budget ({input_bytes} bytes > {}); reduce task/context payload",
             budget.min(64000)
         );
-        let mut body = json!({"model":self.name,"messages":messages,"stream":true,"think":false,"options":{"num_ctx":self.context,"num_predict":self.output,"temperature":0.4}});
+        let mut body = json!({"model":name,"messages":messages,"stream":true,"think":false,"options":{"num_ctx":self.context,"num_predict":self.output,"temperature":0.4}});
         if let Some(t) = tools {
             body["tools"] = t;
         }
@@ -85,6 +143,12 @@ impl Model {
         self.sequence.set(sequence + 1);
         let mut trace = if let Some(path) = self.trace.borrow().as_ref() {
             std::fs::write(
+                path.join(format!("connection-{sequence:03}.json")),
+                serde_json::to_vec_pretty(
+                    &json!({"model":name,"request_timeout_seconds":timeout}),
+                )?,
+            )?;
+            std::fs::write(
                 path.join(format!("request-{sequence:03}.json")),
                 serde_json::to_vec_pretty(&body)?,
             )?;
@@ -94,12 +158,13 @@ impl Model {
         } else {
             None
         };
-        let response = self
-            .client
-            .post(&self.url)
-            .json(&body)
-            .send()?
-            .error_for_status()?;
+        let request = self.client.post(url).json(&body);
+        let request = if timeout == 0 {
+            request
+        } else {
+            request.timeout(Duration::from_secs(timeout))
+        };
+        let response = request.send()?.error_for_status()?;
         let mut content = String::new();
         let mut thinking = String::new();
         let mut calls = Vec::new();
