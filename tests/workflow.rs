@@ -28,6 +28,15 @@ impl Server {
         Self::serve(wizard, delay, probe, false)
     }
     fn serve(wizard: bool, delay: bool, probe: Option<u8>, timeout_review: bool) -> Self {
+        Self::serve_with_edit(wizard, delay, probe, timeout_review, None)
+    }
+    fn serve_with_edit(
+        wizard: bool,
+        delay: bool,
+        probe: Option<u8>,
+        timeout_review: bool,
+        edit: Option<String>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -91,7 +100,7 @@ impl Server {
                         match stage {
                             0 => (json!({"gap":"Improve value","why_now":"Next increment","files":["value.txt"]}).to_string(),json!([])),
                             1 => (json!({"title":format!("Increment {cycle}"),"objective":"Improve value","acceptance":["Value updated"],"files":["value.txt"],"out_of_scope":["Other files"]}).to_string(),json!([])),
-                            2 => ("".into(),json!([{"function":{"name":"save_progress_note","arguments":{"note":format!("Task-local observation for cycle {cycle}")}}},{"function":{"name":"write_file","arguments":{"path":"value.txt","content":cycle.to_string()}}}])),
+                            2 => ("".into(),json!([{"function":{"name":"save_progress_note","arguments":{"note":format!("Task-local observation for cycle {cycle}")}}},{"function":{"name":"write_file","arguments":{"path":"value.txt","content":edit.clone().unwrap_or_else(|| cycle.to_string())}}}])),
                             3 => ("PRIVATE_IMPLEMENTATION_TRANSCRIPT".into(),json!([])),
                             _ => (json!({"decision":"accept","reason":"Diff changes value","criteria":[{"criterion":"Value updated","passed":true,"evidence":"value.txt diff"}]}).to_string(),json!([])),
                         }
@@ -383,6 +392,45 @@ fn timed_out_review_retries_without_repeating_implementation() {
         requests[4], requests[5],
         "Retry exactly the failed review, not earlier stages"
     );
+}
+
+#[test]
+fn review_receives_complete_diff_larger_than_twelve_kilobytes() {
+    let content = format!(
+        "{}\nDIFF_END_MARKER\n",
+        "Useful project content.\n".repeat(650)
+    );
+    let server = Server::serve_with_edit(false, false, None, false, Some(content));
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["context_tokens"] = json!(65536);
+    fs::write(&path, config.to_string()).unwrap();
+    let output = command(root.path())
+        .args(["run", "--cycles", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
+    assert_eq!(state["recent"][0]["disposition"], "accepted");
+    let requests = server.requests.lock().unwrap();
+    let review = requests.last().unwrap();
+    let payload: Value =
+        serde_json::from_str(review["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let diff = payload["diff"].as_str().unwrap();
+    assert!(diff.len() > 12000);
+    assert!(diff.ends_with("+DIFF_END_MARKER"));
+    assert_eq!(payload["diff_truncated"], false);
+    let actual = git(
+        Path::new(state["accepted_workspace"].as_str().unwrap()),
+        &["diff", "HEAD^", "HEAD", "--no-ext-diff", "--no-textconv"],
+    );
+    assert_eq!(diff, actual);
 }
 #[test]
 fn fresh_cycles_and_checkout_isolation() {

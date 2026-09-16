@@ -973,12 +973,8 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
         &workspace,
         &["diff", "--cached", "--no-ext-diff", "--no-textconv"],
     )?;
-    anyhow::ensure!(
-        diff.len() <= 12000,
-        "Diff is too large for an independent bounded review; replan smaller"
-    );
     crate::events::send(crate::events::Event::Phase("Review".into()));
-    let review:Review=m.structured(crate::prompts::REVIEW,json!({"main_goal":c.goal,"criteria":criterion_specs(&task),"task":task,"diff":project::excerpt(&diff,12000),"diff_truncated":diff.len()>12000,"changed_files":changed_files,"resulting_files":project::context(&workspace,&task.files,8000),"baseline_test_names":test_names(&baseline),"verification":result,"independent_probe":fs::read(art.join("probe-outcome.json")).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok())}))?;
+    let review:Review=m.structured(crate::prompts::REVIEW,json!({"main_goal":c.goal,"criteria":criterion_specs(&task),"task":task,"diff":diff,"diff_truncated":false,"changed_files":changed_files,"resulting_files":project::context(&workspace,&task.files,8000),"baseline_test_names":test_names(&baseline),"verification":result,"independent_probe":fs::read(art.join("probe-outcome.json")).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok())}))?;
     emit(art, "review", &review)?;
     let staged_names = project::git(&workspace, &["diff", "--cached", "--name-only", "-z"])?;
     let unexpected: Vec<_> = changed_files

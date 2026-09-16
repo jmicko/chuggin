@@ -283,7 +283,8 @@ another machine. Advanced automation commands are available through help.
 
 This is an experimental harness, not proof of product completeness. Check quality
 and model judgment matter; partial acceptance does not prove arbitrary behavior
-correct. Tasks are still bounded by context and a 12KB review diff limit.
+correct. The reviewer receives the full diff without a separate size cutoff. The overall
+request-context guard still applies, so very large changes can exceed that budget.
 Checks run with the user's permissions. Worktrees isolate Git changes, not code
 execution.
 
