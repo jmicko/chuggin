@@ -37,6 +37,16 @@ impl Server {
         timeout_review: bool,
         edit: Option<String>,
     ) -> Self {
+        Self::serve_with_repetition(wizard, delay, probe, timeout_review, edit, None)
+    }
+    fn serve_with_repetition(
+        wizard: bool,
+        delay: bool,
+        probe: Option<u8>,
+        timeout_review: bool,
+        edit: Option<String>,
+        repetition_stage: Option<usize>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -45,6 +55,7 @@ impl Server {
         let done = Arc::new(AtomicBool::new(false));
         let stop = done.clone();
         let handle = thread::spawn(move || {
+            let mut continuations = 0;
             while !stop.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     thread::sleep(Duration::from_millis(10));
@@ -79,13 +90,23 @@ impl Server {
                     requests.push(body.clone());
                     let n = requests.len() - 1;
                     drop(requests);
+                    if body["messages"].as_array().unwrap().last().unwrap()["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("Validation is still failing.")
+                    {
+                        continuations += 1;
+                    }
                     if delay {
                         thread::sleep(Duration::from_millis(500));
                     }
                     if timeout_review && n == 4 {
                         thread::sleep(Duration::from_millis(1200));
                     }
-                    let logical = n - usize::from(timeout_review && n > 4);
+                    let logical = n
+                        - continuations
+                        - usize::from(timeout_review && n > 4)
+                        - usize::from(repetition_stage.is_some_and(|stage| n > stage));
                     let stage = logical % 5;
                     let cycle = logical / 5 + 1;
                     let (content, tools) = if wizard {
@@ -105,8 +126,14 @@ impl Server {
                             _ => (json!({"decision":"accept","reason":"Diff changes value","criteria":[{"criterion":"Value updated","passed":true,"evidence":"value.txt diff"}]}).to_string(),json!([])),
                         }
                     };
-                    json!({"message":{"role":"assistant","content":content,"tool_calls":tools},"done":true,"done_reason":"stop"}).to_string()+"
-"
+                    if repetition_stage == Some(n) || repetition_stage == Some(usize::MAX) {
+                        // A stream containing a loop and an unexecuted tool call. It never
+                        // completes: recovery must happen while reading, not after done=true.
+                        let prefix = json!({"message":{"content":"The relevant file is value.txt.\n"},"done":false}).to_string()+"\n";
+                        prefix + &(0..20).map(|_| json!({"message":{"content":"I'll try that now. Wait, let me think about it. ","tool_calls":if n == 3 {json!([{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"MUST_NOT_EXECUTE"}}}])} else {json!([])}},"done":false}).to_string()+"\n").collect::<String>()
+                    } else {
+                        json!({"message":{"role":"assistant","content":content,"tool_calls":tools},"done":true,"done_reason":"stop"}).to_string()+"\n"
+                    }
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK
@@ -229,7 +256,16 @@ fn pipeline(pass: bool) {
     )
     .unwrap();
     assert_eq!(note["model_note"], "Task-local observation for cycle 1");
-    let requests = server.requests.lock().unwrap();
+    let recorded = server.requests.lock().unwrap();
+    let requests: Vec<_> = recorded
+        .iter()
+        .filter(|request| {
+            !request["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Validation is still failing.")
+        })
+        .collect();
     assert_eq!(requests.len(), 10);
     let next_input: Value =
         serde_json::from_str(requests[7]["messages"][1]["content"].as_str().unwrap()).unwrap();
@@ -419,6 +455,14 @@ fn review_receives_complete_diff_beyond_former_request_byte_limit() {
         serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
     assert_eq!(state["recent"][0]["disposition"], "accepted");
     let requests = server.requests.lock().unwrap();
+    // Long tool arguments/results remain in the next implementation request.
+    let continuation = &requests[3];
+    assert!(continuation["messages"].to_string().len() > 64000);
+    assert!(
+        continuation["messages"]
+            .to_string()
+            .contains("DIFF_END_MARKER")
+    );
     let review = requests.last().unwrap();
     let payload: Value =
         serde_json::from_str(review["messages"][1]["content"].as_str().unwrap()).unwrap();
@@ -432,6 +476,102 @@ fn review_receives_complete_diff_beyond_former_request_byte_limit() {
         &["diff", "HEAD^", "HEAD", "--no-ext-diff", "--no-textconv"],
     );
     assert_eq!(diff, actual);
+}
+
+#[test]
+fn streaming_repetition_recovers_discovery_implementation_and_review_in_place() {
+    for stage in [0, 1, 3, 4] {
+        let server = Server::serve_with_repetition(false, false, None, false, None, Some(stage));
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let output = command(root.path())
+            .args(["run", "--cycles", "1"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let state: Value =
+            serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["recent"][0]["disposition"], "accepted");
+        assert_eq!(
+            fs::read_to_string(
+                Path::new(state["accepted_workspace"].as_str().unwrap()).join("value.txt")
+            )
+            .unwrap(),
+            "1"
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 6, "No earlier stage is repeated");
+        let original = &requests[stage];
+        let retry = &requests[stage + 1];
+        let messages = original["messages"].as_array().unwrap();
+        assert_eq!(
+            &retry["messages"].as_array().unwrap()[..messages.len()],
+            messages
+        );
+        assert_eq!(retry["format"], original["format"]);
+        assert_eq!(retry["tools"], original["tools"]);
+        assert!(
+            retry["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("Recovery attempt 1")
+        );
+        assert!(!retry["messages"].to_string().contains("MUST_NOT_EXECUTE"));
+        if stage == 3 {
+            assert!(messages.iter().any(|m| m["role"] == "tool"));
+        }
+        if stage == 0 {
+            assert_eq!(
+                retry["messages"][messages.len()]["content"],
+                "The relevant file is value.txt."
+            );
+        } else {
+            assert_eq!(
+                retry["messages"].as_array().unwrap().len(),
+                messages.len() + 1,
+                "Partial structured responses and interrupted tool calls are discarded whole"
+            );
+        }
+        let failure: Value = serde_json::from_slice(
+            &fs::read(root.path().join(format!(
+                "state/cycle-000001/request-failure-{stage:03}.json"
+            )))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failure["retry_same_stage"], true);
+        assert!(failure["error"].as_str().unwrap().contains("Repetitive"));
+    }
+}
+
+#[test]
+fn persistent_repetition_has_bounded_retries_and_records_failure() {
+    let server = Server::serve_with_repetition(false, false, None, false, None, Some(usize::MAX));
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    let output = command(root.path())
+        .args(["run", "--cycles", "1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(server.requests.lock().unwrap().len(), 3);
+    let state: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
+    assert_eq!(state["recent"][0]["disposition"], "retry");
+    let failure: Value = serde_json::from_slice(
+        &fs::read(
+            root.path()
+                .join("state/cycle-000001/request-failure-002.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(failure["retry_same_stage"], false);
 }
 #[test]
 fn fresh_cycles_and_checkout_isolation() {

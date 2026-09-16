@@ -117,8 +117,10 @@ it allows additional time. Resuming a stopped run starts a new timer.
 2. Task shaping specifies a small behavior, writable paths, and acceptance
    criteria. A slice keeps implementation, dependency wiring, and relevant validation
    together; oversized proposals are narrowed to one complete behavior.
-3. Implementation edits a private Git worktree. Long or stalled conversations
-   restart with current files, the task, and the latest check results. Passing
+3. Implementation edits a private Git worktree, retaining its conversation and
+   tool history while it works. Repetitive generation is interrupted and retried
+   in that conversation. A task refresh is a fallback after repeated failed recovery,
+   not a response to conversation byte size. Passing
    configured checks on the current changed files trigger a handoff to verification.
 4. The harness runs the operator's configured checks. For changed Rust code, a
    fresh stage proposes an extra public-API regression test. Chuggin runs that test
@@ -169,9 +171,10 @@ continuation positions. Unique-match edits prevent accidental broad replacement.
 It can request an existing supporting file of any text format when a necessary supporting change
 was omitted from the plan. The reason and expanded scope are logged and supplied
 to review; this does not permit changing Chuggin configuration or Git control files.
-When an implementer repeatedly reads without editing, a fresh patch request asks
-for literal file replacements. The harness applies valid edits and reruns checks;
-a claim that something was fixed never substitutes for changes on disk.
+Investigation and repairs use the same native tools and conversation. Reading
+several files does not trigger a separate patch-generation stage. If the agent
+tries to finish while validation is failing, it receives the failure evidence
+and continues in place; claims never substitute for changes on disk.
 
 Rust tasks can wire new modules through existing parent modules, src/lib.rs, and
 src/main.rs. Their criteria require exercised behavior. Empty Rust test
@@ -181,8 +184,15 @@ Cargo.lock may accompany a task when a corresponding Cargo.toml exists.
 Structured stages send typed JSON schemas to Ollama and use temperature zero.
 Tool-using stages retain native tool calls and temperature 0.4. Model JSON can
 be surrounded by prose or code fences. Invalid formatting gets one
-fresh formatting-repair request; ambiguous multiple matching answers are rejected.
-Repeated JSON fields are allowed; repetitive prose still triggers recovery.
+formatting-repair request retaining the original evidence and conversation;
+ambiguous multiple matching answers are rejected by the parser.
+Repeated JSON fields and fenced code are allowed. Sustained repeated words,
+phrases, or sentence blocks in prose interrupt the stream. Chuggin retains the
+completed conversation and retries up to twice, removing the repetitive tail.
+Only ordinary prose before the repetition may be reused; interrupted tool calls,
+thinking, and partial JSON are never replayed as completed actions. Structured
+responses are regenerated whole. Generation-limit interruptions also request a
+shorter complete response. Each failure and continuation request is logged.
 Goal-drafting failures preserve the pitch and offer Retry, Settings, or Back.
 
 ## Execution, compiler diagnostics, and symbols
@@ -238,8 +248,11 @@ goal, repository, checks, and state location. Project overrides take precedence;
 shared settings are reloaded when starting a run.
 
 Defaults: 32,768 context tokens, 4,096 output tokens, thinking disabled, and up to
-48 implementation responses per task. Fresh-context refreshes happen within that
-budget. Reaching the budget proceeds to verification and review, not a permanent
+48 implementation steps per task, with bounded request recovery within each step.
+Conversations are not reset at an estimated byte threshold. After repeated failed
+request recovery, implementation can refresh from current files, the main goal,
+the task and recorded failures. Reaching the step budget proceeds to verification
+and review, not a permanent
 pause. Model requests default to a 30-minute total timeout; set it to 0 for no
 request deadline. Connection establishment remains bounded to ten seconds.
 Checks have their own individual timeouts. A timeout or connection failure retries

@@ -12,6 +12,18 @@ use std::{
     time::Duration,
 };
 
+#[derive(Debug)]
+struct InterruptedResponse {
+    reason: &'static str,
+    prefix: String,
+}
+impl std::fmt::Display for InterruptedResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason)
+    }
+}
+impl std::error::Error for InterruptedResponse {}
+
 pub struct Model {
     client: Client,
     url: String,
@@ -66,14 +78,21 @@ impl Model {
         tools: Option<Value>,
         format: Option<Value>,
     ) -> Result<Value> {
-        for attempt in 0..2 {
-            let result = self.chat_format_once(messages, tools.clone(), format.clone());
+        let mut conversation = messages.to_vec();
+        let mut transport_retries = 0;
+        let mut generation_retries = 0;
+        loop {
+            let result = self.chat_format_once(&conversation, tools.clone(), format.clone());
             if let Err(error) = &result {
                 crate::events::send(crate::events::Event::RequestFinished);
                 let transient = error.chain().any(|e| {
                     e.downcast_ref::<reqwest::Error>()
                         .is_some_and(|e| e.is_timeout() || e.is_connect())
                 });
+                let interrupted = error.downcast_ref::<InterruptedResponse>();
+                let retry = !self.stop.load(Ordering::SeqCst)
+                    && ((transient && transport_retries < 1)
+                        || (interrupted.is_some() && generation_retries < 2));
                 if let Some(path) = self.trace.borrow().as_ref() {
                     std::fs::write(
                         path.join(format!(
@@ -81,18 +100,39 @@ impl Model {
                             self.sequence.get().saturating_sub(1)
                         )),
                         serde_json::to_vec_pretty(
-                            &json!({"error":format!("{error:#}"),"retry_same_stage":transient && attempt == 0}),
+                            &json!({"error":format!("{error:#}"),"retry_same_stage":retry,"generation_retries":generation_retries,"transport_retries":transport_retries}),
                         )?,
                     )?;
                 }
-                if transient && attempt == 0 && !self.stop.load(Ordering::SeqCst) {
+                if transient && retry {
+                    transport_retries += 1;
                     crate::events::log("Model request timed out or failed to connect; retrying the same stage once with current settings. Completed edits and checks are retained.".into());
                     continue;
                 }
+                if let Some(interrupted) = interrupted.filter(|_| retry) {
+                    generation_retries += 1;
+                    // Rebuild from the last completed turn, never accumulating failed drafts.
+                    conversation = messages.to_vec();
+                    if format.is_none() && !interrupted.prefix.is_empty() {
+                        conversation.push(json!({"role":"assistant","content":interrupted.prefix}));
+                    }
+                    let instruction = if format.is_some() {
+                        "Return a complete replacement JSON response matching the required schema. Do not continue a partial JSON fragment."
+                    } else {
+                        "Continue from the last completed action. Use the existing tool results and current task. Take the next concrete action with a tool, or finish if the work is complete. Any interrupted tool calls were NOT executed; issue complete calls again if needed."
+                    };
+                    conversation.push(json!({"role":"user","content":format!("The previous response was interrupted: {}. Recovery attempt {generation_retries}. Completed actions and file changes are retained. Do not repeat the interrupted narration. {instruction}",interrupted.reason)}));
+                    crate::events::log(format!(
+                        "{}; continuing the same conversation (recovery {generation_retries}/2). Completed tool results and edits are retained.",
+                        interrupted.reason
+                    ));
+                    continue;
+                }
+            } else if generation_retries > 0 {
+                crate::events::log("Model response recovered; continuing the current task.".into());
             }
             return result;
         }
-        unreachable!()
     }
 
     fn chat_format_once(
@@ -184,24 +224,33 @@ impl Model {
             if let Some(c) = d["message"]["tool_calls"].as_array() {
                 calls.extend(c.clone());
             }
-            anyhow::ensure!(
-                content.len() + thinking.len() < 64_000,
-                "Response size exceeded; recover with a smaller task"
-            );
-            anyhow::ensure!(
-                !repetitive(&thinking) && !repetitive(&content),
-                "Repeated model output; discarded response"
-            );
+            let repetition = crate::repetition::start(&thinking)
+                .map(|_| 0)
+                .or_else(|| crate::repetition::start(&content));
+            if let Some(start) = repetition {
+                return Err(InterruptedResponse {
+                    reason: "Repetitive model output interrupted",
+                    // Never retain thinking, partial tool arguments, JSON, or code fragments.
+                    prefix: if calls.is_empty() && !content.contains(['`', '{', '[']) {
+                        content[..start].trim().to_owned()
+                    } else {
+                        String::new()
+                    },
+                }
+                .into());
+            }
             if d["done"].as_bool() == Some(true) {
                 crate::events::send(crate::events::Event::Metrics {
                     prompt: d["prompt_eval_count"].as_u64().unwrap_or(0),
                     generated: d["eval_count"].as_u64().unwrap_or(0),
                     seconds: d["eval_duration"].as_f64().unwrap_or(0.) / 1_000_000_000.,
                 });
-                anyhow::ensure!(
-                    d["done_reason"] != "length",
-                    "Model hit output/context limit; response discarded"
-                );
+                if d["done_reason"] == "length" {
+                    return Err(InterruptedResponse {
+                        reason: "Model reached its generation limit; produce a shorter complete response",
+                        prefix: String::new(),
+                    }.into());
+                }
                 done = true;
                 break;
             }
@@ -216,21 +265,28 @@ impl Model {
     ) -> Result<T> {
         let schema = serde_json::to_value(schemars::schema_for!(T))?;
         let system = format!("{system}\nRequired JSON schema: {schema}");
-        let m = self.chat_format(
+        self.structured_messages(
             &[
                 json!({"role":"system","content":system}),
                 json!({"role":"user","content":input.to_string()}),
             ],
-            None,
-            Some(schema.clone()),
-        )?;
+            schema,
+        )
+    }
+
+    fn structured_messages<T: serde::de::DeserializeOwned>(
+        &self,
+        messages: &[Value],
+        schema: Value,
+    ) -> Result<T> {
+        let m = self.chat_format(messages, None, Some(schema.clone()))?;
         match parse_reply(m["content"].as_str().unwrap_or("")) {
             Ok(value) => Ok(value),
             Err(_) => {
-                let repaired = self.chat_format(&[
-                    json!({"role":"system","content":format!("{system}\nReturn ONLY valid JSON. Repair the formatting of this prior answer, preserving its meaning. JSON keys must be double-quoted. Do not add commentary or Markdown.")}),
-                    json!({"role":"user","content":crate::project::excerpt(m["content"].as_str().unwrap_or(""),12000)}),
-                ], None, Some(schema))?;
+                let mut repair = messages.to_vec();
+                repair.push(m);
+                repair.push(json!({"role":"user","content":"The prior reply could not be read as the required JSON. Return a complete corrected response matching the schema, using the evidence above. Double-quote keys; do not add commentary or Markdown."}));
+                let repaired = self.chat_format(&repair, None, Some(schema))?;
                 parse_reply(repaired["content"].as_str().unwrap_or(""))
                     .context("Could not read the model's reply after a formatting retry")
             }
@@ -249,13 +305,7 @@ impl Model {
             json!({"role":"system","content":system}),
             json!({"role":"user","content":input.to_string()}),
         ];
-        let mut observations = Vec::new();
         for _ in 0..6 {
-            if serde_json::to_vec(&messages)?.len() + tools.to_string().len()
-                > self.context.saturating_sub(self.output + 2048).min(48000) as usize
-            {
-                break;
-            }
             let response = self.chat(&messages, Some(tools.clone()), false)?;
             let calls = response["tool_calls"]
                 .as_array()
@@ -265,7 +315,7 @@ impl Model {
                 if let Ok(value) = parse_reply(response["content"].as_str().unwrap_or("")) {
                     return Ok(value);
                 }
-                observations.push(json!({"draft":crate::project::excerpt(response["content"].as_str().unwrap_or(""),4000)}));
+                messages.push(response);
                 break;
             }
             anyhow::ensure!(
@@ -280,7 +330,6 @@ impl Model {
                     Ok(value) => json!({"ok":true,"result":crate::project::excerpt(&value,6000)}),
                     Err(e) => json!({"ok":false,"error":e.to_string()}),
                 };
-                observations.push(json!({"tool":name,"arguments":args,"result":result}));
                 let mut reply =
                     json!({"role":"tool","tool_name":name,"content":result.to_string()});
                 if let Some(id) = call.get("id") {
@@ -289,7 +338,8 @@ impl Model {
                 messages.push(reply);
             }
         }
-        self.structured(system,json!({"project":input,"inspection":crate::project::excerpt(&serde_json::to_string(&observations)?,8000),"instruction":"Finish the discovery decision from the actual inspected evidence."}))
+        messages.push(json!({"role":"user","content":"Finish the discovery decision using the inspected evidence in this conversation. Return the required JSON."}));
+        self.structured_messages(&messages, serde_json::to_value(schemars::schema_for!(T))?)
     }
 }
 fn parse_reply<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
@@ -340,32 +390,9 @@ fn parse_reply<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
         )
     })
 }
-// Only scan the last few thousand characters; long source-code outputs may legitimately repeat.
-// Four identical nontrivial lines/paragraphs near the tail are enough to abandon this response.
+#[cfg(test)]
 fn repetitive(s: &str) -> bool {
-    let tail: String = s
-        .chars()
-        .rev()
-        .take(6000)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    let mut seen = std::collections::HashMap::new();
-    for line in tail.split(['\n', '.']) {
-        let line = line.trim();
-        // Structured task lists and source strings often repeat valid fields.
-        // Output-size/token limits still bound those responses.
-        if line.len() < 70 || line.starts_with('"') {
-            continue;
-        }
-        let n = seen.entry(line).or_insert(0);
-        *n += 1;
-        if *n >= 4 {
-            return true;
-        }
-    }
-    false
+    crate::repetition::start(s).is_some()
 }
 pub fn tools() -> Value {
     let mut tools = json!([

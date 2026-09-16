@@ -488,48 +488,6 @@ fn extend_source_access(task: &mut Task, root: &Path, path: &str, reason: &str) 
         project::excerpt(&content, 10000)
     ))
 }
-#[derive(Serialize, Deserialize, schemars::JsonSchema)]
-struct PatchPlan {
-    edits: Vec<Replacement>,
-}
-#[derive(Serialize, Deserialize, schemars::JsonSchema)]
-struct Replacement {
-    path: String,
-    old_text: String,
-    new_text: String,
-}
-fn concrete_patch(
-    m: &Model,
-    task: &Task,
-    workspace: &Path,
-    results: &[CheckResult],
-    art: &Path,
-    step: u32,
-) -> Result<()> {
-    let plan: PatchPlan=m.structured("Produce concrete file edits, not a summary or plan. Return JSON {edits:[{path,old_text,new_text}]}. Make 1-4 small edits that advance the task. If checks fail, fix the first validation failure. Otherwise add the missing behavior and a relevant validation. old_text must match an exact unique existing substring, with no line-number prefixes. Use empty old_text only for a NEW file. Use only the supplied allowed paths. Preserve existing behavior and tests. Do not claim edits were made; the harness will apply these literal replacements and run checks. Choose a complete small patch rather than further inspection.",json!({"task":task,"allowed_paths":task.files,"files":project::context(workspace,&task.files,24000),"actual_checks":results}))?;
-    emit(art, &format!("patch-{step}"), &plan)?;
-    anyhow::ensure!(
-        !plan.edits.is_empty() && plan.edits.len() <= 4,
-        "Patch needs 1-4 concrete edits"
-    );
-    for edit in plan.edits {
-        anyhow::ensure!(
-            task.files.contains(&edit.path),
-            "Patch path outside task: {}",
-            edit.path
-        );
-        if edit.old_text.is_empty() {
-            anyhow::ensure!(
-                !project::safe_path(workspace, &edit.path)?.exists(),
-                "Empty old_text is only for new files"
-            );
-            project::write(workspace, &edit.path, &edit.new_text)?;
-        } else {
-            project::edit(workspace, &edit.path, &edit.old_text, &edit.new_text)?;
-        }
-    }
-    Ok(())
-}
 fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) -> Result<Outcome> {
     crate::events::send(crate::events::Event::Phase("Discovery".into()));
     m.trace_to(art);
@@ -653,21 +611,12 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
         json!({"role":"user","content":json!({"main_goal":c.goal,"task":task,"current_checks":working_checks,"repair_note":repair_note,"recovery_origin":recovery.as_ref().map(|o|o.cycle),"instruction":"When checks fail, fix the first validation failure with a targeted edit before doing any broader work. Then validate the requested outcome.","current_files":project::context(&workspace,&task.files,18000)}).to_string()}),
     ];
     let mut notes = String::new();
-    let mut last_result = String::new();
     let mut latest_checks = working_checks;
     let mut validated_snapshot = None;
     let mut response_errors = 0;
-    let mut observations = 0;
-    let mut edited = false;
+    let mut completion_nudged = false;
     for step in 0..c.implementation_calls {
         anyhow::ensure!(!stop.load(Ordering::SeqCst), "Stopped by operator");
-        if serde_json::to_vec(&messages)?.len()
-            > (c.context_tokens.saturating_sub(c.output_tokens + 2048) as usize).min(48000)
-        {
-            messages.truncate(1);
-            messages.push(json!({"role":"user","content":json!({"task":task,"repair_note":repair_note,"current_files":project::context(&workspace,&task.files,12000),"latest_result":last_result,"latest_checks":latest_checks,"instruction":"Fresh implementation session, same task and files. Continue the existing work. Do not re-plan the project. Implement the missing behavior and run checks."}).to_string()}));
-            emit(art, &format!("context-refresh-{step}"), &messages)?;
-        }
         let response = match m.chat(&messages, Some(crate::model::tools_for(&workspace)), false) {
             Ok(r) => r,
             Err(e) => {
@@ -679,52 +628,48 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                 if response_errors >= 3 {
                     break;
                 }
-                messages.truncate(1);
-                messages.push(json!({"role":"user","content":json!({"task":task,"repair_note":repair_note,"current_files":project::context(&workspace,&task.files,12000),"latest_checks":latest_checks,"recovery":"Previous response failed. Work already written remains. Make a small targeted edit now; keep each response short."}).to_string()}));
+                if response_errors == 2 {
+                    // Last-resort refresh after in-conversation recovery failed, never by byte size.
+                    messages.truncate(1);
+                    messages.push(json!({"role":"user","content":json!({"main_goal":c.goal,"task":task,"repair_note":repair_note,"current_files":project::context(&workspace,&task.files,18000),"latest_checks":latest_checks,"recovery":"Repeated request recovery failed. Fresh conversation, same task and existing edits. Inspect the actual files and continue from the latest failure."}).to_string()}));
+                    emit(art, &format!("context-refresh-{step}"), &messages)?;
+                    crate::events::log("Repeated request recovery failed; refreshing this task from current files and validation.".into());
+                } else {
+                    messages.push(json!({"role":"user","content":format!("The last model request failed: {e:#}. The prior conversation and completed actions are retained. Continue the current task; issue complete tool calls when needed.")}));
+                }
                 continue;
             }
         };
+        response_errors = 0;
         emit(art, &format!("implementation-{step}"), &response)?;
         let calls = response["tool_calls"]
             .as_array()
             .cloned()
             .unwrap_or_default();
-        let mut history_response = response.clone();
-        if !calls.is_empty() {
-            history_response["content"] = json!(project::excerpt(
-                response["content"].as_str().unwrap_or(""),
-                1000
-            ));
-        }
-        messages.push(history_response);
+        messages.push(response.clone());
         if calls.is_empty() {
-            if !edited && latest_checks.iter().any(|r| !r.passed) {
-                match concrete_patch(m, &task, &workspace, &latest_checks, art, step) {
-                    Ok(()) => {
-                        edited = true;
-                        latest_checks =
-                            checks(c, &workspace, art, &format!("patch-check-{step}"), stop)?;
-                        repair_note.record(
-                            "applied patch and checked",
-                            &serde_json::to_string(&latest_checks)?,
-                            latest_checks.iter().any(|r| !r.passed),
-                        );
-                        emit(art, "repair-note", &repair_note)?;
-                    }
-                    Err(e) => {
-                        repair_note.record("patch attempt", &format!("{e:#}"), true);
-                        emit(art, "repair-note", &repair_note)?;
-                        emit(art, &format!("patch-error-{step}"), &format!("{e:#}"))?;
-                    }
-                }
-                messages.truncate(1);
-                messages.push(json!({"role":"user","content":json!({"task":task,"repair_note":repair_note,"current_files":project::context(&workspace,&task.files,18000),"current_checks":latest_checks,"instruction":"These are the actual files and checks after the patch. Add any missing validation or fix the remaining failure using tools. Do not claim unperformed actions."}).to_string()}));
+            if latest_checks.iter().any(|r| !r.passed)
+                && validated_snapshot != Some(project::snapshot(&workspace)?)
+            {
+                latest_checks = checks(
+                    c,
+                    &workspace,
+                    art,
+                    &format!("completion-check-{step}"),
+                    stop,
+                )?;
+                validated_snapshot = Some(project::snapshot(&workspace)?);
+            }
+            if latest_checks.iter().any(|r| !r.passed) && !completion_nudged {
+                completion_nudged = true;
+                messages.push(json!({"role":"user","content":json!({"current_checks":latest_checks,"instruction":"Validation is still failing. Continue this task using the tool results above. Inspect the failing case and apply a targeted correction with the available tools; do not just describe a fix."}).to_string()}));
                 continue;
             }
             notes = response["content"].as_str().unwrap_or("").into();
             break;
         }
         anyhow::ensure!(calls.len() <= 8, "Too many sibling tool calls");
+        completion_nudged = false;
         for (index, call) in calls.iter().enumerate() {
             let name = call["function"]["name"].as_str().unwrap_or("");
             let args = &call["function"]["arguments"];
@@ -741,7 +686,6 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                 "project_map" => Ok(crate::code_index::index(&workspace)?.to_string()),
                 "lookup_symbol" => Ok(crate::symbols::lookup(&workspace, args)?.to_string()),
                 "run_command" => {
-                    let prior = project::snapshot(&workspace)?;
                     let result = crate::dev_tools::run(
                         &workspace,
                         art,
@@ -749,10 +693,6 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                         args,
                         stop,
                     )?;
-                    if project::snapshot(&workspace)? != prior {
-                        edited = true;
-                        observations = 0;
-                    }
                     Ok(result.to_string())
                 }
                 "compiler_diagnostics" => Ok(crate::dev_tools::diagnostics(
@@ -852,7 +792,6 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                 Err(e) => json!({"ok":false,"error":e.to_string()}),
             };
             emit(art, &format!("tool-{step}-{index}"), &value)?;
-            last_result = project::excerpt(&value.to_string(), 4000);
             if matches!(
                 name,
                 "edit_file" | "write_file" | "run_command" | "run_checks" | "compiler_diagnostics"
@@ -889,10 +828,6 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                 );
             }
             emit(art, "repair-note", &repair_note)?;
-            if (name == "write_file" || name == "edit_file") && value["ok"] == true {
-                observations = 0;
-                edited = true;
-            }
             let mut tool_reply =
                 json!({"role":"tool","tool_name":name,"content":value.to_string()});
             if let Some(id) = call.get("id") {
@@ -900,7 +835,6 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
             }
             messages.push(tool_reply);
         }
-        observations += 1;
         if !latest_checks.is_empty()
             && latest_checks.iter().all(|r| r.passed)
             && validated_snapshot
@@ -910,29 +844,6 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
         {
             notes="Implementation changes passed configured validation; handing off to independent verification and review.".into();
             break;
-        }
-        if observations >= 4 {
-            match concrete_patch(m, &task, &workspace, &latest_checks, art, step) {
-                Ok(()) => {
-                    edited = true;
-                    latest_checks =
-                        checks(c, &workspace, art, &format!("patch-check-{step}"), stop)?;
-                    repair_note.record(
-                        "applied patch and checked",
-                        &serde_json::to_string(&latest_checks)?,
-                        latest_checks.iter().any(|r| !r.passed),
-                    );
-                    emit(art, "repair-note", &repair_note)?;
-                    messages.push(json!({"role":"user","content":json!({"repair_note":repair_note,"applied_patch":true,"current_files":project::context(&workspace,&task.files,16000),"current_checks":latest_checks}).to_string()}));
-                }
-                Err(e) => {
-                    repair_note.record("patch attempt", &format!("{e:#}"), true);
-                    emit(art, "repair-note", &repair_note)?;
-                    emit(art, &format!("patch-error-{step}"), &format!("{e:#}"))?;
-                }
-            }
-            messages.push(json!({"role":"user","content":"Stop re-exploring unchanged files. If checks pass and the requested behavior is complete, finish with a short summary. Otherwise make the next corrective edit using the source already supplied."}));
-            observations = 0;
         }
     }
     emit(art, "implementation-note", &notes)?;
