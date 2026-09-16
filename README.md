@@ -283,8 +283,9 @@ another machine. Advanced automation commands are available through help.
 
 This is an experimental harness, not proof of product completeness. Check quality
 and model judgment matter; partial acceptance does not prove arbitrary behavior
-correct. The reviewer receives the full diff without a separate size cutoff. The overall
-request-context guard still applies, so very large changes can exceed that budget.
+correct. The reviewer receives the full diff without a separate size cutoff.
+Requests have no byte-based context cutoff; the configured context and output token
+limits are sent to Ollama. Large requests can still exceed the model's context capacity.
 Checks run with the user's permissions. Worktrees isolate Git changes, not code
 execution.
 

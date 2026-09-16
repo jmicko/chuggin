@@ -395,10 +395,10 @@ fn timed_out_review_retries_without_repeating_implementation() {
 }
 
 #[test]
-fn review_receives_complete_diff_larger_than_twelve_kilobytes() {
+fn review_receives_complete_diff_beyond_former_request_byte_limit() {
     let content = format!(
         "{}\nDIFF_END_MARKER\n",
-        "Useful project content.\n".repeat(650)
+        "Useful project content.\n".repeat(3000)
     );
     let server = Server::serve_with_edit(false, false, None, false, Some(content));
     let root = tempfile::tempdir().unwrap();
@@ -423,7 +423,8 @@ fn review_receives_complete_diff_larger_than_twelve_kilobytes() {
     let payload: Value =
         serde_json::from_str(review["messages"][1]["content"].as_str().unwrap()).unwrap();
     let diff = payload["diff"].as_str().unwrap();
-    assert!(diff.len() > 12000);
+    assert!(diff.len() > 64000);
+    assert_eq!(review["options"]["num_ctx"], 65536);
     assert!(diff.ends_with("+DIFF_END_MARKER"));
     assert_eq!(payload["diff_truncated"], false);
     let actual = git(

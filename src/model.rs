@@ -122,15 +122,6 @@ impl Model {
         crate::events::send(crate::events::Event::RequestModel(name.to_owned()));
         crate::events::send(crate::events::Event::Request);
         anyhow::ensure!(!self.stop.load(Ordering::SeqCst), "Stopped by operator");
-        // Conservative byte budget; token counts vary by model/tokenizer.
-        let input_bytes = serde_json::to_vec(messages)?.len()
-            + tools.as_ref().map(|t| t.to_string().len()).unwrap_or(0);
-        let budget = self.context.saturating_sub(self.output + 1024) as usize;
-        anyhow::ensure!(
-            input_bytes <= budget.min(64000),
-            "Stage input exceeds conservative context budget ({input_bytes} bytes > {}); reduce task/context payload",
-            budget.min(64000)
-        );
         let mut body = json!({"model":name,"messages":messages,"stream":true,"think":false,"options":{"num_ctx":self.context,"num_predict":self.output,"temperature":0.4}});
         if let Some(t) = tools {
             body["tools"] = t;
