@@ -138,7 +138,10 @@ impl Server {
                         let (content, tools) = reply(&body, n);
                         if matches!(
                             content.as_str(),
-                            "__FAIL_REQUEST__" | "__HTTP_LIMIT__" | "__CREDIT_LIMIT__"
+                            "__FAIL_REQUEST__"
+                                | "__HTTP_LIMIT__"
+                                | "__CREDIT_LIMIT__"
+                                | "__CREDIT_RETRY__"
                         ) {
                             content
                         } else if content == "__STREAM_LIMIT__" {
@@ -152,6 +155,7 @@ impl Server {
                     "__FAIL_REQUEST__" => "400 Bad Request",
                     "__HTTP_LIMIT__" => "429 Too Many Requests\nRetry-After: 1",
                     "__CREDIT_LIMIT__" => "402 Payment Required",
+                    "__CREDIT_RETRY__" => "402 Payment Required\nRetry-After: 1",
                     _ => "200 OK",
                 };
                 let response = format!(
@@ -2115,7 +2119,7 @@ fn provider_rate_limit_retries_identical_conversation_without_replaying_edits() 
     assert_eq!(session["response_errors"], 0);
 }
 #[test]
-fn provider_credits_pause_once_and_checkpoint_edits() {
+fn provider_credits_keep_waiting_until_operator_timer_and_checkpoint_edits() {
     let server = Server::custom(false, false, None, |_, n| {
         if n == 0 {
             (
@@ -2127,7 +2131,10 @@ fn provider_credits_pause_once_and_checkpoint_edits() {
         }
     });
     let root = tempfile::tempdir().unwrap();
-    fixture(root.path(), &server.url, true);
+    let config_path = fixture(root.path(), &server.url, true);
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["run_duration_seconds"] = json!(1);
+    fs::write(&config_path, config.to_string()).unwrap();
     run_cycles(root.path(), 10);
     assert_eq!(server.requests.lock().unwrap().len(), 2);
     let saved = state(root.path());
@@ -2143,8 +2150,9 @@ fn provider_credits_pause_once_and_checkpoint_edits() {
         saved["feedback"]
             .as_str()
             .unwrap()
-            .contains("No automatic retries")
+            .contains("Run timer reached")
     );
+    assert!(root.path().join("state/provider-wait.json").exists());
 }
 #[test]
 fn provider_stream_limit_timer_and_restart_preserve_cooldown() {
@@ -2232,4 +2240,27 @@ fn provider_wait_allows_soft_stop_and_model_change() {
     }
     assert_eq!(server.requests.lock().unwrap().len(), 2);
     assert!(!root.path().join("state/provider-wait.json").exists());
+}
+
+#[test]
+fn provider_credits_automatically_resume_after_repeated_exhaustion() {
+    let server = Server::custom(false, false, None, |_, n| {
+        if n < 2 {
+            ("__CREDIT_RETRY__".into(), json!([]))
+        } else {
+            ("Credits available; resumed".into(), json!([]))
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    let calls = server.requests.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0], calls[1]);
+    assert_eq!(calls[1], calls[2]);
+    assert!(!root.path().join("state/provider-wait.json").exists());
+    let session: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
+            .unwrap();
+    assert_eq!(session["response_errors"], 0);
 }

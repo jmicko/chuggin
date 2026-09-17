@@ -185,7 +185,7 @@ impl Model {
                         .unwrap_or_else(|| crate::provider::backoff(provider_attempts));
                     let (model, url) = self.request_target.borrow().clone();
                     // Round up to the next second so persistence never shortens Retry-After.
-                    let record = json!({"reason":provider.reason,"pause":provider.pause,"model":model,"url":url,"attempt":provider_attempts,"until":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs().saturating_add(delay.as_secs()).saturating_add(1),"delay_seconds":delay.as_secs()});
+                    let record = json!({"reason":provider.reason,"model":model,"url":url,"attempt":provider_attempts,"until":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs().saturating_add(delay.as_secs()).saturating_add(1),"delay_seconds":delay.as_secs()});
                     if let Some(path) = self.trace.borrow().as_ref() {
                         std::fs::write(
                             path.join(format!(
@@ -194,9 +194,6 @@ impl Model {
                             )),
                             serde_json::to_vec_pretty(&record)?,
                         )?;
-                    }
-                    if provider.pause {
-                        return Err(crate::provider::Stopped(format!("{}. Resolve billing/access or select another model, then resume. No automatic retries.",provider.reason)).into());
                     }
                     if let Some(path) = self.provider_target()?.2 {
                         let temp = path.with_extension("tmp");

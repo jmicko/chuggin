@@ -5,7 +5,6 @@ use std::time::{Duration, SystemTime};
 pub struct Unavailable {
     pub reason: &'static str,
     pub retry_after: Option<Duration>,
-    pub pause: bool,
 }
 impl std::fmt::Display for Unavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,7 +80,6 @@ pub fn classify(status: u16, message: &str, retry_after: Option<Duration>) -> Op
             "Provider temporarily unavailable"
         },
         retry_after,
-        pause: auth || (exhausted && retry_after.is_none()),
     })
 }
 pub fn backoff(attempt: u32) -> Duration {
@@ -92,24 +90,25 @@ pub fn backoff(attempt: u32) -> Duration {
 mod tests {
     use super::*;
     #[test]
-    fn legacy_limits_wait_and_credits_without_reset_pause() {
+    fn legacy_limits_credits_and_authentication_share_wait_policy() {
         for text in [
             "usage limit reached",
             "weekly limit reached",
             "session limit exceeded",
         ] {
-            assert!(!classify(200, text, None).unwrap().pause);
+            assert!(classify(200, text, None).is_some());
         }
-        assert!(classify(402, "", None).unwrap().pause);
-        assert!(classify(200, "insufficient credits", None).unwrap().pause);
-        assert!(
-            !classify(402, "", Some(Duration::from_secs(3600)))
+        assert!(classify(402, "", None).is_some());
+        assert!(classify(200, "insufficient credits", None).is_some());
+        assert_eq!(
+            classify(402, "", Some(Duration::from_secs(3600)))
                 .unwrap()
-                .pause
+                .retry_after,
+            Some(Duration::from_secs(3600))
         );
-        assert!(classify(401, "", None).unwrap().pause);
+        assert!(classify(401, "", None).is_some());
         assert!(classify(400, "invalid tool schema", None).is_none());
-        assert!(!classify(503, "", None).unwrap().pause);
+        assert!(classify(503, "", None).is_some());
     }
     #[test]
     fn retry_headers_and_fallback_delays() {
@@ -129,5 +128,8 @@ mod tests {
             (1..=6).map(|n| backoff(n).as_secs()).collect::<Vec<_>>(),
             [60, 120, 240, 480, 900, 900]
         );
+        for attempt in [100, 10_000, u32::MAX] {
+            assert_eq!(backoff(attempt), Duration::from_secs(900));
+        }
     }
 }

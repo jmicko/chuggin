@@ -291,10 +291,14 @@ The dashboard shows **Waiting for provider** and a countdown. Provider errors do
 not trigger conversation compaction or count as reasoning failures. Limit errors
 inside an otherwise successful Ollama stream are handled too.
 
-Credit/payment exhaustion without a supplied retry time, and authentication/access
-errors, save the current work and stop without automatic retries. Resolve the
-account issue or select another model, then resume. Chuggin never purchases credits
-or changes your billing plan. An unrecognized quota message returned with HTTP 429
+Credit/payment exhaustion and authentication/access errors use the same waiting
+policy, even without a supplied reset time. After reaching the 15-minute backoff
+cap, Chuggin keeps retrying every 15 minutes indefinitely; there is no attempt limit.
+An explicit longer `Retry-After` is still honored. Work and conversation stay intact
+while you resolve account issues, credits reset, or you select another model.
+Chuggin never purchases credits or changes your billing plan. Set Run duration to
+0 for an unlimited run; explicit stop requests and configured run timers still apply.
+An unrecognized quota message returned with HTTP 429
 still receives the bounded-frequency retry policy; a reset time cannot be inferred
 reliably from every provider's prose.
 
