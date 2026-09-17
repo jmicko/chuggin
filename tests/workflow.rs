@@ -1814,6 +1814,33 @@ mod terminal_ui {
         ui.restored();
     }
     #[test]
+    fn home_model_selection_updates_project_override_only() {
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        let path = fixture(root.path(), &server.url, true);
+        let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        config["model"] = json!("old-project-model");
+        fs::write(&path, config.to_string()).unwrap();
+        let shared = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        let defaults = r#"{"model":"shared-model","ollama_url":"http://127.0.0.1:1"}"#;
+        fs::write(&shared, defaults).unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("old-project-model");
+        ui.send(b"jjj\r");
+        ui.wait("Choose model for this project");
+        ui.send(b"\r");
+        ui.wait("Resume project");
+        ui.wait("fake");
+        ui.send(b"q");
+        ui.restored();
+        config["model"] = json!("fake");
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, config);
+        assert_eq!(fs::read_to_string(shared).unwrap(), defaults);
+    }
+
+    #[test]
     fn full_screen_settings_and_unicode_input_do_not_modify_project() {
         let root = tempfile::tempdir().unwrap();
         let mut ui = TerminalProcess::start(root.path());

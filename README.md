@@ -268,6 +268,10 @@ $XDG_CONFIG_HOME/chuggin/settings.json. Project-local chuggin.json contains the 
 goal, repository, checks, and state location. Project overrides take precedence;
 shared settings are reloaded when starting a run.
 
+On the home screen, **Choose model** changes the current project's model using
+its configured Ollama server. Before project setup it changes the shared default.
+**Shared settings** changes defaults; existing project overrides still take precedence.
+
 Defaults: 32,768 context tokens, 4,096 output tokens, thinking disabled, and up to
 48 work steps per cycle, with bounded request recovery within each step.
 Conversations are not reset at an estimated byte threshold. After repeated failed

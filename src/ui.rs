@@ -216,8 +216,12 @@ fn splash(
         "Continue the next focused cycle",
         "The ambition guiding every cycle",
         "Saved checkpoints and check results",
-        "Choose a shared model default",
-        "Connection and working budgets",
+        if items.first().is_some_and(|item| item == "Resume project") {
+            "Change the model for this project"
+        } else {
+            "Choose a shared model default"
+        },
+        "Defaults for projects without overrides",
         "Return to your shell",
     ];
     let entries: Vec<ListItem> = items

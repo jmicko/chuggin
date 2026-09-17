@@ -472,17 +472,33 @@ fn available_models(s: &Settings) -> Result<Vec<String>> {
     );
     Ok(names)
 }
-pub fn choose_model() -> Result<()> {
+pub fn choose_model(project: Option<&Path>) -> Result<()> {
     let mut s = settings()?;
+    if let Some(path) = project {
+        let effective = runner::load(path)?;
+        s.ollama_url = effective.ollama_url;
+        s.model = effective.model;
+    }
     crate::ui::notice(format!("\nLoading models from {}…", s.ollama_url));
     let connection = s.clone();
     let names = crate::ui::busy("Loading available models", move || {
         available_models(&connection)
     })?;
     let selected = names.iter().position(|n| n == &s.model).unwrap_or(0);
-    if let Some(index) = crate::menu::select("Choose model (shared default)", &names, selected)? {
+    let title = if project.is_some() {
+        "Choose model for this project"
+    } else {
+        "Choose model (shared default)"
+    };
+    if let Some(index) = crate::menu::select(title, &names, selected)? {
         s.model = names[index].clone();
-        save(&settings_path()?, &s)?;
+        if let Some(path) = project {
+            let mut config: Value = serde_json::from_slice(&fs::read(path)?)?;
+            config["model"] = json!(s.model);
+            save(path, &config)?;
+        } else {
+            save(&settings_path()?, &s)?;
+        }
         crate::ui::notice(format!("Model saved: {}", s.model));
     }
     Ok(())
@@ -493,7 +509,7 @@ pub fn settings_menu() -> Result<()> {
         let items = vec![
             format!("Ollama server     {}", s.ollama_url),
             format!(
-                "Model             {}",
+                "Default model     {}",
                 if s.model.is_empty() {
                     "Not selected"
                 } else {
@@ -534,7 +550,7 @@ pub fn settings_menu() -> Result<()> {
                 s.ollama_url = url.trim_end_matches('/').into();
             }
             1 => {
-                choose_model()?;
+                choose_model(None)?;
                 continue;
             }
             2 => {

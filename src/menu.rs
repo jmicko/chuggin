@@ -81,7 +81,7 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             "Project goal".into(),
             "Progress".into(),
             "Choose model".into(),
-            "Settings".into(),
+            "Shared settings".into(),
             "Run duration".into(),
             "Quit".into(),
         ];
@@ -147,7 +147,7 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                         crate::ui::show("Saved progress", "This project has not started yet.")?;
                     }
                 }
-                3 => setup::choose_model()?,
+                3 => setup::choose_model(project.as_deref())?,
                 4 => setup::settings_menu()?,
                 5 => {
                     if let Some(path) = project.as_ref() {
