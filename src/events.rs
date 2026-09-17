@@ -27,6 +27,10 @@ pub enum Event {
         path: PathBuf,
     },
     CheckDone(bool),
+    ValidationDone {
+        passed: bool,
+        checkpoint: Option<String>,
+    },
     Outcome {
         disposition: String,
         task: String,

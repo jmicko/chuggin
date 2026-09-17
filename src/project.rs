@@ -11,9 +11,7 @@ pub fn kill_active_check() {
 }
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -116,15 +114,6 @@ pub fn inventory(root: &Path) -> Result<Vec<String>> {
     files.sort();
     Ok(files)
 }
-pub fn snapshot(root: &Path) -> Result<BTreeMap<String, String>> {
-    inventory(root)?
-        .into_iter()
-        .map(|p| {
-            let data = fs::read(safe_path(root, &p)?)?;
-            Ok((p, format!("{:x}", Sha256::digest(data))))
-        })
-        .collect()
-}
 pub fn excerpt(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.into();
@@ -134,21 +123,6 @@ pub fn excerpt(text: &str, limit: usize) -> String {
         cut -= 1;
     }
     format!("{}\n[truncated]", &text[..cut])
-}
-pub fn context(root: &Path, files: &[String], limit: usize) -> String {
-    let mut out = String::new();
-    for name in files {
-        if out.len() >= limit {
-            break;
-        }
-        if let Ok(s) = read(root, name) {
-            out.push_str(&format!(
-                "\n--- {name} ---\n{}",
-                excerpt(&s, (limit - out.len()).min(20_000))
-            ));
-        }
-    }
-    out
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Check {

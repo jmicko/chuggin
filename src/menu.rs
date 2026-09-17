@@ -30,6 +30,38 @@ pub fn pause() -> Result<()> {
     io::stdin().read_line(&mut line)?;
     Ok(())
 }
+fn progress_text(progress: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(progress) else {
+        return progress.into();
+    };
+    let branch = v["working_branch"]
+        .as_str()
+        .or_else(|| v["accepted_branch"].as_str())
+        .unwrap_or("—");
+    let workspace = v["working_workspace"]
+        .as_str()
+        .or_else(|| v["accepted_workspace"].as_str())
+        .unwrap_or("—");
+    let passing = v["last_checks_passed_ref"]
+        .as_str()
+        .filter(|reference| !reference.is_empty())
+        .unwrap_or("None recorded");
+    let mut text = format!(
+        "Cycle {}\nWorking branch: {branch}\nWorkspace: {workspace}\nLast checkpoint with passing checks: {passing}\n\nCheckpoints save unfinished work too. Check results and review findings guide the next cycle.\n\nRecent cycles\n",
+        v["cycle"]
+    );
+    if let Some(items) = v["recent"].as_array() {
+        for outcome in items.iter().rev() {
+            text.push_str(&format!(
+                "\n#{} · {}\n{}\n",
+                outcome["cycle"],
+                crate::ui::outcome_label(outcome["disposition"].as_str().unwrap_or("")),
+                outcome["task"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    text
+}
 pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
     anyhow::ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
@@ -70,11 +102,11 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                 .map(|v| {
                     format!(
-                        "Ready after cycle {}\nYour accepted work is saved.",
+                        "Ready after cycle {}\nResume saved work and unresolved findings.",
                         v["cycle"]
                     )
                 })
-                .unwrap_or("Goal accepted. Ready for the first cycle.".into())
+                .unwrap_or("Goal saved. Ready for the first cycle.".into())
         } else {
             "A fresh project. Start with a goal; Chuggin will help shape it.".into()
         };
@@ -109,10 +141,7 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                         let c = runner::load(path)?;
                         let progress = std::fs::read_to_string(c.state_dir.join("state.json"))
                             .unwrap_or("This project has not started yet.".into());
-                        let text=serde_json::from_str::<serde_json::Value>(&progress).ok().map(|v|{
-                            let mut s=format!("Cycle {}\nAccepted branch: {}\nWorkspace: {}\n\nRecent attempts\n",v["cycle"],v["accepted_branch"].as_str().unwrap_or("—"),v["accepted_workspace"].as_str().unwrap_or("—"));
-                            if let Some(items)=v["recent"].as_array(){for o in items.iter().rev(){s.push_str(&format!("\n#{} · {}\n{}\n",o["cycle"],o["disposition"].as_str().unwrap_or(""),o["task"].as_str().unwrap_or("")));}}s
-                        }).unwrap_or(progress);
+                        let text = progress_text(&progress);
                         crate::ui::show("Saved progress", &text)?;
                     } else {
                         crate::ui::show("Saved progress", "This project has not started yet.")?;
@@ -138,5 +167,31 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             crate::ui::notice(format!("\n{e:#}"));
             pause().context("Could not return to menu")?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::progress_text;
+
+    #[test]
+    fn saved_progress_distinguishes_unfinished_work_from_passing_checks() {
+        let text = progress_text(
+            r#"{"cycle":5,"working_branch":"codex/working","working_workspace":"/project/workspace","last_checks_passed_ref":"abc123","recent":[{"cycle":5,"disposition":"checkpoint/checks-failing","task":"Repair the parser"}]}"#,
+        );
+        assert!(text.contains("Working branch: codex/working"));
+        assert!(text.contains("Last checkpoint with passing checks: abc123"));
+        assert!(text.contains("Saved · checks failing"));
+        assert!(text.contains("Checkpoints save unfinished work too."));
+    }
+
+    #[test]
+    fn saved_progress_can_display_legacy_state_before_migration() {
+        let text = progress_text(
+            r#"{"cycle":2,"accepted_branch":"codex/old","accepted_workspace":"/old/workspace"}"#,
+        );
+        assert!(text.contains("Working branch: codex/old"));
+        assert!(text.contains("Workspace: /old/workspace"));
+        assert!(text.contains("Last checkpoint with passing checks: None recorded"));
     }
 }

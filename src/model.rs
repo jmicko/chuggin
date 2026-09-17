@@ -34,6 +34,8 @@ pub struct Model {
     trace: RefCell<Option<PathBuf>>,
     sequence: Cell<u32>,
     settings_path: Option<PathBuf>,
+    completed_messages: RefCell<Option<Vec<Value>>>,
+    context_pressure: Cell<bool>,
 }
 impl Model {
     pub fn new(
@@ -55,7 +57,15 @@ impl Model {
             trace: RefCell::new(None),
             sequence: Cell::new(0),
             settings_path: None,
+            completed_messages: RefCell::new(None),
+            context_pressure: Cell::new(false),
         })
+    }
+    pub fn take_completed_messages(&self) -> Option<Vec<Value>> {
+        self.completed_messages.borrow_mut().take()
+    }
+    pub fn context_pressure(&self) -> bool {
+        self.context_pressure.get()
     }
     pub fn use_project_settings(&mut self, path: &Path) {
         self.settings_path = Some(path.to_owned());
@@ -78,6 +88,7 @@ impl Model {
         tools: Option<Value>,
         format: Option<Value>,
     ) -> Result<Value> {
+        *self.completed_messages.borrow_mut() = None;
         let mut conversation = messages.to_vec();
         let mut transport_retries = 0;
         let mut generation_retries = 0;
@@ -130,6 +141,9 @@ impl Model {
                 }
             } else if generation_retries > 0 {
                 crate::events::log("Model response recovered; continuing the current task.".into());
+            }
+            if result.is_ok() {
+                *self.completed_messages.borrow_mut() = Some(conversation);
             }
             return result;
         }
@@ -240,6 +254,10 @@ impl Model {
                 .into());
             }
             if d["done"].as_bool() == Some(true) {
+                let used = d["prompt_eval_count"].as_u64().unwrap_or(0)
+                    + d["eval_count"].as_u64().unwrap_or(0);
+                self.context_pressure
+                    .set(used >= self.context.saturating_sub(self.output + 1024) as u64);
                 crate::events::send(crate::events::Event::Metrics {
                     prompt: d["prompt_eval_count"].as_u64().unwrap_or(0),
                     generated: d["eval_count"].as_u64().unwrap_or(0),
@@ -292,56 +310,8 @@ impl Model {
             }
         }
     }
-
-    /// Read-only investigation with bounded observations; no history survives this stage.
-    pub fn investigate<T: serde::de::DeserializeOwned + schemars::JsonSchema>(
-        &self,
-        system: &str,
-        input: Value,
-        tools: Value,
-        mut execute: impl FnMut(&str, &Value) -> Result<String>,
-    ) -> Result<T> {
-        let mut messages = vec![
-            json!({"role":"system","content":system}),
-            json!({"role":"user","content":input.to_string()}),
-        ];
-        for _ in 0..6 {
-            let response = self.chat(&messages, Some(tools.clone()), false)?;
-            let calls = response["tool_calls"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            if calls.is_empty() {
-                if let Ok(value) = parse_reply(response["content"].as_str().unwrap_or("")) {
-                    return Ok(value);
-                }
-                messages.push(response);
-                break;
-            }
-            anyhow::ensure!(
-                calls.len() <= 8,
-                "Too many inspection calls in one response"
-            );
-            messages.push(response);
-            for call in calls {
-                let name = call["function"]["name"].as_str().unwrap_or("");
-                let args = &call["function"]["arguments"];
-                let result = match execute(name, args) {
-                    Ok(value) => json!({"ok":true,"result":crate::project::excerpt(&value,6000)}),
-                    Err(e) => json!({"ok":false,"error":e.to_string()}),
-                };
-                let mut reply =
-                    json!({"role":"tool","tool_name":name,"content":result.to_string()});
-                if let Some(id) = call.get("id") {
-                    reply["tool_call_id"] = id.clone();
-                }
-                messages.push(reply);
-            }
-        }
-        messages.push(json!({"role":"user","content":"Finish the discovery decision using the inspected evidence in this conversation. Return the required JSON."}));
-        self.structured_messages(&messages, serde_json::to_value(schemars::schema_for!(T))?)
-    }
 }
+
 fn parse_reply<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
     // Extract one complete JSON value from surrounding prose, without rewriting its data.
     // Reject ambiguous multiple matching objects rather than guessing which to execute.
@@ -396,14 +366,16 @@ fn repetitive(s: &str) -> bool {
 }
 pub fn tools() -> Value {
     let mut tools = json!([
-     {"type":"function","function":{"name":"save_progress_note","description":"Replace a short task-local handoff note preserved across fresh contexts and same-task repairs. Record observed failure, attempted fix, constraints learned, and next action; cite files or check evidence. This is an advisory note, not proof of success. Maximum 1600 bytes; empty clears it.","parameters":{"type":"object","properties":{"note":{"type":"string"}},"required":["note"]}}},
+     {"type":"function","function":{"name":"save_progress_note","description":"Replace a short persistent progress note carried across tasks, checkpoints and context handoffs. Record observed failure, attempted fix, constraints learned, and next action; cite files or check evidence. This is an advisory note, not proof of success. Maximum 1600 bytes; empty clears it.","parameters":{"type":"object","properties":{"note":{"type":"string"}},"required":["note"]}}},
      {"type":"function","function":{"name":"project_map","description":"Inspect project file paths plus optional Rust declarations and module reachability. For other formats use search and read_file to inspect content. The map is inventory, not proof of correctness.","parameters":{"type":"object","properties":{}}}},
-     {"type":"function","function":{"name":"request_file_access","description":"Request access to an existing supporting file omitted from task.files, in any language or text format. Explain the minimal supporting change. The harness grants safe paths and records the exception for review. Preserve existing behavior and validation.","parameters":{"type":"object","properties":{"path":{"type":"string"},"reason":{"type":"string"}},"required":["path","reason"]}}},
+     {"type":"function","function":{"name":"set_task","description":"Record or revise the current task. Plans and file lists are advisory; work already on disk is always retained.","parameters":{"type":"object","properties":{"title":{"type":"string"},"objective":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"files":{"type":"array","items":{"type":"string"}},"out_of_scope":{"type":"array","items":{"type":"string"}}},"required":["title","objective"]}}},
+     {"type":"function","function":{"name":"finish_task","description":"Report that the current task is complete. The harness saves a checkpoint and verifies configured checks. Unresolved failures remain available for repair.","parameters":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}}},
+     {"type":"function","function":{"name":"restore_checkpoint","description":"Explicitly restore project files from an ancestor checkpoint. First saves all current work in Git. Use only when inspection shows this is preferable to repairing current work. Explain why, then validate the result.","parameters":{"type":"object","properties":{"commit":{"type":"string"},"reason":{"type":"string"}},"required":["commit","reason"]}}},
      {"type":"function","function":{"name":"read_file","description":"Read numbered lines. Follow the continuation start_line to read the rest, rather than repeating the same request.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"line_count":{"type":"integer"}},"required":["path"]}}},
      {"type":"function","function":{"name":"edit_file","description":"Replace an exact, unique old_text occurrence with new_text. Supply file text without line-number prefixes.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}}},
      {"type":"function","function":{"name":"list_files","description":"List project paths.","parameters":{"type":"object","properties":{}}}},
      {"type":"function","function":{"name":"search","description":"Find literal text in project files; returns paths and line numbers.","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}},
-     {"type":"function","function":{"name":"write_file","description":"Create or replace a project file. Read existing files first. Only files in the task specification may be changed.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
+     {"type":"function","function":{"name":"write_file","description":"Create or replace a project file. Read existing files first. Use project-relative paths; preserve operator settings and Git metadata.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
      {"type":"function","function":{"name":"run_checks","description":"Execute the operator-configured validation commands and return results.","parameters":{"type":"object","properties":{}}}}
     ]);
     tools
@@ -418,45 +390,6 @@ pub fn tools() -> Value {
             .extend(crate::web_tools::schemas());
     }
     tools
-}
-pub fn tools_for(root: &std::path::Path) -> Value {
-    let mut available = tools();
-    let rust = crate::project::inventory(root)
-        .unwrap_or_default()
-        .iter()
-        .any(|p| p.ends_with(".rs"));
-    available
-        .as_array_mut()
-        .unwrap()
-        .retain(|t| match t["function"]["name"].as_str() {
-            Some("compiler_diagnostics") => root.join("Cargo.toml").is_file(),
-            Some("lookup_symbol") => rust,
-            _ => true,
-        });
-    available
-}
-
-pub fn inspection_tools(root: &std::path::Path) -> Value {
-    json!(
-        tools_for(root)
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|t| matches!(
-                t["function"]["name"].as_str(),
-                Some(
-                    "project_map"
-                        | "lookup_symbol"
-                        | "read_file"
-                        | "list_files"
-                        | "search"
-                        | "web_search"
-                        | "read_web_page"
-                )
-            ))
-            .cloned()
-            .collect::<Vec<_>>()
-    )
 }
 #[cfg(test)]
 mod tests {

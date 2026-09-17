@@ -22,30 +22,61 @@ struct Server {
 }
 impl Server {
     fn new(wizard: bool, delay: bool) -> Self {
-        Self::with_probe(wizard, delay, None)
+        Self::serve(wizard, delay, None, false)
     }
-    fn with_probe(wizard: bool, delay: bool, probe: Option<u8>) -> Self {
-        Self::serve(wizard, delay, probe, false)
-    }
-    fn serve(wizard: bool, delay: bool, probe: Option<u8>, timeout_review: bool) -> Self {
-        Self::serve_with_edit(wizard, delay, probe, timeout_review, None)
+    fn serve(wizard: bool, delay: bool, tools_mode: Option<u8>, timeout_followup: bool) -> Self {
+        Self::serve_with_edit(wizard, delay, tools_mode, timeout_followup, None)
     }
     fn serve_with_edit(
         wizard: bool,
         delay: bool,
-        probe: Option<u8>,
+        tools_mode: Option<u8>,
         timeout_review: bool,
         edit: Option<String>,
     ) -> Self {
-        Self::serve_with_repetition(wizard, delay, probe, timeout_review, edit, None)
+        Self::serve_with_repetition(wizard, delay, tools_mode, timeout_review, edit, None)
     }
     fn serve_with_repetition(
         wizard: bool,
         delay: bool,
-        probe: Option<u8>,
+        tools_mode: Option<u8>,
         timeout_review: bool,
         edit: Option<String>,
         repetition_stage: Option<usize>,
+    ) -> Self {
+        let mut cycle = 0;
+        let mut awaiting_completion = false;
+        Self::custom(delay, timeout_review, repetition_stage, move |body, n| {
+            if wizard {
+                return (
+                    json!({"goal":format!("Build a useful editor. Draft {}.", n+1)}).to_string(),
+                    json!([]),
+                );
+            }
+            if let Some(mode) = tools_mode {
+                return dev_tool_reply(body, mode);
+            }
+            if awaiting_completion {
+                awaiting_completion = false;
+                return ("PRIVATE_IMPLEMENTATION_TRANSCRIPT".into(), json!([]));
+            }
+            awaiting_completion = true;
+            cycle += 1;
+            (
+                String::new(),
+                json!([
+                    task_tool(&format!("Increment {cycle}")),
+                    {"function":{"name":"save_progress_note","arguments":{"note":format!("Task-local observation for cycle {cycle}")}}},
+                    {"function":{"name":"write_file","arguments":{"path":"value.txt","content":edit.clone().unwrap_or_else(|| cycle.to_string())}}}
+                ]),
+            )
+        })
+    }
+    fn custom(
+        delay: bool,
+        timeout_review: bool,
+        repetition_request: Option<usize>,
+        mut reply: impl FnMut(&Value, usize) -> (String, Value) + Send + 'static,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -55,7 +86,7 @@ impl Server {
         let done = Arc::new(AtomicBool::new(false));
         let stop = done.clone();
         let handle = thread::spawn(move || {
-            let mut continuations = 0;
+            let mut review_timed_out = false;
             while !stop.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     thread::sleep(Duration::from_millis(10));
@@ -90,53 +121,35 @@ impl Server {
                     requests.push(body.clone());
                     let n = requests.len() - 1;
                     drop(requests);
-                    if body["messages"].as_array().unwrap().last().unwrap()["content"]
-                        .as_str()
-                        .unwrap_or("")
-                        .contains("Validation is still failing.")
-                    {
-                        continuations += 1;
-                    }
                     if delay {
-                        thread::sleep(Duration::from_millis(500));
+                        thread::sleep(Duration::from_millis(800));
                     }
-                    if timeout_review && n == 4 {
+                    if timeout_review && n == 1 && !review_timed_out {
+                        review_timed_out = true;
                         thread::sleep(Duration::from_millis(1200));
+                        continue;
                     }
-                    let logical = n
-                        - continuations
-                        - usize::from(timeout_review && n > 4)
-                        - usize::from(repetition_stage.is_some_and(|stage| n > stage));
-                    let stage = logical % 5;
-                    let cycle = logical / 5 + 1;
-                    let (content, tools) = if wizard {
-                        (
-                            json!({"goal":format!("Build a useful editor. Draft {}.", n+1)})
-                                .to_string(),
-                            json!([]),
-                        )
-                    } else if let Some(invalid) = probe {
-                        probe_reply(&body, invalid)
-                    } else {
-                        match stage {
-                            0 => (json!({"gap":"Improve value","why_now":"Next increment","files":["value.txt"]}).to_string(),json!([])),
-                            1 => (json!({"title":format!("Increment {cycle}"),"objective":"Improve value","acceptance":["Value updated"],"files":["value.txt"],"out_of_scope":["Other files"]}).to_string(),json!([])),
-                            2 => ("".into(),json!([{"function":{"name":"save_progress_note","arguments":{"note":format!("Task-local observation for cycle {cycle}")}}},{"function":{"name":"write_file","arguments":{"path":"value.txt","content":edit.clone().unwrap_or_else(|| cycle.to_string())}}}])),
-                            3 => ("PRIVATE_IMPLEMENTATION_TRANSCRIPT".into(),json!([])),
-                            _ => (json!({"decision":"accept","reason":"Diff changes value","criteria":[{"criterion":"Value updated","passed":true,"evidence":"value.txt diff"}]}).to_string(),json!([])),
-                        }
-                    };
-                    if repetition_stage == Some(n) || repetition_stage == Some(usize::MAX) {
+                    if repetition_request == Some(n) || repetition_request == Some(usize::MAX) {
                         // A stream containing a loop and an unexecuted tool call. It never
                         // completes: recovery must happen while reading, not after done=true.
                         let prefix = json!({"message":{"content":"The relevant file is value.txt.\n"},"done":false}).to_string()+"\n";
-                        prefix + &(0..20).map(|_| json!({"message":{"content":"I'll try that now. Wait, let me think about it. ","tool_calls":if n == 3 {json!([{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"MUST_NOT_EXECUTE"}}}])} else {json!([])}},"done":false}).to_string()+"\n").collect::<String>()
+                        prefix + &(0..20).map(|_| json!({"message":{"content":"I'll try that now. Wait, let me think about it. ","tool_calls":if n == 1 {json!([{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"MUST_NOT_EXECUTE"}}}])} else {json!([])}},"done":false}).to_string()+"\n").collect::<String>()
                     } else {
-                        json!({"message":{"role":"assistant","content":content,"tool_calls":tools},"done":true,"done_reason":"stop"}).to_string()+"\n"
+                        let (content, tools) = reply(&body, n);
+                        if content == "__FAIL_REQUEST__" {
+                            content
+                        } else {
+                            json!({"message":{"role":"assistant","content":content,"tool_calls":tools},"done":true,"done_reason":"stop"}).to_string()+"\n"
+                        }
                     }
                 };
+                let status = if data == "__FAIL_REQUEST__" {
+                    "503 Service Unavailable"
+                } else {
+                    "200 OK"
+                };
                 let response = format!(
-                    "HTTP/1.1 200 OK
+                    "HTTP/1.1 {status}
 Content-Length: {}
 Connection: close
 
@@ -160,6 +173,31 @@ impl Drop for Server {
         self.done.store(true, Ordering::SeqCst);
         let _ = self.handle.take().unwrap().join();
     }
+}
+fn is_work(body: &Value) -> bool {
+    body["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "write_file")
+    })
+}
+fn task_tool(title: &str) -> Value {
+    json!({"function":{"name":"set_task","arguments":{"title":title,"objective":"Improve value","acceptance":["Value updated"],"files":["value.txt"]}}})
+}
+fn state(root: &Path) -> Value {
+    serde_json::from_slice(&fs::read(root.join("state/state.json")).unwrap()).unwrap()
+}
+fn run_cycles(root: &Path, cycles: u64) {
+    let out = command(root)
+        .args(["run", "--cycles", &cycles.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 fn git(repo: &Path, args: &[&str]) -> String {
     let o = Command::new("git")
@@ -239,87 +277,68 @@ fn missing_git_identity_blocks_before_model_requests() {
         assert!(!root.path().join("state/state.json").exists());
     }
 }
-fn pipeline(pass: bool) {
+
+#[test]
+fn checkpoints_advance_in_one_workspace_and_keep_the_user_checkout_isolated() {
     let server = Server::new(false, false);
     let root = tempfile::tempdir().unwrap();
-    let config = fixture(root.path(), &server.url, pass);
-    let head = git(&root.path().join("repo"), &["rev-parse", "HEAD"]);
-    let o = command(root.path())
-        .args(["run", "--config", config.to_str().unwrap(), "--cycles", "2"])
-        .output()
-        .unwrap();
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let state: Value =
-        serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
-    let note: Value = serde_json::from_slice(
-        &fs::read(root.path().join("state/cycle-000001/repair-note.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(note["model_note"], "Task-local observation for cycle 1");
-    let recorded = server.requests.lock().unwrap();
-    let requests: Vec<_> = recorded
-        .iter()
-        .filter(|request| {
-            !request["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap_or("")
-                .contains("Validation is still failing.")
-        })
-        .collect();
-    assert_eq!(requests.len(), 10);
-    let next_input: Value =
-        serde_json::from_str(requests[7]["messages"][1]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(next_input["repair_note"]["model_note"], "");
-    for n in [0, 1, 4, 5, 6, 9] {
-        assert_eq!(requests[n]["messages"].as_array().unwrap().len(), 2);
-    }
-    assert!(
-        !serde_json::to_string(&requests[5..9])
-            .unwrap()
-            .contains("PRIVATE_IMPLEMENTATION_TRANSCRIPT")
-    );
-    assert!(
-        !serde_json::to_string(&*requests)
-            .unwrap()
-            .contains("USER_EDIT")
-    );
+    let config = fixture(root.path(), &server.url, true);
+    let repo = root.path().join("repo");
+    let initial = git(&repo, &["rev-parse", "HEAD"]);
+    run_cycles(root.path(), 1);
+    let first = state(root.path());
+    run_cycles(root.path(), 1);
+    let second = state(root.path());
+    assert_eq!(second["schema_version"], 2);
+    assert_eq!(first["working_workspace"], second["working_workspace"]);
+    assert_ne!(first["working_ref"], second["working_ref"]);
+    assert_eq!(second["last_checks_passed_ref"], second["working_ref"]);
     assert_eq!(
-        fs::read_to_string(root.path().join("repo/value.txt")).unwrap(),
+        fs::read_to_string(
+            Path::new(second["working_workspace"].as_str().unwrap()).join("value.txt")
+        )
+        .unwrap(),
+        "2"
+    );
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), initial);
+    assert_eq!(
+        fs::read_to_string(repo.join("value.txt")).unwrap(),
         "USER_EDIT"
     );
-    assert_eq!(git(&root.path().join("repo"), &["rev-parse", "HEAD"]), head);
-    if pass {
-        assert_ne!(state["accepted_ref"], head);
-        assert_eq!(
-            git(
-                &root.path().join("repo"),
-                &[
-                    "log",
-                    "-1",
-                    "--format=%an <%ae>|%cn <%ce>",
-                    state["accepted_ref"].as_str().unwrap()
-                ]
-            ),
-            "Test Operator <operator@example.com>|Test Operator <operator@example.com>"
-        );
-        assert_eq!(
-            fs::read_to_string(
-                Path::new(state["accepted_workspace"].as_str().unwrap()).join("value.txt")
-            )
-            .unwrap(),
-            "2"
-        );
-        assert!(requests[5].to_string().contains("Increment 1"));
-    } else {
-        assert_eq!(state["accepted_ref"], head);
-    }
+    assert_eq!(
+        git(
+            &repo,
+            &[
+                "log",
+                "-1",
+                "--format=%an <%ae>|%cn <%ce>",
+                second["working_ref"].as_str().unwrap()
+            ]
+        ),
+        "Test Operator <operator@example.com>|Test Operator <operator@example.com>"
+    );
+    let requests = server.requests.lock().unwrap();
+    let original_history = requests[1]["messages"].as_array().unwrap();
+    assert_eq!(
+        &requests[2]["messages"].as_array().unwrap()[..original_history.len()],
+        original_history
+    );
+    assert!(requests.iter().all(
+        |request| request["messages"][0] == requests[0]["messages"][0]
+            && request["tools"] == requests[0]["tools"]
+    ));
+    assert!(
+        requests[2]
+            .to_string()
+            .contains("PRIVATE_IMPLEMENTATION_TRANSCRIPT")
+    );
     drop(requests);
     let mut changed: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     changed["goal"] = json!("Changed goal");
     fs::write(&config, changed.to_string()).unwrap();
     assert!(
         !command(root.path())
-            .args(["run", "--config", config.to_str().unwrap()])
+            .args(["run", "--cycles", "1"])
             .output()
             .unwrap()
             .status
@@ -328,7 +347,759 @@ fn pipeline(pass: bool) {
 }
 
 #[test]
-fn plain_text_project_uses_its_own_validation_without_rust_tools() {
+fn failing_work_is_checkpointed_then_repaired_across_cycles_and_process_restarts() {
+    for restart in [false, true] {
+        let mut attempt = 0;
+        let mut edited = false;
+        let server = Server::custom(false, false, None, move |_, _| {
+            if edited {
+                attempt += 1;
+                edited = false;
+                return ("The current attempt is ready for checks.".into(), json!([]));
+            }
+            edited = true;
+            let script = if attempt == 0 {
+                "printf BROKEN > value.txt"
+            } else {
+                "test \"$(cat value.txt)\" = BROKEN && printf FIXED > value.txt"
+            };
+            (
+                String::new(),
+                json!([task_tool("Repair the value"),{"function":{"name":"run_command","arguments":{"argv":["sh","-c",script]}}}]),
+            )
+        });
+        let root = tempfile::tempdir().unwrap();
+        let config = fixture(root.path(), &server.url, true);
+        let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        settings["implementation_calls"] = json!(2);
+        settings["checks"] =
+            json!([{"argv":["sh","-c","test \"$(cat value.txt)\" = FIXED"],"timeout_seconds":5}]);
+        fs::write(config, settings.to_string()).unwrap();
+        if restart {
+            run_cycles(root.path(), 1);
+            let failed = state(root.path());
+            assert_eq!(
+                failed["recent"][0]["disposition"],
+                "checkpoint/checks-failing"
+            );
+            assert!(failed["last_checks_passed_ref"].is_null());
+            assert_eq!(
+                fs::read_to_string(
+                    Path::new(failed["working_workspace"].as_str().unwrap()).join("value.txt")
+                )
+                .unwrap(),
+                "BROKEN"
+            );
+            assert_eq!(
+                git(
+                    &root.path().join("repo"),
+                    &[
+                        "show",
+                        &format!("{}:value.txt", failed["working_ref"].as_str().unwrap())
+                    ]
+                ),
+                "BROKEN"
+            );
+            run_cycles(root.path(), 1);
+        } else {
+            run_cycles(root.path(), 2);
+        }
+        let saved = state(root.path());
+        let workspace = Path::new(saved["working_workspace"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(workspace.join("value.txt")).unwrap(),
+            "FIXED"
+        );
+        assert_eq!(saved["last_checks_passed_ref"], saved["working_ref"]);
+        let requests = server.requests.lock().unwrap();
+        assert!(
+            requests.iter().all(is_work),
+            "Planning, coding and refinement share the same tools"
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|body| is_work(body))
+                .any(|body| body.to_string().contains("BROKEN"))
+        );
+        let first_history = requests[1]["messages"].as_array().unwrap();
+        assert_eq!(
+            &requests[2]["messages"].as_array().unwrap()[..first_history.len()],
+            first_history,
+            "The repair retains the working conversation across a cycle or process restart"
+        );
+    }
+}
+
+#[test]
+fn unfinished_and_failed_attempts_preserve_deletions_renames_and_new_files() {
+    for failing_checks in [false, true] {
+        let mut edited = false;
+        let server = Server::custom(false, false, None, move |_, _| {
+            if edited {
+                return (
+                    "This change is unfinished and needs further work.".into(),
+                    json!([]),
+                );
+            }
+            edited = true;
+            (
+                String::new(),
+                json!([task_tool("Reorganize document files"),{"function":{"name":"run_command","arguments":{"argv":["sh","-c","mv value.txt renamed.txt && printf 'new notes' > notes.txt"]}}}]),
+            )
+        });
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, !failing_checks);
+        run_cycles(root.path(), 1);
+        let saved = state(root.path());
+        let workspace = Path::new(saved["working_workspace"].as_str().unwrap());
+        assert!(!workspace.join("value.txt").exists());
+        assert_eq!(
+            fs::read_to_string(workspace.join("renamed.txt")).unwrap(),
+            "USER_EDIT"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("notes.txt")).unwrap(),
+            "new notes"
+        );
+        assert_eq!(git(workspace, &["status", "--porcelain"]), "");
+        assert_eq!(
+            git(workspace, &["ls-tree", "-r", "--name-only", "HEAD"]),
+            "notes.txt\nrenamed.txt"
+        );
+        assert!(
+            saved["current_task"].is_object(),
+            "An unfinished task remains available for follow-up"
+        );
+    }
+}
+
+#[test]
+fn model_error_after_editing_still_checkpoints_completed_tool_changes() {
+    let mut edited = false;
+    let server = Server::custom(false, false, None, move |_, _| {
+        if edited {
+            return ("__FAIL_REQUEST__".into(), json!([]));
+        }
+        edited = true;
+        (
+            String::new(),
+            json!([task_tool("Keep unfinished work"), {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"KEEP_AFTER_NETWORK_ERROR"}}}]),
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    let saved = state(root.path());
+    let workspace = Path::new(saved["working_workspace"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(workspace.join("value.txt")).unwrap(),
+        "KEEP_AFTER_NETWORK_ERROR"
+    );
+    assert_eq!(
+        git(workspace, &["show", "HEAD:value.txt"]),
+        "KEEP_AFTER_NETWORK_ERROR"
+    );
+    assert!(saved["current_task"].is_object());
+    assert!(
+        fs::read_dir(root.path().join("state/cycle-000001"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("request-failure-"))
+    );
+}
+
+#[test]
+fn finish_task_records_completion_only_when_checks_pass_and_always_saves_edits() {
+    for pass in [false, true] {
+        let server = Server::custom(false, false, None, |_, _| {
+            (
+                String::new(),
+                json!([task_tool("Finish the current task"),{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"COMPLETED_EDIT"}}},{"function":{"name":"finish_task","arguments":{"summary":"The value was updated and is ready for validation."}}}]),
+            )
+        });
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, pass);
+        run_cycles(root.path(), 1);
+        let saved = state(root.path());
+        assert_eq!(saved["current_task"].is_null(), pass);
+        assert_eq!(
+            fs::read_to_string(
+                Path::new(saved["working_workspace"].as_str().unwrap()).join("value.txt")
+            )
+            .unwrap(),
+            "COMPLETED_EDIT"
+        );
+        assert_eq!(saved["last_checks_passed_ref"].is_string(), pass);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn legacy_migration_recovers_the_entire_interrupted_workspace_including_staged_changes() {
+    let mut edited = false;
+    let server = Server::custom(false, false, None, move |_, _| {
+        if edited {
+            return (
+                "Recovered unfinished files and continued.".into(),
+                json!([]),
+            );
+        }
+        edited = true;
+        (
+            String::new(),
+            json!([task_tool("Continue interrupted reorganization"), {"function":{"name":"run_command","arguments":{"argv":["sh","-c","test ! -e value.txt && test \"$(cat renamed.txt)\" = DIRTY_CANDIDATE && test \"$(cat staged.txt)\" = STAGED_CANDIDATE && printf resumed > resumed.txt"]}}}]),
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    let repo = root.path().join("repo");
+    let initial = git(&repo, &["rev-parse", "HEAD"]);
+    let state_dir = root.path().join("state");
+    let art = state_dir.join("cycle-000001");
+    fs::create_dir_all(&art).unwrap();
+    let baseline = state_dir.join("baseline");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            baseline.to_str().unwrap(),
+            &initial,
+        ],
+    );
+    let candidate = art.join("workspace");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "codex/legacy-interrupted",
+            candidate.to_str().unwrap(),
+            &initial,
+        ],
+    );
+    fs::rename(candidate.join("value.txt"), candidate.join("renamed.txt")).unwrap();
+    fs::write(candidate.join("renamed.txt"), "DIRTY_CANDIDATE").unwrap();
+    fs::write(candidate.join("staged.txt"), "STAGED_CANDIDATE").unwrap();
+    git(&candidate, &["add", "staged.txt"]);
+    let original_state = json!({"run_id":"legacy-run","goal":"Improve value incrementally","repo":repo,"cycle":1,"accepted_ref":initial,"accepted_branch":"","accepted_workspace":baseline,"recent":[]});
+    fs::write(state_dir.join("state.json"), original_state.to_string()).unwrap();
+    fs::write(
+        art.join("attempt.json"),
+        json!({"base":initial,"branch":"codex/legacy-interrupted","workspace":candidate})
+            .to_string(),
+    )
+    .unwrap();
+    fs::write(art.join("task.json"), json!({"title":"Continue interrupted reorganization","objective":"Retain unfinished work","acceptance":["Files reorganized"],"files":["value.txt","renamed.txt","staged.txt"],"out_of_scope":[]}).to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    let saved = state(root.path());
+    assert_eq!(saved["schema_version"], 2);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(state_dir.join("state-v1-backup.json")).unwrap())
+            .unwrap(),
+        original_state
+    );
+    let workspace = Path::new(saved["working_workspace"].as_str().unwrap());
+    assert!(!workspace.join("value.txt").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.join("renamed.txt")).unwrap(),
+        "DIRTY_CANDIDATE"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("staged.txt")).unwrap(),
+        "STAGED_CANDIDATE"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("resumed.txt")).unwrap(),
+        "resumed"
+    );
+    assert_eq!(git(workspace, &["status", "--porcelain"]), "");
+    assert_eq!(
+        fs::read_to_string(repo.join("value.txt")).unwrap(),
+        "USER_EDIT"
+    );
+}
+
+#[test]
+fn legacy_migration_prefers_edited_work_over_a_newer_empty_attempt() {
+    for only_untracked in [false, true] {
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let repo = root.path().join("repo");
+        let initial = git(&repo, &["rev-parse", "HEAD"]);
+        let state_dir = root.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let baseline = state_dir.join("baseline");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                baseline.to_str().unwrap(),
+                &initial,
+            ],
+        );
+        for cycle in [1, 2] {
+            let artifact = state_dir.join(format!("cycle-{cycle:06}"));
+            fs::create_dir_all(&artifact).unwrap();
+            let workspace = artifact.join("workspace");
+            let branch = format!("codex/legacy-attempt-{cycle}");
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch,
+                    workspace.to_str().unwrap(),
+                    &initial,
+                ],
+            );
+            fs::write(
+                artifact.join("attempt.json"),
+                json!({"base":initial,"branch":branch,"workspace":workspace}).to_string(),
+            )
+            .unwrap();
+            fs::write(artifact.join("task.json"), json!({"title":format!("Attempt {cycle}"),"objective":"Improve project content","acceptance":["Content updated"],"files":["value.txt"],"out_of_scope":[]}).to_string()).unwrap();
+        }
+        let edited = state_dir.join("cycle-000001/workspace");
+        let empty = state_dir.join("cycle-000002/workspace");
+        fs::write(
+            edited.join("unfinished-notes.txt"),
+            "Retain these untracked findings",
+        )
+        .unwrap();
+        if !only_untracked {
+            fs::write(edited.join("value.txt"), "STAGED_PROGRESS").unwrap();
+            fs::write(edited.join("new-module.txt"), "Staged new project content").unwrap();
+            git(&edited, &["add", "value.txt", "new-module.txt"]);
+        }
+        let edited_status = git(&edited, &["status", "--porcelain"]);
+        let edited_index = git(&edited, &["write-tree"]);
+        let legacy = json!({"run_id":"legacy-empty-last","goal":"Improve value incrementally","repo":repo,"cycle":2,"accepted_ref":initial,"accepted_branch":"","accepted_workspace":baseline,"recent":[]});
+        fs::write(state_dir.join("state.json"), legacy.to_string()).unwrap();
+        run_cycles(root.path(), 0);
+        let saved = state(root.path());
+        assert_eq!(
+            saved["working_workspace"],
+            edited.to_str().unwrap(),
+            "A newer empty workspace must not hide actual unfinished work"
+        );
+        assert_eq!(saved["current_task"]["title"], "Attempt 1");
+        assert_eq!(
+            fs::read_to_string(edited.join("unfinished-notes.txt")).unwrap(),
+            "Retain these untracked findings"
+        );
+        if !only_untracked {
+            assert_eq!(
+                fs::read_to_string(edited.join("value.txt")).unwrap(),
+                "STAGED_PROGRESS"
+            );
+            assert_eq!(
+                fs::read_to_string(edited.join("new-module.txt")).unwrap(),
+                "Staged new project content"
+            );
+        }
+        assert_eq!(git(&edited, &["status", "--porcelain"]), edited_status);
+        assert_eq!(git(&edited, &["write-tree"]), edited_index);
+        assert_eq!(fs::read_to_string(empty.join("value.txt")).unwrap(), "0");
+        assert_eq!(git(&empty, &["status", "--porcelain"]), "");
+        assert_eq!(
+            fs::read_to_string(repo.join("value.txt")).unwrap(),
+            "USER_EDIT"
+        );
+        assert!(server.requests.lock().unwrap().is_empty());
+    }
+}
+
+fn dirty_checkout_fixture(root: &Path, url: &str) -> (String, String, String) {
+    fixture(root, url, true);
+    let repo = root.join("repo");
+    fs::write(repo.join("deleted.txt"), "Delete this tracked file").unwrap();
+    fs::write(repo.join("old-name.txt"), "Preserve the renamed file").unwrap();
+    fs::write(repo.join("tracked.bin"), [0, 1, 2, 255]).unwrap();
+    fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+    git(
+        &repo,
+        &[
+            "add",
+            "deleted.txt",
+            "old-name.txt",
+            "tracked.bin",
+            ".gitignore",
+        ],
+    );
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "Tracked project artifacts",
+        ],
+    );
+    fs::remove_file(repo.join("deleted.txt")).unwrap();
+    fs::rename(repo.join("old-name.txt"), repo.join("new-name.txt")).unwrap();
+    fs::write(repo.join("tracked.bin"), [255, 0, 13, 10, 128]).unwrap();
+    fs::write(repo.join("new.bin"), [0, 254, 252, 10]).unwrap();
+    fs::write(repo.join("new-document.txt"), "Untracked project work").unwrap();
+    fs::write(repo.join("staged.txt"), "Staged project work").unwrap();
+    git(&repo, &["add", "staged.txt"]);
+    fs::write(
+        repo.join("staged.txt"),
+        "Further unstaged work after staging",
+    )
+    .unwrap();
+    fs::write(repo.join("ignored.txt"), "Do not import ignored files").unwrap();
+    fs::create_dir_all(repo.join(".chuggin")).unwrap();
+    fs::write(repo.join(".chuggin/runtime.txt"), "Harness runtime state").unwrap();
+    fs::write(repo.join("chuggin.json"), "Harness configuration").unwrap();
+    (
+        git(&repo, &["rev-parse", "HEAD"]),
+        git(&repo, &["status", "--porcelain"]),
+        git(&repo, &["write-tree"]),
+    )
+}
+
+fn assert_imported_dirty_checkout(root: &Path, original: &(String, String, String)) {
+    let repo = root.join("repo");
+    let saved = state(root);
+    assert_eq!(
+        saved["cycle"], 0,
+        "Preparing a workspace must not start a model cycle"
+    );
+    let workspace = Path::new(saved["working_workspace"].as_str().unwrap());
+    assert_ne!(workspace, repo);
+    assert!(workspace.starts_with(root.join("state")));
+    assert_eq!(
+        fs::read_to_string(workspace.join("value.txt")).unwrap(),
+        "USER_EDIT"
+    );
+    assert!(!workspace.join("deleted.txt").exists());
+    assert!(!workspace.join("old-name.txt").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.join("new-name.txt")).unwrap(),
+        "Preserve the renamed file"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("new-document.txt")).unwrap(),
+        "Untracked project work"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("staged.txt")).unwrap(),
+        "Further unstaged work after staging"
+    );
+    assert_eq!(
+        fs::read(workspace.join("tracked.bin")).unwrap(),
+        [255, 0, 13, 10, 128]
+    );
+    assert_eq!(
+        fs::read(workspace.join("new.bin")).unwrap(),
+        [0, 254, 252, 10]
+    );
+    assert!(!workspace.join("ignored.txt").exists());
+    assert!(!workspace.join(".chuggin/runtime.txt").exists());
+    assert!(!workspace.join("chuggin.json").exists());
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), original.0);
+    assert_eq!(git(&repo, &["status", "--porcelain"]), original.1);
+    assert_eq!(
+        git(&repo, &["write-tree"]),
+        original.2,
+        "Import must leave the user's staging area intact"
+    );
+    assert_eq!(
+        fs::read(repo.join("tracked.bin")).unwrap(),
+        [255, 0, 13, 10, 128]
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("staged.txt")).unwrap(),
+        "Further unstaged work after staging"
+    );
+}
+
+#[test]
+fn first_run_imports_current_dirty_project_files_including_binaries_and_deletions() {
+    let server = Server::new(false, false);
+    let root = tempfile::tempdir().unwrap();
+    let original = dirty_checkout_fixture(root.path(), &server.url);
+    run_cycles(root.path(), 0);
+    assert_imported_dirty_checkout(root.path(), &original);
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn legacy_root_workspace_migrates_all_dirty_files_without_starting_a_cycle() {
+    let server = Server::new(false, false);
+    let root = tempfile::tempdir().unwrap();
+    let original = dirty_checkout_fixture(root.path(), &server.url);
+    let state_dir = root.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let legacy = json!({"run_id":"legacy-root","goal":"Improve value incrementally","repo":root.path().join("repo"),"cycle":0,"accepted_ref":original.0,"accepted_branch":"","accepted_workspace":root.path().join("repo"),"recent":[]});
+    fs::write(state_dir.join("state.json"), legacy.to_string()).unwrap();
+    run_cycles(root.path(), 0);
+    assert_imported_dirty_checkout(root.path(), &original);
+    assert_eq!(state(root.path())["schema_version"], 2);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(state_dir.join("state-v1-backup.json")).unwrap())
+            .unwrap(),
+        legacy
+    );
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn orphan_working_checkout_retains_its_actual_head_and_unfinished_files() {
+    let server = Server::new(false, false);
+    let root = tempfile::tempdir().unwrap();
+    let original = dirty_checkout_fixture(root.path(), &server.url);
+    let repo = root.path().join("repo");
+    let state_dir = root.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let workspace = state_dir.join("working");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "codex/orphan-work",
+            workspace.to_str().unwrap(),
+            &original.0,
+        ],
+    );
+    fs::write(workspace.join("value.txt"), "ORPHAN_COMMITTED").unwrap();
+    git(&workspace, &["add", "value.txt"]);
+    git(
+        &workspace,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "Checkpoint whose state save was interrupted",
+        ],
+    );
+    let orphan_head = git(&workspace, &["rev-parse", "HEAD"]);
+    fs::write(workspace.join("value.txt"), "ORPHAN_UNFINISHED").unwrap();
+    fs::write(workspace.join("orphan-staged.bin"), [0, 255, 4]).unwrap();
+    git(&workspace, &["add", "orphan-staged.bin"]);
+    fs::write(
+        workspace.join("orphan-notes.txt"),
+        "Keep these untracked findings",
+    )
+    .unwrap();
+    let orphan_status = git(&workspace, &["status", "--porcelain"]);
+    let orphan_index = git(&workspace, &["write-tree"]);
+    run_cycles(root.path(), 0);
+    let saved = state(root.path());
+    assert_eq!(saved["working_ref"], orphan_head);
+    assert_eq!(saved["working_workspace"], workspace.to_str().unwrap());
+    assert_eq!(saved["working_branch"], "codex/orphan-work");
+    assert_eq!(saved["seed_from_repo"], false);
+    assert_eq!(
+        fs::read_to_string(workspace.join("value.txt")).unwrap(),
+        "ORPHAN_UNFINISHED"
+    );
+    assert_eq!(
+        fs::read(workspace.join("orphan-staged.bin")).unwrap(),
+        [0, 255, 4]
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("orphan-notes.txt")).unwrap(),
+        "Keep these untracked findings"
+    );
+    assert!(
+        !workspace.join("new-document.txt").exists(),
+        "Do not overwrite an orphan workspace with the original checkout"
+    );
+    assert_eq!(git(&workspace, &["status", "--porcelain"]), orphan_status);
+    assert_eq!(git(&workspace, &["write-tree"]), orphan_index);
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), original.0);
+    assert_eq!(git(&repo, &["status", "--porcelain"]), original.1);
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn interrupted_initial_import_finishes_before_any_model_request() {
+    let server = Server::new(false, false);
+    let root = tempfile::tempdir().unwrap();
+    let original = dirty_checkout_fixture(root.path(), &server.url);
+    let repo = root.path().join("repo");
+    let state_dir = root.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let workspace = state_dir.join("working");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "codex/interrupted-import",
+            workspace.to_str().unwrap(),
+            &original.0,
+        ],
+    );
+    // The initial import copied only part of one file before the process ended.
+    fs::write(workspace.join("value.txt"), "PARTIAL_IMPORT").unwrap();
+    fs::write(state_dir.join("state.json"), json!({"schema_version":2,"run_id":"interrupted-import","goal":"Improve value incrementally","repo":repo,"cycle":0,"working_ref":original.0,"working_branch":"codex/interrupted-import","working_workspace":workspace,"seed_from_repo":true,"recent":[]}).to_string()).unwrap();
+    run_cycles(root.path(), 0);
+    assert_imported_dirty_checkout(root.path(), &original);
+    assert_eq!(state(root.path())["seed_from_repo"], false);
+    assert!(server.requests.lock().unwrap().is_empty());
+    fs::write(workspace.join("value.txt"), "LATER_WORKSPACE_CHANGE").unwrap();
+    run_cycles(root.path(), 0);
+    assert_eq!(
+        fs::read_to_string(workspace.join("value.txt")).unwrap(),
+        "LATER_WORKSPACE_CHANGE",
+        "A completed import is never replayed on resume"
+    );
+}
+
+#[test]
+fn initial_import_preserves_file_to_directory_and_directory_to_file_replacements() {
+    let server = Server::new(false, false);
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    let repo = root.path().join("repo");
+    fs::write(repo.join("becomes-directory"), "Previously a tracked file").unwrap();
+    fs::create_dir_all(repo.join("becomes-file/nested")).unwrap();
+    fs::write(
+        repo.join("becomes-file/nested/old.txt"),
+        "Previously a tracked directory",
+    )
+    .unwrap();
+    git(&repo, &["add", "becomes-directory", "becomes-file"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "Artifacts before type replacements",
+        ],
+    );
+    fs::remove_file(repo.join("becomes-directory")).unwrap();
+    fs::create_dir_all(repo.join("becomes-directory/subdir")).unwrap();
+    fs::write(repo.join("becomes-directory/subdir/new.bin"), [0, 128, 255]).unwrap();
+    fs::remove_dir_all(repo.join("becomes-file")).unwrap();
+    fs::write(repo.join("becomes-file"), "Now a project document").unwrap();
+    let original_status = git(&repo, &["status", "--porcelain"]);
+    let original_index = git(&repo, &["write-tree"]);
+    run_cycles(root.path(), 0);
+    let saved = state(root.path());
+    let workspace = Path::new(saved["working_workspace"].as_str().unwrap());
+    assert!(workspace.join("becomes-directory").is_dir());
+    assert_eq!(
+        fs::read(workspace.join("becomes-directory/subdir/new.bin")).unwrap(),
+        [0, 128, 255]
+    );
+    assert!(workspace.join("becomes-file").is_file());
+    assert_eq!(
+        fs::read_to_string(workspace.join("becomes-file")).unwrap(),
+        "Now a project document"
+    );
+    assert_eq!(git(&repo, &["status", "--porcelain"]), original_status);
+    assert_eq!(git(&repo, &["write-tree"]), original_index);
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn dirty_persistent_workspace_survives_a_restart_without_resetting_to_checkpoint() {
+    let server = Server::new(false, false);
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    let before = state(root.path());
+    let workspace = Path::new(before["working_workspace"].as_str().unwrap());
+    fs::write(
+        workspace.join("uncommitted.txt"),
+        "unfinished work from interrupted process",
+    )
+    .unwrap();
+    fs::remove_file(workspace.join("value.txt")).unwrap();
+    git(workspace, &["add", "-A"]);
+    let server2 = Server::custom(false, false, None, |_, _| {
+        (
+            "Continue checking the interrupted work; do not change files.".into(),
+            json!([]),
+        )
+    });
+    let config = root.path().join("chuggin.json");
+    let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    settings["ollama_url"] = json!(server2.url);
+    fs::write(config, settings.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    let after = state(root.path());
+    assert_eq!(before["working_workspace"], after["working_workspace"]);
+    assert!(!workspace.join("value.txt").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.join("uncommitted.txt")).unwrap(),
+        "unfinished work from interrupted process"
+    );
+    assert_eq!(git(workspace, &["status", "--porcelain"]), "");
+    assert_eq!(
+        git(workspace, &["ls-tree", "-r", "--name-only", "HEAD"]),
+        "uncommitted.txt"
+    );
+}
+
+#[test]
+fn explicit_checkpoint_restoration_preserves_the_abandoned_work_in_history() {
+    let restore_ref = Arc::new(Mutex::new(String::new()));
+    let target = restore_ref.clone();
+    let mut edited = false;
+    let server = Server::custom(false, false, None, move |_, _| {
+        if edited {
+            edited = false;
+            return ("Changes saved for verification.".into(), json!([]));
+        }
+        edited = true;
+        let reference = target.lock().unwrap().clone();
+        let tools = if reference.is_empty() {
+            json!([task_tool("Improve the value"), {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"USEFUL_WORK"}}}])
+        } else {
+            json!([{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"ABANDONED_APPROACH"}}},{"function":{"name":"restore_checkpoint","arguments":{"commit":reference,"reason":"The new approach is incorrect; retain the earlier implementation."}}}])
+        };
+        (String::new(), tools)
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    *restore_ref.lock().unwrap() = state(root.path())["working_ref"].as_str().unwrap().into();
+    run_cycles(root.path(), 1);
+    let saved = state(root.path());
+    let workspace = Path::new(saved["working_workspace"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(workspace.join("value.txt")).unwrap(),
+        "USEFUL_WORK"
+    );
+    assert_eq!(
+        git(workspace, &["show", "HEAD^:value.txt"]),
+        "ABANDONED_APPROACH"
+    );
+    let artifact = root.path().join("state/cycle-000002/restore-0-1.json");
+    let record: Value = serde_json::from_slice(&fs::read(artifact).unwrap()).unwrap();
+    assert!(record["reason"].as_str().unwrap().contains("incorrect"));
+}
+
+#[test]
+fn plain_text_project_uses_its_own_validation_without_automatic_language_checks() {
     let server = Server::new(false, false);
     let root = tempfile::tempdir().unwrap();
     let config_path = fixture(root.path(), &server.url, true);
@@ -348,10 +1119,10 @@ fn plain_text_project_uses_its_own_validation_without_rust_tools() {
     );
     let state: Value =
         serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
-    assert_eq!(state["recent"][0]["disposition"], "accepted");
+    assert_eq!(state["recent"][0]["disposition"], "checkpoint");
     assert_eq!(
         fs::read_to_string(
-            Path::new(state["accepted_workspace"].as_str().unwrap()).join("value.txt")
+            Path::new(state["working_workspace"].as_str().unwrap()).join("value.txt")
         )
         .unwrap(),
         "1"
@@ -362,14 +1133,21 @@ fn plain_text_project_uses_its_own_validation_without_rust_tools() {
             .join("state/cycle-000001/probe-outcome.json")
             .exists()
     );
-    for request in server.requests.lock().unwrap().iter() {
-        if let Some(tools) = request["tools"].as_array() {
-            assert!(!tools.iter().any(|tool| matches!(
-                tool["function"]["name"].as_str(),
-                Some("compiler_diagnostics" | "lookup_symbol")
-            )));
-        }
-    }
+    let artifact = root.path().join("state/cycle-000001");
+    assert!(
+        !fs::read_dir(artifact)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("diagnostics-"))
+    );
+    assert!(
+        !Path::new(state["working_workspace"].as_str().unwrap())
+            .join("Cargo.toml")
+            .exists()
+    );
 }
 
 #[test]
@@ -397,13 +1175,13 @@ fn duration_limit_finishes_cycle_and_resets_on_resume() {
         assert_eq!(state["cycle"], cycle);
         assert_eq!(
             state["recent"].as_array().unwrap().last().unwrap()["disposition"],
-            "accepted"
+            "checkpoint"
         );
     }
 }
 
 #[test]
-fn timed_out_review_retries_without_repeating_implementation() {
+fn timed_out_followup_retries_without_repeating_edits() {
     let server = Server::serve(false, false, None, true);
     let root = tempfile::tempdir().unwrap();
     let path = fixture(root.path(), &server.url, true);
@@ -421,17 +1199,17 @@ fn timed_out_review_retries_without_repeating_implementation() {
     );
     let state: Value =
         serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
-    assert_eq!(state["recent"][0]["disposition"], "accepted");
+    assert_eq!(state["recent"][0]["disposition"], "checkpoint");
     let requests = server.requests.lock().unwrap();
-    assert_eq!(requests.len(), 6);
+    assert_eq!(requests.len(), 3);
     assert_eq!(
-        requests[4], requests[5],
-        "Retry exactly the failed review, not earlier stages"
+        requests[1], requests[2],
+        "Retry exactly the failed follow-up, preserving completed tool results"
     );
 }
 
 #[test]
-fn review_receives_complete_diff_beyond_former_request_byte_limit() {
+fn conversation_preserves_long_tool_arguments_beyond_former_byte_limit() {
     let content = format!(
         "{}\nDIFF_END_MARKER\n",
         "Useful project content.\n".repeat(3000)
@@ -453,34 +1231,28 @@ fn review_receives_complete_diff_beyond_former_request_byte_limit() {
     );
     let state: Value =
         serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
-    assert_eq!(state["recent"][0]["disposition"], "accepted");
+    assert_eq!(state["recent"][0]["disposition"], "checkpoint");
     let requests = server.requests.lock().unwrap();
     // Long tool arguments/results remain in the next implementation request.
-    let continuation = &requests[3];
+    let continuation = &requests[1];
     assert!(continuation["messages"].to_string().len() > 64000);
     assert!(
         continuation["messages"]
             .to_string()
             .contains("DIFF_END_MARKER")
     );
-    let review = requests.last().unwrap();
-    let payload: Value =
-        serde_json::from_str(review["messages"][1]["content"].as_str().unwrap()).unwrap();
-    let diff = payload["diff"].as_str().unwrap();
-    assert!(diff.len() > 64000);
-    assert_eq!(review["options"]["num_ctx"], 65536);
-    assert!(diff.ends_with("+DIFF_END_MARKER"));
-    assert_eq!(payload["diff_truncated"], false);
+    assert_eq!(continuation["options"]["num_ctx"], 65536);
     let actual = git(
-        Path::new(state["accepted_workspace"].as_str().unwrap()),
+        Path::new(state["working_workspace"].as_str().unwrap()),
         &["diff", "HEAD^", "HEAD", "--no-ext-diff", "--no-textconv"],
     );
-    assert_eq!(diff, actual);
+    assert!(actual.len() > 64000);
+    assert!(actual.ends_with("+DIFF_END_MARKER"));
 }
 
 #[test]
-fn streaming_repetition_recovers_discovery_implementation_and_review_in_place() {
-    for stage in [0, 1, 3, 4] {
+fn streaming_repetition_recovers_without_replaying_completed_tools() {
+    for stage in [0, 1] {
         let server = Server::serve_with_repetition(false, false, None, false, None, Some(stage));
         let root = tempfile::tempdir().unwrap();
         fixture(root.path(), &server.url, true);
@@ -496,16 +1268,16 @@ fn streaming_repetition_recovers_discovery_implementation_and_review_in_place() 
         let state: Value =
             serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap())
                 .unwrap();
-        assert_eq!(state["recent"][0]["disposition"], "accepted");
+        assert_eq!(state["recent"][0]["disposition"], "checkpoint");
         assert_eq!(
             fs::read_to_string(
-                Path::new(state["accepted_workspace"].as_str().unwrap()).join("value.txt")
+                Path::new(state["working_workspace"].as_str().unwrap()).join("value.txt")
             )
             .unwrap(),
             "1"
         );
         let requests = server.requests.lock().unwrap();
-        assert_eq!(requests.len(), 6, "No earlier stage is repeated");
+        assert_eq!(requests.len(), 3, "Completed edits are not replayed");
         let original = &requests[stage];
         let retry = &requests[stage + 1];
         let messages = original["messages"].as_array().unwrap();
@@ -522,7 +1294,7 @@ fn streaming_repetition_recovers_discovery_implementation_and_review_in_place() 
                 .contains("Recovery attempt 1")
         );
         assert!(!retry["messages"].to_string().contains("MUST_NOT_EXECUTE"));
-        if stage == 3 {
+        if stage == 1 {
             assert!(messages.iter().any(|m| m["role"] == "tool"));
         }
         if stage == 0 {
@@ -559,10 +1331,19 @@ fn persistent_repetition_has_bounded_retries_and_records_failure() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(server.requests.lock().unwrap().len(), 3);
+    assert_eq!(server.requests.lock().unwrap().len(), 9);
     let state: Value =
         serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
-    assert_eq!(state["recent"][0]["disposition"], "retry");
+    assert_eq!(state["recent"][0]["disposition"], "checkpoint");
+    assert_eq!(
+        fs::read_to_string(
+            Path::new(state["working_workspace"].as_str().unwrap()).join("value.txt")
+        )
+        .unwrap(),
+        "USER_EDIT",
+        "Imported user work remains saved even when every model response fails"
+    );
+    assert!(state["feedback"].as_str().unwrap().contains("Repetitive"));
     let failure: Value = serde_json::from_slice(
         &fs::read(
             root.path()
@@ -572,14 +1353,6 @@ fn persistent_repetition_has_bounded_retries_and_records_failure() {
     )
     .unwrap();
     assert_eq!(failure["retry_same_stage"], false);
-}
-#[test]
-fn fresh_cycles_and_checkout_isolation() {
-    pipeline(true);
-}
-#[test]
-fn failed_checks_override_review() {
-    pipeline(false);
 }
 #[test]
 fn setup_revises_goal_and_reuses_global_settings() {
@@ -680,7 +1453,7 @@ fn soft_stop_finishes_cycle_and_force_stop_releases_lock() {
         libc::kill(child.id() as i32, libc::SIGINT);
     }
     assert!(child.wait().unwrap().success());
-    assert_eq!(server.requests.lock().unwrap().len(), 5);
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
     let state: Value =
         serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
     assert_eq!(state["cycle"], 1);
@@ -690,7 +1463,7 @@ fn soft_stop_finishes_cycle_and_force_stop_releases_lock() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    while server.requests.lock().unwrap().len() < 6 {
+    while server.requests.lock().unwrap().len() < 3 {
         thread::sleep(Duration::from_millis(10));
     }
     unsafe {
@@ -826,11 +1599,11 @@ fn cargo_generated_lockfile_does_not_reject_a_valid_task() {
         &fs::read(root.path().join("state/cycle-000001/outcome.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(outcome["disposition"], "accepted", "{outcome}");
+    assert_eq!(outcome["disposition"], "checkpoint/unverified", "{outcome}");
     let state: Value =
         serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
     assert!(
-        Path::new(state["accepted_workspace"].as_str().unwrap())
+        Path::new(state["working_workspace"].as_str().unwrap())
             .join("Cargo.lock")
             .exists()
     );
@@ -1010,7 +1783,7 @@ mod terminal_ui {
             serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap())
                 .unwrap();
         assert_eq!(state["cycle"], 1);
-        assert_eq!(state["recent"][0]["disposition"], "accepted");
+        assert_eq!(state["recent"][0]["disposition"], "checkpoint");
         // Resume directly after the worker has actually stopped.
         ui.send(b"r");
         ui.wait("cycle 2");
@@ -1080,9 +1853,9 @@ mod terminal_ui {
             serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap())
                 .unwrap();
         assert_eq!(state["cycle"], 1);
-        assert_eq!(state["recent"][0]["disposition"], "accepted");
+        assert_eq!(state["recent"][0]["disposition"], "checkpoint");
         let requests = server.requests.lock().unwrap();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["model"], "fake");
         assert!(requests[1..].iter().all(|r| r["model"] == "fake-next"));
         drop(requests);
@@ -1187,156 +1960,6 @@ mod terminal_ui {
     }
 }
 
-fn probe_reply(body: &Value, mode: u8) -> (String, Value) {
-    let system = body["messages"][0]["content"].as_str().unwrap();
-    let value = if system.starts_with("Start fresh") {
-        json!({"gap":"Return two","why_now":"Required behavior","files":["src/lib.rs"]})
-    } else if system.starts_with("Return JSON {title") {
-        json!({"title":"Return two","objective":"value returns two","acceptance":["value returns two"],"files":["src/lib.rs"],"out_of_scope":[]})
-    } else if system.starts_with("Implement the supplied") {
-        if mode >= 3 {
-            return dev_tool_reply(body, mode);
-        }
-        if body["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["role"] == "tool")
-        {
-            return ("Implemented and tested.".into(), json!([]));
-        }
-        return (
-            String::new(),
-            json!([{"function":{"name":"write_file","arguments":{"path":"src/lib.rs","content":"pub fn value() -> u8 { 2 }\n#[test] fn baseline() { assert!(value() > 0); }\n#[test] fn returns_two() { assert_eq!(value(), 2); }\n"}}}]),
-        );
-    } else if system.starts_with("Write an independent Rust") {
-        json!({"code":if mode == 3 {"#[test] fn probe() { assert_eq!(probe_demo::value(), 2); }"} else if mode == 1 {"#[test] fn probe() { probe_demo::missing(); }"} else if mode == 2 { if body["messages"][1]["content"].as_str().unwrap().contains("compiler_feedback") {"#[test] fn probe() { assert_eq!(probe_demo::value(), 2); }"} else {"#[test] fn probe() { assert_eq!(value(), 2); }"} } else {"#[test] fn probe() { assert_eq!(probe_demo::value(), 3); }"},"rationale":"Fixture probe deliberately challenges the approving reviewer"})
-    } else if system.starts_with("Independently review") {
-        json!({"decision":"accept","reason":"Fixture reviewer always approves","criteria":[{"criterion":"C1","passed":true,"evidence":"implementation"},{"criterion":"C2","passed":true,"evidence":"focused test"}]})
-    } else {
-        panic!("Unexpected stage: {system}");
-    };
-    (value.to_string(), json!([]))
-}
-fn regression_probe(mode: u8) {
-    let server = Server::with_probe(false, false, Some(mode));
-    let root = tempfile::tempdir().unwrap();
-    let config = fixture(root.path(), &server.url, true);
-    let repo = root.path().join("repo");
-    fs::create_dir(repo.join("src")).unwrap();
-    fs::write(
-        repo.join("Cargo.toml"),
-        "[package]\nname = \"probe_demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-    )
-    .unwrap();
-    fs::write(
-        repo.join("src/lib.rs"),
-        "pub fn value() -> u8 { 1 }\n#[test] fn baseline() { assert!(value() > 0); }\n",
-    )
-    .unwrap();
-    fs::write(repo.join(".gitignore"), "/target\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "Rust fixture",
-        ],
-    );
-    let mut c: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    c["checks"] = json!([{"argv":["cargo","test","--offline"],"timeout_seconds":30}]);
-    fs::write(&config, c.to_string()).unwrap();
-    let output = command(root.path())
-        .args(["run", "--config", config.to_str().unwrap(), "--cycles", "1"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let art = root.path().join("state/cycle-000001");
-    let outcome: Value =
-        serde_json::from_slice(&fs::read(art.join("outcome.json")).unwrap()).unwrap();
-    if mode == 4 {
-        assert_eq!(outcome["disposition"], "rejected/Accept");
-        let gate: Value =
-            serde_json::from_slice(&fs::read(art.join("acceptance.json")).unwrap()).unwrap();
-        assert_eq!(gate["checks_pass"], false);
-        let command: Value =
-            serde_json::from_slice(&fs::read(art.join("tool-0-2.json")).unwrap()).unwrap();
-        let result: Value = serde_json::from_str(command["result"].as_str().unwrap()).unwrap();
-        assert_eq!(result["exit_code"], 0);
-        return;
-    }
-    let probe: Value = serde_json::from_slice(
-        &fs::read(art.join("probe-outcome.json")).unwrap_or_else(|_| {
-            panic!(
-                "Missing probe: {outcome}; {}",
-                String::from_utf8_lossy(&output.stdout)
-            )
-        }),
-    )
-    .unwrap();
-    assert_eq!(
-        probe["status"],
-        match mode {
-            0 => "failed_and_retained",
-            1 => "invalid_probe_removed",
-            _ => "passed_and_retained",
-        }
-    );
-    assert_eq!(
-        art.join("workspace/tests/chuggin_regression_1.rs").exists(),
-        mode != 1
-    );
-    assert_eq!(outcome["disposition"] == "accepted", mode != 0, "{outcome}");
-    if mode == 3 {
-        for name in [
-            "command-0-2.log",
-            "diagnostics-0-1.log",
-            "tool-1-0.json",
-            "verification.json",
-        ] {
-            assert!(art.join(name).exists(), "Missing {name}");
-        }
-        let log: Value =
-            serde_json::from_slice(&fs::read(art.join("tool-1-0.json")).unwrap()).unwrap();
-        assert_eq!(log["ok"], true);
-        assert!(log["result"].as_str().unwrap().contains("COMMAND_FINISHED"));
-        assert!(
-            fs::read_to_string(repo.join("src/lib.rs"))
-                .unwrap()
-                .contains("{ 1 }")
-        );
-    }
-    let requests = server.requests.lock().unwrap();
-    assert!(
-        requests
-            .iter()
-            .filter(|r| r["tools"].is_null())
-            .all(|r| r["format"].is_object())
-    );
-}
-#[test]
-fn failing_regression_overrides_approving_reviewer() {
-    regression_probe(0);
-}
-#[test]
-fn noncompiling_probe_is_removed_without_losing_valid_work() {
-    regression_probe(1);
-}
-
-#[test]
-fn regression_compile_error_gets_a_fresh_repair() {
-    regression_probe(2);
-}
-
 fn dev_tool_reply(body: &Value, mode: u8) -> (String, Value) {
     let messages = body["messages"].as_array().unwrap();
     if messages
@@ -1368,10 +1991,84 @@ fn dev_tool_reply(body: &Value, mode: u8) -> (String, Value) {
 }
 #[test]
 fn execution_diagnostics_and_lookup_work_in_the_real_pipeline() {
-    regression_probe(3);
+    exercise_project_tools(false);
 }
 
 #[test]
-fn successful_command_cannot_override_failing_final_checks() {
-    regression_probe(4);
+fn successful_command_does_not_hide_failing_checks_or_discard_work() {
+    exercise_project_tools(true);
+}
+
+fn exercise_project_tools(failing: bool) {
+    let server = Server::serve(false, false, Some(if failing { 4 } else { 3 }), false);
+    let root = tempfile::tempdir().unwrap();
+    let config = fixture(root.path(), &server.url, true);
+    let repo = root.path().join("repo");
+    fs::create_dir(repo.join("src")).unwrap();
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"tools_demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn value() -> u8 { 1 }\n#[test] fn baseline() { assert!(value() > 0); }\n",
+    )
+    .unwrap();
+    fs::write(repo.join(".gitignore"), "/target\n").unwrap();
+    git(&repo, &["add", "Cargo.toml", "src", ".gitignore"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "Rust fixture",
+        ],
+    );
+    let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    settings["checks"] = json!([{"argv":[env!("CARGO"),"test","--offline"],"timeout_seconds":30}]);
+    fs::write(config, settings.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    let saved = state(root.path());
+    assert_eq!(
+        saved["recent"][0]["disposition"],
+        if failing {
+            "checkpoint/checks-failing"
+        } else {
+            "checkpoint"
+        }
+    );
+    assert!(
+        fs::read_to_string(
+            Path::new(saved["working_workspace"].as_str().unwrap()).join("src/lib.rs")
+        )
+        .unwrap()
+        .contains("{ 2 }")
+    );
+    assert!(
+        fs::read_to_string(repo.join("src/lib.rs"))
+            .unwrap()
+            .contains("{ 1 }")
+    );
+    let artifact = root.path().join("state/cycle-000001");
+    for name in [
+        "command-0-2.log",
+        "diagnostics-0-1.log",
+        "tool-1-0.json",
+        "verification.json",
+    ] {
+        assert!(artifact.join(name).exists(), "Missing {name}");
+    }
+    let log: Value =
+        serde_json::from_slice(&fs::read(artifact.join("tool-1-0.json")).unwrap()).unwrap();
+    assert_eq!(log["ok"], true);
+    assert!(log["result"].as_str().unwrap().contains("COMMAND_FINISHED"));
+    assert!(
+        !artifact.join("probe-outcome.json").exists(),
+        "Rust probes should not run automatically"
+    );
 }

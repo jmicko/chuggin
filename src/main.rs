@@ -25,7 +25,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Fresh-context stages for persistent local coding experiments"
+    about = "Persistent projects and continuous local model refinement"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -98,10 +98,6 @@ fn main() -> Result<()> {
             cycles,
             forever,
         }) => {
-            anyhow::ensure!(
-                forever || cycles > 0,
-                "Use --forever or a positive --cycles count"
-            );
             running.store(true, Ordering::SeqCst);
             let config = if config == std::path::Path::new("chuggin.json") && !config.exists() {
                 setup::find_project()?.unwrap_or(config)

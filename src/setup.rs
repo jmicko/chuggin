@@ -329,7 +329,7 @@ pub fn wizard() -> Result<PathBuf> {
         draft.feedback = action;
         save(&draft_path, &draft)?;
     }
-    crate::ui::notice("\nChoose a check Chuggin must pass before accepting changes.\nChoose validation appropriate to this project: tests, a document linter, a data checker, or your own validation script.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
+    crate::ui::notice("\nChoose a check Chuggin can use to guide refinement. All work is saved even when checks fail.\nChoose validation appropriate to this project: tests, a document linter, a data checker, or your own validation script.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
     let check = loop {
         let default_check = if root.join("Cargo.toml").is_file() {
             "cargo test"

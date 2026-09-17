@@ -1,9 +1,9 @@
 # Chuggin
 
-A Rust terminal tool for advancing software, document, and data projects with local models through
-an indefinite sequence of focused tasks.
+A Rust terminal tool for advancing software, document, and data projects with local models.
+It keeps working, checking results, and refining the same project.
 
-**The program loops indefinitely. Model conversations do not.**
+**Save the work. Test it. Keep improving it.**
 
 ## Install
 
@@ -58,7 +58,7 @@ tool actions, check output, recovery messages, and recent outcomes.
 - **R:** cancel a pending stop or resume directly after the run finishes.
   When the run finishes, Enter returns to the splash screen.
 
-The side panel shows request counts, recent acceptance outcomes, context usage,
+The side panel shows request counts, recent checkpoints and findings, context usage,
 and generation speed. Token counts and speed come from Ollama after each completed
 response, not estimates during streaming. CPU, RAM, and process memory describe
 the local Linux computer; they do not measure the remote server's GPU.
@@ -86,7 +86,7 @@ Git ignores and excluding Chuggin's state.
 
 First Ctrl-C requests a stop after the current cycle. Press R to cancel that
 request, or press R on the finished screen to continue from saved progress.
-Second Ctrl-C stops immediately. Subsequent runs resume with fresh conversations.
+Second Ctrl-C stops immediately. Subsequent runs resume the persistent working project.
 During setup, a single Ctrl-C exits.
 
 Choose **Run duration** from the home menu to set a project-specific duration
@@ -111,56 +111,72 @@ apply immediately against elapsed time since this run started. Shortening the
 duration below elapsed time requests a stop after the current cycle; extending
 it allows additional time. Resuming a stopped run starts a new timer.
 
-## Persistent project, fresh stages
+## One conversation, continuous refinement
 
-1. Discovery picks the next useful gap from the main goal and current evidence.
-2. Task shaping specifies a small behavior, writable paths, and acceptance
-   criteria. A slice keeps implementation, dependency wiring, and relevant validation
-   together; oversized proposals are narrowed to one complete behavior.
-3. Implementation edits a private Git worktree, retaining its conversation and
-   tool history while it works. Repetitive generation is interrupted and retried
-   in that conversation. A task refresh is a fallback after repeated failed recovery,
-   not a response to conversation byte size. Passing
-   configured checks on the current changed files trigger a handoff to verification.
-4. The harness runs the operator's configured checks. For changed Rust code, a
-   fresh stage proposes an extra public-API regression test. Chuggin runs that test
-   explicitly, retains valid tests, and gives compile errors one fresh test-only
-   repair. Remaining noncompiling or timed-out probes are logged and removed. A valid failing test blocks acceptance and carries into repair.
-5. A fresh reviewer examines the task, diff, files, and actual results.
-6. Passing work is committed; repairable attempts can carry their files into
-   the next fresh cycle.
+Chuggin separates **saving progress** from **verifying correctness**. One durable
+working branch and worktree hold the developing project. Failing checks, model
+errors, and cycle boundaries do not discard its edits. A checkpoint is a saved
+revision, not an approval.
 
-The broad project goal remains fixed. Discovery gets bounded progress evidence,
-not prior conversations or unverified reviewer claims. The latest rejected
-attempt can be retried from the same accepted baseline; repeated unsuccessful
-repairs return to task planning without resurrecting older broken candidates.
+The agent uses **one conversation across tasks, cycles, and restarts**. Its system
+instructions, main goal, and tool definitions stay stable. New task directions,
+tool results, and check feedback are appended to the same history. This keeps
+useful reasoning available and gives Ollama the opportunity to reuse a cached
+prompt prefix instead of processing a different conversation for each activity.
+Actual cache reuse depends on the server, model, and available context.
+Tool definitions are fixed during a run; changes such as enabling web tools are
+applied when the next run starts.
 
-Implementation keeps a bounded, task-local repair note across context resets
-and eligible retries of the same task. It records recent actions and failures;
-the model can use `save_progress_note` to replace a short factual handoff about
-what it tried, constraints it found, and its next action. These notes work with
-any project language or file type. They are advisory: current files and actual
-validation results take precedence. A new task starts with an empty note.
-Each cycle saves `repair-note.json` alongside its other diagnostic artifacts.
+Within that conversation the agent can:
 
-Full acceptance requires passing checks, preservation of previously reported
-passing test names when recognizable in check output, scope compliance, and reviewer evidence
-for every criterion. Markdown formatting and whitespace differences in copied
-criteria do not cause rejection. New reviews reference stable C1/C2 IDs, so they
-do not have to reproduce long criterion sentences.
+- Inspect the current files and choose a useful next result with `set_task`.
+- Plan, edit, run checks, and repair in any order that the evidence warrants.
+- Examine its changes for missed problems using the same tools and history.
+- Call `finish_task` with a factual summary when it believes the task is done.
 
-A reviewer may explicitly accept **partial progress** when a task bundled too much:
-the delivered subset must be independently useful, pass all checks, preserve all
-previously reported passing test names when available, and provide concrete evidence
-for the completed criteria. Unmet criteria remain in the review and progress record.
-Neither full nor partial acceptance requires a particular test-output format.
+`set_task` records the task's objective, desired outcomes, and likely relevant
+files. These are planning hints, not file allowlists or rigid acceptance rules.
+`finish_task` expresses completion intent. Chuggin marks the task complete only
+when the configured checks pass; failures are appended to the conversation and
+the task remains unfinished for repair. **Every result still preserves the files.**
+There is no mandatory separate planning agent or reviewer, and no review veto.
+An ordinary prose response can end a work interval without marking the task done.
+
+At each cycle boundary Chuggin runs configured checks, even if the agent already
+ran them, saves a checkpoint when there are changes, and records the results.
+The last passing revision advances only when all configured checks pass and the
+project files remain unchanged during those checks. Commands that modify files
+leave a saved but unverified checkpoint for another validation pass. The next
+cycle continues from those files and the same conversation.
+
+Chuggin does not rebuild an attempt from an older passing snapshot. If an approach
+needs to be undone, the agent can make a targeted correction or explicitly use
+`restore_checkpoint` with an ancestor commit and a reason. Restoration first saves
+the current work in Git, then restores the requested project files. It does not
+erase the prior history or automatically certify the restored files.
+
+Conversation recovery happens for reported context pressure or repeated request
+failures, not simply because a task or cycle ended or a text-size estimate was
+exceeded. Before a handoff, Chuggin archives the full conversation. It preserves
+the stable instructions and goal, then supplies the current task, checkpoint,
+progress notes, and latest feedback. A token-pressure handoff also retains recent
+messages. This is a deterministic handoff, without an extra summary-model request,
+and never resets project files. The interface distinguishes checkpoints,
+unresolved failures, and the last revision whose configured checks passed.
+A passing check is evidence about that check, not proof of project completeness.
+
+The agent can use `save_progress_note` for a short factual handoff: what changed,
+what it checked, outstanding problems, and a useful next action. Recent actions
+and failures are recorded too. These notes work with any language or artifact
+format and remain advisory; current files and observed validation take precedence.
 
 ## Tools and recovery
 
-Discovery has read-only inspection tools and a bounded inventory of all project
-files. Rust declarations and module reachability supplement the inventory when
-present. Other formats use file reading and text search. Stage prompts describe
-project outcomes and evidence rather than assuming a language or test framework.
+The agent has the same inspection, editing, execution, and task tools throughout
+the working conversation, plus a bounded inventory of project files. Rust
+declarations and module reachability supplement the inventory when present. Other
+formats use file reading and text search. Instructions describe project outcomes
+and evidence rather than assuming a language or test framework.
 Setup asks for a validation command appropriate to the project; it only suggests
 `cargo test` when a Cargo manifest exists. Documents and data can use linters,
 consistency checkers, or custom scripts. A validation command is still required.
@@ -168,24 +184,21 @@ consistency checkers, or custom scripts. A validation command is still required.
 The model can list files, search literal text, read numbered line ranges, replace
 a file, make an exact targeted edit, and run configured checks. Long reads include
 continuation positions. Unique-match edits prevent accidental broad replacement.
-It can request an existing supporting file of any text format when a necessary supporting change
-was omitted from the plan. The reason and expanded scope are logged and supplied
-to review; this does not permit changing Chuggin configuration or Git control files.
+Edits can address any relevant project file, including supporting work omitted from
+the original plan. Chuggin configuration, runtime state, and Git control files remain
+protected.
 Investigation and repairs use the same native tools and conversation. Reading
 several files does not trigger a separate patch-generation stage. If the agent
 tries to finish while validation is failing, it receives the failure evidence
 and continues in place; claims never substitute for changes on disk.
 
-Rust tasks can wire new modules through existing parent modules, src/lib.rs, and
-src/main.rs. Their criteria require exercised behavior. Empty Rust test
-runs explicitly explain that orphan source files need module declarations.
-Cargo.lock may accompany a task when a corresponding Cargo.toml exists.
+Validation is project-defined. There is no mandatory Rust regression-writing
+stage, test-name gate, or language-specific acceptance rule. The agent can add and
+run suitable tests and investigate missing checks using the normal tools.
 
-Structured stages send typed JSON schemas to Ollama and use temperature zero.
-Tool-using stages retain native tool calls and temperature 0.4. Model JSON can
-be surrounded by prose or code fences. Invalid formatting gets one
-formatting-repair request retaining the original evidence and conversation;
-ambiguous multiple matching answers are rejected by the parser.
+The working conversation uses native tool calls and temperature 0.4. Task metadata
+is recorded through tools; ordinary work does not require a staged JSON report.
+Setup goal drafting still uses structured output and formatting repair.
 Repeated JSON fields and fenced code are allowed. Sustained repeated words,
 phrases, or sentence blocks in prose interrupt the stream. Chuggin retains the
 completed conversation and retries up to twice, removing the repetitive tail.
@@ -197,29 +210,37 @@ Goal-drafting failures preserve the pitch and offer Retry, Settings, or Back.
 
 ## Execution, compiler diagnostics, and symbols
 
-Implementation can use **run_command** with an executable and argument array,
+The working agent can use **run_command** with an executable and argument array,
 for example `["cargo", "test", "unicode"]` or `["cargo", "fmt"]`. Commands run
-in the attempt's workspace, with no implicit shell and no interactive stdin.
+in the persistent workspace, with no implicit shell and no interactive stdin.
 The default timeout is 120 seconds; a call can select 1–600 seconds. Chuggin
 returns the exit code, timeout status, a bounded output tail, and a log ID.
-**read_command_log** retrieves the full log in chunks. Commands and checks share
+**read_command_log** retrieves the full log in chunks, including logs from earlier
+cycles. Use the complete returned ID, such as `cycle-000003/command-2-0.log`, so
+continued conversations retrieve the original evidence even after command numbers
+repeat. Legacy IDs without a cycle prefix refer only to the current cycle.
+Commands and checks share
 the live output view and process-group cleanup on completion, timeout, or force stop.
 Application runs are bounded foreground runs, not persistent interactive sessions.
 
-When a Cargo manifest exists, **compiler_diagnostics** runs Cargo check for all targets and returns grouped
-errors/warnings, source locations, nearby code, and compiler suggestions. It does
+**compiler_diagnostics** is a Rust helper that requires a Cargo manifest. It runs
+Cargo check for all targets and returns grouped errors/warnings, source locations,
+nearby code, and compiler suggestions. It does
 not execute tests. Command success does not substitute for the configured final
-checks or acceptance review; command-produced file changes still undergo scope review.
+checks. Command-produced edits remain part of the persistent project and are
+saved at the next checkpoint.
 Like configured checks, commands execute with the user's OS permissions. A Git
 worktree isolates project revisions; it is not an OS sandbox. The model is
 instructed to keep commands within its task and leave Git commits/state to Chuggin.
 
-When Rust files exist, discovery and implementation have **lookup_symbol**. It finds Rust types,
+**lookup_symbol** inspects Rust files. It finds types,
 functions, private/public methods, and name-based reference candidates, with
 paths, line numbers, source snippets, and pagination. It parses Rust syntax, so
 comments and string contents do not appear as references. This is not a language
 server: it does not resolve types, expand macros, or filter inactive cfg branches.
-Discovery remains read-only; execution tools are exposed only during implementation.
+These helper definitions remain available to keep the tool schema stable; they
+are useful only for the formats they support. They are not required validation
+steps for other projects.
 
 ## Optional Brave search and page reading
 
@@ -231,7 +252,7 @@ The key is stored separately in ~/.config/chuggin/brave.key (or the correspondin
 XDG directory) with owner-only permissions. It is not included in project
 configuration, prompts, or request logs. It is sent only to Brave's search API.
 
-Discovery and implementation can use **web_search** for five sourced snippets,
+The agent can use **web_search** for five sourced snippets,
 and **read_web_page** for numbered, paginated public HTTPS text and links.
 Responses are bounded and cached within a cycle. Page reading does not execute
 JavaScript; private/local addresses and binary downloads are rejected. External
@@ -248,37 +269,46 @@ goal, repository, checks, and state location. Project overrides take precedence;
 shared settings are reloaded when starting a run.
 
 Defaults: 32,768 context tokens, 4,096 output tokens, thinking disabled, and up to
-48 implementation steps per task, with bounded request recovery within each step.
+48 work steps per cycle, with bounded request recovery within each step.
 Conversations are not reset at an estimated byte threshold. After repeated failed
-request recovery, implementation can refresh from current files, the main goal,
-the task and recorded failures. Reaching the step budget proceeds to verification
-and review, not a permanent
-pause. Model requests default to a 30-minute total timeout; set it to 0 for no
-request deadline. Connection establishment remains bounded to ten seconds.
+request recovery or actual context pressure, work can continue in a refreshed
+conversation with the current files, main goal, task, and recorded failures.
+Reaching the step budget proceeds to checks and a saved checkpoint.
+It does not discard unfinished edits or pause the project. Model requests default
+to a 30-minute total timeout; set it to 0 for no request deadline. Connection
+establishment remains bounded to ten seconds.
 Checks have their own individual timeouts. A timeout or connection failure retries
 the same model request once, retaining completed edits and validation instead of
-restarting earlier stages. If the retry fails, normal cycle recovery applies.
+restarting earlier stages. If the retry fails, the existing files are still
+retained for continued work.
 Request settings and failed attempts are recorded alongside the response traces.
 
-.chuggin/state.json points at the accepted commit and private workspace. Accepted
-branches are named codex/chuggin-.... The original checkout is not overwritten or
-automatically merged.
-Interrupted candidates with saved tasks are eligible for the same bounded,
-freshly verified recovery as rejected attempts.
+`.chuggin/state.json` records `working_ref`, `working_branch`, `working_workspace`,
+`last_checks_passed_ref`, the current task, feedback, and recent outcomes.
+New projects use `.chuggin/working` on a `codex/chuggin-working-...` branch.
+The initial worktree includes the original checkout's current project files,
+including uncommitted edits, deletions, and untracked files that Git does not ignore.
+The original checkout is not overwritten or automatically merged. The persistent
+worktree is the developing project; checkpoint commits can contain failing or
+unfinished work. `.chuggin/conversation.json` preserves the working conversation
+across tasks, cycles, and restarts.
 
-Each cycle-NNNNNN directory contains:
+Existing projects adopt their latest compatible candidate with actual changes,
+skipping newer attempts that stopped before editing. They adopt that work in place and
+back up their previous state. Historical cycle folders, logs, and commits remain
+available for diagnosis. The adopted workspace retains uncommitted files too.
 
-- Effective configuration, prompt version, discovery inspections, proposed/final
-  task, and recovery origin.
-- Regression-test proposals, execution logs, and retained/removed probe decisions.
+Each cycle-NNNNNN directory records the evidence for that interval:
+
+- Effective configuration, prompt version, and task information.
 - Exact model requests and raw streamed responses, including server-provided
-  token counts, timings, and partial output from interrupted generations.
-- Implementation replies, tool results, context refreshes, and response errors.
-- Full check logs, verification, review, exact scope/acceptance gates, and outcome.
-- The attempt's worktree, including rejected work.
+  token counts, timings, and interrupted output.
+- Tool results, progress notes, context recovery, and request errors.
+- Full check logs, validation results, completion requests, and checkpoint outcome.
 
-The short state summary rotates; full cycle folders remain. Artifact and build
-output cleanup is not yet automatic.
+The working conversation and current files survive task and cycle boundaries. The short
+state summary rotates; full cycle folders remain. Artifact and build output
+cleanup is not yet automatic.
 
 ## Build and test
 
@@ -295,25 +325,24 @@ Git and the target project's build/test tools must be on PATH. Ollama can run on
 another machine. Advanced automation commands are available through help.
 
 This is an experimental harness, not proof of product completeness. Check quality
-and model judgment matter; partial acceptance does not prove arbitrary behavior
-correct. The reviewer receives the full diff without a separate size cutoff.
-Requests have no byte-based context cutoff; the configured context and output token
+and model judgment matter; a saved checkpoint does not prove arbitrary behavior
+correct. Requests have no byte-based context cutoff; the configured context and output token
 limits are sent to Ollama. Large requests can still exceed the model's context capacity.
 Checks run with the user's permissions. Worktrees isolate Git changes, not code
 execution.
 
 ## Harness design references
 
-The current changes emphasize selective context, useful tool feedback, and
-actual verification, informed by [Anthropic's context engineering guidance](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+The current design emphasizes persistent work, useful tool feedback, and
+observable verification, informed by [Anthropic's context engineering guidance](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
 and [tool design guidance](https://www.anthropic.com/engineering/writing-tools-for-agents).
-Structured replies follow [Ollama's schema support](https://docs.ollama.com/capabilities/structured-outputs).
+Structured goal drafts follow [Ollama's schema support](https://docs.ollama.com/capabilities/structured-outputs).
 Search uses the [Brave Web Search API](https://api-dashboard.search.brave.com/api-reference/web/search/get).
 
-A fresh regression writer is still the same model: it can miss defects or invent
-an invalid test. Successful cycles and passing tests do not establish completion
-of a broad product goal. Compare prompt-version logs and real accepted diffs
-across longer runs before treating these changes as a performance improvement.
+The working model can still miss defects or invent a concern. Saved checkpoints
+and passing tests do not establish completion of a broad product goal. Compare
+actual changes, unresolved findings, and validation results across longer runs
+before treating harness changes as a performance improvement.
 
 ## License
 

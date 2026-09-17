@@ -1,4 +1,4 @@
-//! Implementation-only execution and bounded access to its evidence.
+//! Project execution and bounded access to its evidence across cycles.
 use crate::project::{self, Check};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -14,7 +14,7 @@ pub fn schemas() -> Vec<Value> {
     vec![
         json!({"type":"function","function":{"name":"run_command","description":"Run an executable with argv in the private task workspace. Examples: [\"cargo\",\"test\",\"test_name\"], [\"cargo\",\"fmt\"]. No implicit shell; pipes/redirection are literal arguments. Commands finish or time out; background children are terminated. Returns exit_code, output tail and log_id. Honor task scope. Do not commit, reset Git, modify Chuggin state or operate outside this workspace. Configured final checks still run independently.","parameters":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":600}},"required":["argv"]}}}),
         json!({"type":"function","function":{"name":"compiler_diagnostics","description":"Run cargo check --all-targets and group Rust errors/warnings with source locations, snippets and compiler suggestions. Use after compiler failure rather than guessing APIs. This does not run tests or replace run_checks. Full raw output is available through log_id.","parameters":{"type":"object","properties":{}}}}),
-        json!({"type":"function","function":{"name":"read_command_log","description":"Read an earlier command/diagnostics log from this cycle in bounded byte chunks. Use log_id and next_offset returned by tools; do not repeat the same offset.","parameters":{"type":"object","properties":{"log_id":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["log_id"]}}}),
+        json!({"type":"function","function":{"name":"read_command_log","description":"Read an earlier command/diagnostics log, including prior cycles, in bounded byte chunks. Use the complete log_id and next_offset returned by tools; do not repeat the same offset.","parameters":{"type":"object","properties":{"log_id":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["log_id"]}}}),
     ]
 }
 pub fn run(root: &Path, art: &Path, id: &str, args: &Value, stop: &AtomicBool) -> Result<Value> {
@@ -39,17 +39,19 @@ pub fn run(root: &Path, art: &Path, id: &str, args: &Value, stop: &AtomicBool) -
         (1..=600).contains(&timeout),
         "timeout_seconds must be 1–600"
     );
-    let log_id = format!("command-{id}.log");
+    let filename = format!("command-{id}.log");
+    let log = art.join(&filename);
     let result = project::check(
         root,
         &Check {
             argv,
             timeout_seconds: timeout,
         },
-        &art.join(&log_id),
+        &log,
         stop,
     )?;
-    let bytes = fs::metadata(art.join(&log_id))?.len();
+    let bytes = fs::metadata(log)?.len();
+    let log_id = qualified_log_id(art, &filename);
     Ok(
         json!({"exit_code":result.exit_code,"passed":result.passed,"timed_out":result.timed_out,"output_tail":output_tail(&result.output,7000),"log_id":log_id,"log_bytes":bytes,"instruction":"Use read_command_log for full output. A successful command does not replace configured final checks."}),
     )
@@ -61,17 +63,54 @@ fn output_tail(text: &str, limit: usize) -> &str {
     }
     &text[start..]
 }
+fn cycle_name(name: &str) -> bool {
+    name.strip_prefix("cycle-")
+        .is_some_and(|digits| digits.len() >= 6 && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+fn qualified_log_id(art: &Path, filename: &str) -> String {
+    match art.file_name().and_then(|name| name.to_str()) {
+        Some(cycle) if cycle_name(cycle) => format!("{cycle}/{filename}"),
+        _ => filename.to_owned(),
+    }
+}
+fn log_filename(name: &str) -> bool {
+    (name.starts_with("command-") || name.starts_with("diagnostics-"))
+        && name.ends_with(".log")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
 pub fn read_log(art: &Path, args: &Value) -> Result<Value> {
     let id = args["log_id"].as_str().context("Missing log_id")?;
     anyhow::ensure!(
-        (id.starts_with("command-") || id.starts_with("diagnostics-"))
-            && id.ends_with(".log")
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.'),
-        "Use a command/diagnostics log_id from this cycle"
+        !fs::symlink_metadata(art)?.file_type().is_symlink(),
+        "Symlinks are not available to log tools"
     );
-    let path = project::safe_path(art, id)?;
+    let root = if let Some((cycle, filename)) = id.split_once('/') {
+        anyhow::ensure!(
+            cycle_name(cycle)
+                && log_filename(filename)
+                && art
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(cycle_name),
+            "Use the complete command/diagnostics log_id returned by a tool"
+        );
+        let state = art.parent().context("Cycle directory has no parent")?;
+        anyhow::ensure!(
+            !fs::symlink_metadata(state)?.file_type().is_symlink(),
+            "Symlinks are not available to log tools"
+        );
+        state
+    } else {
+        anyhow::ensure!(
+            log_filename(id),
+            "Use a command/diagnostics log_id returned by a tool"
+        );
+        art
+    };
+    let path = project::safe_path(root, id)?;
+    anyhow::ensure!(fs::metadata(&path)?.is_file(), "Log is not a regular file");
     let mut file = fs::File::open(path)?;
     let total = file.metadata()?.len();
     let offset = match args.get("offset") {
@@ -92,8 +131,9 @@ pub fn diagnostics(root: &Path, art: &Path, id: &str, stop: &AtomicBool) -> Resu
         root.join("Cargo.toml").is_file(),
         "No Cargo.toml in task workspace"
     );
-    let log_id = format!("diagnostics-{id}.log");
-    let log = art.join(&log_id);
+    let filename = format!("diagnostics-{id}.log");
+    let log = art.join(&filename);
+    let log_id = qualified_log_id(art, &filename);
     let result = project::check(
         root,
         &Check {
@@ -247,6 +287,80 @@ mod tests {
         );
     }
     #[test]
+    fn qualified_logs_keep_their_cycle_when_command_ids_repeat() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let first_cycle = state.path().join("cycle-000001");
+        let second_cycle = state.path().join("cycle-000002");
+        fs::create_dir(&first_cycle).unwrap();
+        fs::create_dir(&second_cycle).unwrap();
+        let stop = AtomicBool::new(false);
+        let first = run(
+            root.path(),
+            &first_cycle,
+            "0-0",
+            &json!({"argv":["printf","%s","earlier failure evidence"]}),
+            &stop,
+        )
+        .unwrap();
+        let second = run(
+            root.path(),
+            &second_cycle,
+            "0-0",
+            &json!({"argv":["printf","%s","later successful result"]}),
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(first["log_id"], "cycle-000001/command-0-0.log");
+        assert_eq!(second["log_id"], "cycle-000002/command-0-0.log");
+        assert_eq!(
+            read_log(&second_cycle, &json!({"log_id":first["log_id"]})).unwrap()["text"],
+            "earlier failure evidence"
+        );
+        assert_eq!(
+            read_log(&second_cycle, &json!({"log_id":second["log_id"]})).unwrap()["text"],
+            "later successful result"
+        );
+        // Existing unqualified IDs remain explicitly local to the current cycle.
+        assert_eq!(
+            read_log(&second_cycle, &json!({"log_id":"command-0-0.log"})).unwrap()["text"],
+            "later successful result"
+        );
+        for id in [
+            "../cycle-000001/command-0-0.log",
+            "cycle-000001/../command-0-0.log",
+            "cycle-000001//command-0-0.log",
+            "cycle-000001/nested/command-0-0.log",
+            "/cycle-000001/command-0-0.log",
+            "other-project/command-0-0.log",
+            "cycle-000001/state.json",
+        ] {
+            assert!(
+                read_log(&second_cycle, &json!({"log_id":id})).is_err(),
+                "accepted {id}"
+            );
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn log_reads_reject_symlinked_cycles_and_files() {
+        use std::os::unix::fs::symlink;
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let current = state.path().join("cycle-000002");
+        fs::create_dir(&current).unwrap();
+        fs::write(outside.path().join("command-0-0.log"), "outside evidence").unwrap();
+        symlink(outside.path(), state.path().join("cycle-000001")).unwrap();
+        assert!(read_log(&current, &json!({"log_id":"cycle-000001/command-0-0.log"})).is_err());
+        symlink(
+            outside.path().join("command-0-0.log"),
+            current.join("command-0-0.log"),
+        )
+        .unwrap();
+        assert!(read_log(&current, &json!({"log_id":"command-0-0.log"})).is_err());
+        assert!(read_log(&current, &json!({"log_id":"cycle-000002/command-0-0.log"})).is_err());
+    }
+    #[test]
     fn timeout_stops_descendants() {
         let root = tempfile::tempdir().unwrap();
         let art = tempfile::tempdir().unwrap();
@@ -265,7 +379,11 @@ mod tests {
     #[test]
     fn real_compiler_errors_include_locations_and_logs() {
         let root = tempfile::tempdir().unwrap();
-        let art = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let first_cycle = state.path().join("cycle-000001");
+        let second_cycle = state.path().join("cycle-000002");
+        fs::create_dir(&first_cycle).unwrap();
+        fs::create_dir(&second_cycle).unwrap();
         project::write(
             root.path(),
             "Cargo.toml",
@@ -278,7 +396,9 @@ mod tests {
             "pub fn broken() -> u32 { \"wrong\" }\n",
         )
         .unwrap();
-        let result = diagnostics(root.path(), art.path(), "0-0", &AtomicBool::new(false)).unwrap();
+        let result =
+            diagnostics(root.path(), &first_cycle, "0-0", &AtomicBool::new(false)).unwrap();
+        assert_eq!(result["log_id"], "cycle-000001/diagnostics-0-0.log");
         assert_eq!(result["passed"], false);
         let errors = result["diagnostics"].as_array().unwrap();
         assert!(
@@ -291,7 +411,7 @@ mod tests {
             "{result}"
         );
         assert!(
-            read_log(art.path(), &json!({"log_id":result["log_id"]})).unwrap()["text"]
+            read_log(&second_cycle, &json!({"log_id":result["log_id"]})).unwrap()["text"]
                 .as_str()
                 .unwrap()
                 .contains("compiler-message")

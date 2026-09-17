@@ -215,7 +215,7 @@ fn splash(
     let descriptions = [
         "Continue the next focused cycle",
         "The ambition guiding every cycle",
-        "Accepted work and recent attempts",
+        "Saved checkpoints and check results",
         "Choose a shared model default",
         "Connection and working budgets",
         "Return to your shell",
@@ -586,6 +586,15 @@ struct Tail {
     file: fs::File,
     offset: u64,
 }
+pub(crate) fn outcome_label(disposition: &str) -> &str {
+    match disposition {
+        "checkpoint" => "Saved · checks passed",
+        "checkpoint/checks-failing" => "Saved · checks failing",
+        "checkpoint/unverified" => "Saved · unverified",
+        "unchanged" => "No file changes",
+        historical => historical,
+    }
+}
 struct Dashboard {
     entries: VecDeque<Entry>,
     phase: String,
@@ -596,8 +605,8 @@ struct Dashboard {
     generated: u64,
     speed: f64,
     request_active: bool,
-    accepted: u64,
-    retried: u64,
+    checkpoints: u64,
+    completed_cycles: u64,
     started: Instant,
     phase_started: Instant,
     last_activity: Instant,
@@ -621,6 +630,7 @@ struct Dashboard {
     partial_check: String,
     history: VecDeque<String>,
     last_check: Option<bool>,
+    last_passing_checkpoint: Option<String>,
     dropped: u64,
 }
 impl Dashboard {
@@ -635,8 +645,8 @@ impl Dashboard {
             generated: 0,
             speed: 0.,
             request_active: false,
-            accepted: 0,
-            retried: 0,
+            checkpoints: 0,
+            completed_cycles: 0,
             started: Instant::now(),
             phase_started: Instant::now(),
             last_activity: Instant::now(),
@@ -660,18 +670,23 @@ impl Dashboard {
             partial_check: String::new(),
             history: VecDeque::new(),
             last_check: None,
+            last_passing_checkpoint: None,
             dropped: 0,
         };
         if let Ok(bytes) = fs::read(config.state_dir.join("state.json"))
             && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
         {
             d.cycle = v["cycle"].as_u64().unwrap_or(0);
+            d.last_passing_checkpoint = v["last_checks_passed_ref"]
+                .as_str()
+                .filter(|reference| !reference.is_empty())
+                .map(|reference| reference.chars().take(8).collect());
             if let Some(recent) = v["recent"].as_array() {
                 for o in recent.iter().rev().take(5) {
                     d.history.push_back(format!(
                         "#{}  {}\n{}",
                         o["cycle"],
-                        o["disposition"].as_str().unwrap_or(""),
+                        outcome_label(o["disposition"].as_str().unwrap_or("")),
                         o["task"].as_str().unwrap_or("")
                     ));
                 }
@@ -743,6 +758,9 @@ impl Dashboard {
             Event::Phase(s) => {
                 self.request_active = false;
                 self.flush_model();
+                if s == "Check" {
+                    self.last_check = None;
+                }
                 self.phase = s;
                 self.phase_started = Instant::now();
                 self.push(Kind::Activity, format!("── {} ──", self.phase));
@@ -784,34 +802,47 @@ impl Dashboard {
                     .ok()
                     .map(|file| Tail { file, offset: 0 });
                 self.push(Kind::Check, format!("$ {command}"));
-                self.last_check = None;
             }
             Event::CheckDone(ok) => {
                 self.poll_tail();
                 self.tail = None;
                 let s = std::mem::take(&mut self.partial_check);
                 self.push(Kind::Check, s);
-                self.last_check = Some(ok);
                 self.push(
                     Kind::Check,
                     if ok {
-                        "✓ Checks passed"
+                        "✓ Command succeeded"
                     } else {
-                        "× Checks failed · candidate remains unaccepted"
+                        "× Command failed · work is kept for repair"
+                    }
+                    .into(),
+                );
+            }
+            Event::ValidationDone { passed, checkpoint } => {
+                self.last_check = Some(passed);
+                if passed && let Some(reference) = checkpoint {
+                    self.last_passing_checkpoint = Some(reference.chars().take(8).collect());
+                }
+                self.push(
+                    Kind::Check,
+                    if passed {
+                        "✓ Configured checks passed"
+                    } else {
+                        "× Validation needs attention · work is kept for repair"
                     }
                     .into(),
                 );
             }
             Event::Outcome { disposition, task } => {
-                if disposition.starts_with("accepted") {
-                    self.accepted += 1;
-                } else {
-                    self.retried += 1;
+                self.completed_cycles += 1;
+                if disposition.starts_with("checkpoint") {
+                    self.checkpoints += 1;
                 }
+                let label = outcome_label(&disposition);
                 self.history
-                    .push_front(format!("#{}  {disposition}\n{task}", self.cycle));
+                    .push_front(format!("#{}  {label}\n{task}", self.cycle));
                 self.history.truncate(5);
-                self.push(Kind::Activity, format!("{disposition} · {task}"));
+                self.push(Kind::Activity, format!("{label} · {task}"));
             }
         }
     }
@@ -984,7 +1015,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         ])),
         r[0],
     );
-    let phases = ["Discovery", "Shape", "Implement", "Verify", "Review"];
+    let phases = ["Orient", "Work", "Check", "Review", "Checkpoint"];
     let mut steps = Vec::new();
     for (i, s) in phases.iter().enumerate() {
         if i > 0 {
@@ -993,13 +1024,17 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         steps.push(Span::styled(
             s.to_string(),
             Style::default()
-                .fg(if d.finished.is_none() && d.phase.starts_with(s) {
+                .fg(if d.finished.is_none() && d.phase == *s {
                     BG
                 } else {
                     MUTED
                 })
-                .bg(if d.phase.starts_with(s) { CYAN } else { BG })
-                .add_modifier(if d.phase.starts_with(s) {
+                .bg(if d.finished.is_none() && d.phase == *s {
+                    CYAN
+                } else {
+                    BG
+                })
+                .add_modifier(if d.finished.is_none() && d.phase == *s {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
@@ -1146,7 +1181,10 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         }
         let session = vec![
             Line::from("THIS SESSION").fg(CYAN).bold(),
-            Line::from(format!("{} accepted · {} retries", d.accepted, d.retried)),
+            Line::from(format!(
+                "Saved: {} · cycles: {}",
+                d.checkpoints, d.completed_cycles
+            )),
             Line::from(format!(
                 "Elapsed {}",
                 duration(
@@ -1162,7 +1200,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             )),
             Line::from(match d.last_check {
                 Some(true) => "✓ Latest checks passed",
-                Some(false) => "× Latest checks failed",
+                Some(false) => "× Checks need attention",
                 None if d.finished.is_some() => "No check result recorded",
                 None => "Checks pending / running",
             })
@@ -1171,9 +1209,14 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
                 Some(false) => GOLD,
                 None => MUTED,
             }),
+            Line::from(format!(
+                "Last passing: {}",
+                d.last_passing_checkpoint.as_deref().unwrap_or("none")
+            ))
+            .fg(MUTED),
         ];
         f.render_widget(p(Text::from(session)), side[2]);
-        let mut history = vec![Line::from("RECENT OUTCOMES").fg(CYAN).bold()];
+        let mut history = vec![Line::from("RECENT CYCLES").fg(CYAN).bold()];
         for h in d.history.iter().take(3) {
             for line in textwrap::wrap(h, inner.width.max(1) as usize) {
                 history.push(Line::from(line.into_owned()).fg(MUTED));
@@ -1288,7 +1331,7 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
         let result = match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(format!("{e:#}")),
-            Err(_) => Err("Runner panicked; candidate artifacts are preserved.".into()),
+            Err(_) => Err("Runner panicked; the working files and logs remain on disk.".into()),
         };
         let _ = done_tx.send(result);
     });
@@ -1615,14 +1658,14 @@ mod tests {
             d.apply(Event::Task(
                 "Add document container with paragraph iteration".into(),
             ));
-            d.apply(Event::Phase("Implement".into()));
+            d.apply(Event::Phase("Work".into()));
             d.apply(Event::Metrics {
                 prompt: 7641,
                 generated: 2137,
                 seconds: 40.,
             });
             d.apply(Event::Tool("edit_file src/model/document.rs".into()));
-            d.apply(Event::Delta("I’m adding a focused iterator and checking empty-document behavior.\nThe accepted Paragraph API is preserved.\n".into()));
+            d.apply(Event::Delta("I’m adding a focused iterator and checking empty-document behavior.\nThe existing Paragraph API is preserved.\n".into()));
             d.apply(Event::CheckDone(true));
             d.resources.refresh();
             t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
@@ -1743,6 +1786,114 @@ mod tests {
                 .iter()
                 .any(|e| e.text.contains("focused_behavior"))
         );
-        assert_eq!(d.last_check, Some(true));
+        // An arbitrary command completing is not the configured validation result.
+        assert_eq!(d.last_check, None);
+    }
+
+    #[test]
+    fn failing_checkpoints_are_saved_without_claiming_they_passed() {
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::Cycle(1));
+        d.apply(Event::CheckDone(true));
+        d.apply(Event::ValidationDone {
+            passed: true,
+            checkpoint: Some("abc12345abcdef".into()),
+        });
+        d.apply(Event::Outcome {
+            disposition: "checkpoint".into(),
+            task: "Initial implementation".into(),
+        });
+        d.apply(Event::Cycle(2));
+        d.apply(Event::Phase("Checkpoint".into()));
+        d.apply(Event::CheckDone(false));
+        d.apply(Event::ValidationDone {
+            passed: false,
+            checkpoint: Some("def98765abcdef".into()),
+        });
+        d.apply(Event::Outcome {
+            disposition: "checkpoint/checks-failing".into(),
+            task: "Continue repairing current work".into(),
+        });
+        assert_eq!(d.checkpoints, 2);
+        assert_eq!(d.completed_cycles, 2);
+        assert_eq!(d.last_passing_checkpoint.as_deref(), Some("abc12345"));
+        assert_eq!(d.last_check, Some(false));
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
+        let text = screen_text(&t);
+        assert!(text.contains("Saved: 2 · cycles: 2"));
+        assert!(text.contains("work is kept for repair"));
+        assert!(text.contains("Last passing: abc12345"));
+        assert!(text.contains("Saved · checks failing"));
+        assert!(!text.contains("unaccepted"));
+        let b = t.backend().buffer();
+        let highlighted = (0..b.area.height)
+            .flat_map(|y| (0..b.area.width).map(move |x| (x, y)))
+            .filter(|&pos| b[pos].bg == CYAN)
+            .map(|pos| b[pos].symbol())
+            .collect::<String>();
+        assert_eq!(highlighted, "Checkpoint");
+    }
+
+    #[test]
+    fn unverified_and_unchanged_cycles_do_not_claim_a_passing_checkpoint() {
+        let mut d = Dashboard::new(&config());
+        d.apply(Event::Outcome {
+            disposition: "checkpoint/unverified".into(),
+            task: "Interrupted request".into(),
+        });
+        d.apply(Event::Outcome {
+            disposition: "unchanged".into(),
+            task: "Inspect files".into(),
+        });
+        assert_eq!(d.checkpoints, 1);
+        assert_eq!(d.completed_cycles, 2);
+        assert!(d.last_passing_checkpoint.is_none());
+    }
+
+    #[test]
+    fn resumed_dashboard_keeps_last_passing_checkpoint_when_new_checks_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config();
+        c.state_dir = dir.path().to_owned();
+        fs::write(
+            dir.path().join("state.json"),
+            r#"{"cycle":8,"last_checks_passed_ref":"0123456789abcdef","recent":[{"cycle":8,"disposition":"checkpoint/checks-failing","task":"Repair existing changes"}]}"#,
+        )
+        .unwrap();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::Cycle(9));
+        d.apply(Event::CheckDone(false));
+        d.apply(Event::ValidationDone {
+            passed: false,
+            checkpoint: None,
+        });
+        d.apply(Event::Outcome {
+            disposition: "checkpoint/checks-failing".into(),
+            task: "Keep refining existing changes".into(),
+        });
+        assert_eq!(d.last_passing_checkpoint.as_deref(), Some("01234567"));
+        assert_eq!(d.checkpoints, 1);
+        assert_eq!(d.completed_cycles, 1);
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
+        assert!(screen_text(&t).contains("Last passing: 01234567"));
+    }
+
+    #[test]
+    fn successful_commands_do_not_overwrite_failed_validation() {
+        let mut d = Dashboard::new(&config());
+        d.apply(Event::ValidationDone {
+            passed: false,
+            checkpoint: None,
+        });
+        d.apply(Event::CheckDone(true));
+        d.apply(Event::Outcome {
+            disposition: "unchanged".into(),
+            task: "Inspect failures".into(),
+        });
+        assert_eq!(d.last_check, Some(false));
+        assert!(d.last_passing_checkpoint.is_none());
     }
 }

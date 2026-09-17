@@ -38,14 +38,23 @@ pub fn default_request_timeout() -> u64 {
 }
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct State {
+    schema_version: u32,
     run_id: String,
     goal: String,
     repo: PathBuf,
     cycle: u64,
-    accepted_ref: String,
-    accepted_branch: String,
-    accepted_workspace: PathBuf,
+    #[serde(alias = "accepted_ref")]
+    working_ref: String,
+    #[serde(alias = "accepted_branch")]
+    working_branch: String,
+    #[serde(alias = "accepted_workspace")]
+    working_workspace: PathBuf,
+    last_checks_passed_ref: Option<String>,
+    current_task: Option<Task>,
+    feedback: String,
+    seed_from_repo: bool,
     recent: Vec<Outcome>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -56,44 +65,29 @@ struct Outcome {
     evidence: String,
     artifact_dir: PathBuf,
 }
-#[derive(Serialize, Deserialize, schemars::JsonSchema)]
-struct Discovery {
-    gap: String,
-    why_now: String,
-    files: Vec<String>,
-}
-#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 struct Task {
     title: String,
+    #[serde(default)]
     objective: String,
-    #[schemars(length(min = 1, max = 3))]
+    #[serde(default)]
     acceptance: Vec<String>,
+    #[serde(default)]
     files: Vec<String>,
+    #[serde(default)]
     out_of_scope: Vec<String>,
 }
-#[derive(Serialize, Deserialize, schemars::JsonSchema)]
-struct Review {
-    decision: Decision,
-    reason: String,
-    criteria: Vec<Criterion>,
-}
-#[derive(Serialize, Deserialize, PartialEq, Debug, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum Decision {
-    Accept,
-    Partial,
-    Repair,
-    Replan,
-    Rollback,
-}
-#[derive(Serialize, Deserialize, schemars::JsonSchema)]
-struct Criterion {
-    criterion: String,
-    passed: bool,
-    evidence: String,
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Conversation {
+    messages: Vec<Value>,
+    tools: Value,
+    note: RepairNote,
+    context_pressure: bool,
+    response_errors: u32,
 }
 
-/// Bounded, task-local evidence survives resets without retaining a transcript.
+/// Compact evidence accompanies the transcript and survives conversation handoffs.
 #[derive(Default, Serialize, Deserialize)]
 struct RepairNote {
     model_note: String,
@@ -286,92 +280,429 @@ fn emit(art: &Path, stage: &str, value: &impl Serialize) -> Result<()> {
     }
     save(&art.join(format!("{stage}.json")), value)
 }
-fn discovery_input(c: &Config, s: &State) -> Result<Value> {
-    let files = project::inventory(&s.accepted_workspace)?;
-    let mut seed: Vec<_> = files
-        .iter()
-        .filter(|p| {
-            p.ends_with("README.md")
-                || p.ends_with("Cargo.toml")
-                || p.ends_with("package.json")
-                || p.ends_with("main.rs")
-                || p.ends_with("lib.rs")
-        })
-        .take(8)
-        .cloned()
-        .collect();
-    // Fresh discovery needs implementation evidence, not only entry points.
-    // Prioritize the latest accepted files so omitted snippets aren't mistaken
-    // for missing code and the planner doesn't rebuild its last milestone.
-    let changed = project::git(
-        &s.accepted_workspace,
-        &["show", "--pretty=", "--name-only", "HEAD"],
+
+fn lock_project(c: &Config) -> Result<fs::File> {
+    fs::create_dir_all(&c.state_dir)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(c.state_dir.join("run.lock"))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        anyhow::ensure!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            "Another Chuggin process is already running this project"
+        );
+    }
+    Ok(file)
+}
+fn verify_workspace(c: &Config, workspace: &Path) -> Result<()> {
+    anyhow::ensure!(
+        fs::canonicalize(workspace)?.starts_with(fs::canonicalize(&c.state_dir)?),
+        "Working workspace must be inside this project's state directory"
+    );
+    let common = |root: &Path| -> Result<PathBuf> {
+        let path = project::git(root, &["rev-parse", "--git-common-dir"])?;
+        Ok(fs::canonicalize(root.join(path))?)
+    };
+    anyhow::ensure!(
+        common(workspace)? == common(&c.repo)?,
+        "Working workspace belongs to another repository"
+    );
+    Ok(())
+}
+
+fn create_workspace(c: &Config, id: &str, head: &str) -> Result<(PathBuf, String, bool)> {
+    let workspace = fs::canonicalize(&c.state_dir)?.join("working");
+    if workspace.exists() {
+        verify_workspace(c, &workspace)?;
+        let branch = project::git(&workspace, &["branch", "--show-current"])?;
+        anyhow::ensure!(
+            !branch.is_empty(),
+            "Existing working checkout has no branch"
+        );
+        crate::events::log(
+            "Recovered the existing working checkout; continuing with its current files.".into(),
+        );
+        return Ok((workspace, branch, false));
+    }
+    let branch = format!("codex/chuggin-working-{id}");
+    project::git(
+        &c.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            workspace.to_str().context("Non-UTF8 workspace")?,
+            head,
+        ],
     )?;
-    for name in changed.lines().chain(files.iter().map(String::as_str)) {
-        if !seed.iter().any(|p| p == name) && name.ends_with(".rs") {
-            seed.push(name.into());
+    Ok((workspace, branch, true))
+}
+
+/// Import all current project files without changing the user's original index,
+/// branch or checkout. Preserve deletions, renames, binaries and untracked files.
+fn seed_working_files(c: &Config, workspace: &Path) -> Result<()> {
+    let mut files = std::collections::BTreeSet::new();
+    for root in [&c.repo, &workspace.to_path_buf()] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Cannot list project files for initial checkpoint"
+        );
+        for path in output.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            files.insert(
+                std::str::from_utf8(path)
+                    .context("Non-UTF8 project path")?
+                    .to_owned(),
+            );
         }
     }
-    let history = project::git(&s.accepted_workspace, &["log", "-30", "--format=%h %s"])?;
-    let previous_task = s
-        .recent
-        .last()
-        .filter(|o| o.disposition != "accepted")
-        .and_then(|o| fs::read(o.artifact_dir.join("task.json")).ok())
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-    Ok(
-        json!({"accepted_milestones":project::excerpt(&history,2500),"previous_unfinished_task":previous_task.as_ref().and_then(|t|t.get("title")),"main_goal":c.goal,"accepted_commit":s.accepted_ref,"recent_outcomes":recent_evidence(s),"inventory":project::excerpt(&files.join("\n"),6000),"code_index":crate::code_index::index(&s.accepted_workspace)?,"orientation":project::context(&s.accepted_workspace,&seed,4000),"evidence_rules":"Every inventory path exists on disk. Orientation is an excerpt, not the complete project. Do not infer missing files or broken builds from omitted snippets. Identify a genuinely absent behavior beyond the latest accepted milestone."}),
-    )
+    for name in files {
+        let path = Path::new(&name);
+        if name == "chuggin.json" || path.components().any(|part| !matches!(part, std::path::Component::Normal(n) if n != ".git" && n != ".chuggin")) { continue; }
+        let source = c.repo.join(path);
+        let target = workspace.join(path);
+        // Never follow a changed parent symlink while importing another path.
+        if path
+            .ancestors()
+            .skip(1)
+            .filter(|p| !p.as_os_str().is_empty())
+            .any(|parent| {
+                [&c.repo, &workspace.to_path_buf()].iter().any(|root| {
+                    fs::symlink_metadata(root.join(parent))
+                        .is_ok_and(|m| m.file_type().is_symlink())
+                })
+            })
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&source).ok();
+        // A tracked file may have become a directory (or vice versa).
+        if metadata.as_ref().is_some_and(|m| m.is_dir()) && target.is_file() {
+            fs::remove_file(&target)?;
+        }
+        if metadata
+            .as_ref()
+            .is_some_and(|m| m.is_file() || m.file_type().is_symlink())
+            && target.is_dir()
+        {
+            fs::remove_dir_all(&target)?;
+        }
+        if let Some(parent) = target.parent() {
+            // An earlier imported parent file supersedes old tracked descendants.
+            if parent
+                .ancestors()
+                .take_while(|p| *p != workspace)
+                .any(|p| p.is_file())
+            {
+                continue;
+            }
+            fs::create_dir_all(parent)?;
+        }
+        if fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+            fs::remove_file(&target)?;
+        }
+        match metadata {
+            Some(meta) if meta.file_type().is_symlink() => {
+                if target.is_file() {
+                    fs::remove_file(&target)?;
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(fs::read_link(&source)?, &target)?;
+                #[cfg(not(unix))]
+                anyhow::bail!("Symlink import is unsupported on this platform");
+            }
+            Some(meta) if meta.is_file() => {
+                fs::copy(&source, &target)?;
+            }
+            None if target.is_file() => {
+                fs::remove_file(&target)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
-fn acceptance_allowed(
-    task: &Task,
-    review: &Review,
-    results: &[CheckResult],
-    changed: bool,
-) -> bool {
-    changed
-        && !results.is_empty()
-        && results.iter().all(|c| c.passed)
-        && review.decision == Decision::Accept
-        && task
-            .acceptance
-            .iter()
-            .enumerate()
-            .all(|(i, _)| criterion_satisfied(task, review, i))
+fn prepare_state(c: &Config) -> Result<State> {
+    let path = c.state_dir.join("state.json");
+    if path.exists() {
+        let bytes = fs::read(&path)?;
+        let mut s: State = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(
+            s.schema_version <= 2,
+            "This state needs a newer Chuggin version"
+        );
+        anyhow::ensure!(
+            s.goal == c.goal && s.repo == fs::canonicalize(&c.repo)?,
+            "This state belongs to a different goal or repository"
+        );
+        if s.schema_version < 2 {
+            // Preserve the original record before adopting any unfinished work.
+            let backup = c.state_dir.join("state-v1-backup.json");
+            if !backup.exists() {
+                fs::write(&backup, &bytes)?;
+            }
+            let baseline = s.working_ref.clone();
+            if !s.working_branch.is_empty() {
+                s.last_checks_passed_ref = Some(baseline.clone());
+            }
+            let mut dirs: Vec<_> = fs::read_dir(&c.state_dir)?
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("cycle-"))
+                .map(|e| e.path())
+                .collect();
+            dirs.sort();
+            let mut fallback = None;
+            let mut candidate = None;
+            for dir in dirs.into_iter().rev() {
+                let attempt = fs::read(dir.join("attempt.json"))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+                let workspace = dir.join("workspace");
+                if !attempt.as_ref().is_some_and(|a| a["base"] == baseline)
+                    || !workspace.is_dir()
+                    || verify_workspace(c, &workspace).is_err()
+                {
+                    continue;
+                }
+                if fallback.is_none() {
+                    fallback = Some((dir.clone(), workspace.clone()));
+                }
+                let mut diff = vec!["diff", "--name-only", &baseline, "--"];
+                diff.extend_from_slice(PROJECT_PATHS);
+                let mut untracked = vec!["ls-files", "--others", "--exclude-standard", "--"];
+                untracked.extend_from_slice(PROJECT_PATHS);
+                if !project::git(&workspace, &diff)?.is_empty()
+                    || !project::git(&workspace, &untracked)?.is_empty()
+                {
+                    candidate = Some((dir, workspace));
+                    break;
+                }
+            }
+            // A newer attempt may have stopped before editing anything. Recover
+            // the latest actual work instead of adopting that empty baseline.
+            if let Some((dir, workspace)) = candidate.or(fallback) {
+                s.working_workspace = workspace;
+                s.current_task = fs::read(dir.join("task.json"))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok());
+                let previous = fs::read(dir.join("outcome.json"))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Outcome>(&b).ok())
+                    .map(|o| o.evidence)
+                    .unwrap_or_else(|| {
+                        "Resuming unfinished work. Inspect the actual files and validate them."
+                            .into()
+                    });
+                s.feedback = format!(
+                    "Migrated unfinished work from the earlier runner. Prior rejection and scope rules no longer decide whether work is kept. Inspect these files, run the configured checks, and refine them in place. Historical feedback: {previous}"
+                );
+                crate::events::log(format!(
+                    "Adopted the complete unfinished workspace at {}. Old attempts and history are preserved.",
+                    s.working_workspace.display()
+                ));
+            }
+            if fs::canonicalize(&s.working_workspace)? == fs::canonicalize(&c.repo)? {
+                let (workspace, branch, seed) = create_workspace(c, &s.run_id, &baseline)?;
+                s.working_workspace = workspace;
+                s.working_branch = branch;
+                s.seed_from_repo = seed;
+            }
+            verify_workspace(c, &s.working_workspace)?;
+            s.working_branch = project::git(&s.working_workspace, &["branch", "--show-current"])?;
+            if s.working_branch.is_empty() {
+                s.working_branch = format!("codex/chuggin-working-{}", s.run_id);
+                project::git(&s.working_workspace, &["switch", "-c", &s.working_branch])?;
+            }
+            s.working_ref = project::git(&s.working_workspace, &["rev-parse", "HEAD"])?;
+            s.schema_version = 2;
+            save(&path, &s)?;
+        }
+        verify_workspace(c, &s.working_workspace)?;
+        if s.seed_from_repo {
+            seed_working_files(c, &s.working_workspace)?;
+            s.seed_from_repo = false;
+            save(&path, &s)?;
+        }
+        // HEAD may have advanced just before an interrupted state save.
+        s.working_ref = project::git(&s.working_workspace, &["rev-parse", "HEAD"])?;
+        Ok(s)
+    } else {
+        let head = project::git(&c.repo, &["rev-parse", "HEAD"])
+            .context("Target needs an initial commit before creating its working branch")?;
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis()
+            .to_string();
+        let (workspace, branch, seed) = create_workspace(c, &id, &head)?;
+        let working_ref = project::git(&workspace, &["rev-parse", "HEAD"])?;
+        let mut state = State {
+            schema_version: 2,
+            run_id: id,
+            goal: c.goal.clone(),
+            repo: fs::canonicalize(&c.repo)?,
+            working_ref,
+            working_branch: branch,
+            working_workspace: workspace,
+            seed_from_repo: seed,
+            ..State::default()
+        };
+        save(&path, &state)?;
+        if seed {
+            seed_working_files(c, &state.working_workspace)?;
+            state.seed_from_repo = false;
+            save(&path, &state)?;
+        }
+        Ok(state)
+    }
 }
-fn criterion_key(text: &str) -> String {
-    text.replace('`', "")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+
+const PROJECT_PATHS: &[&str] = &[".", ":(exclude).chuggin", ":(exclude)chuggin.json"];
+fn stage_project(workspace: &Path) -> Result<()> {
+    let mut args = vec!["add", "-A", "--"];
+    args.extend_from_slice(PROJECT_PATHS);
+    project::git(workspace, &args)?;
+    project::git(
+        workspace,
+        &["reset", "-q", "HEAD", "--", ".chuggin", "chuggin.json"],
+    )?;
+    Ok(())
 }
-fn normalize_task(task: &mut Task) {
-    let mut seen = std::collections::BTreeSet::new();
-    task.acceptance.retain(|s| seen.insert(criterion_key(s)));
-    seen.clear();
-    task.out_of_scope.retain(|s| seen.insert(criterion_key(s)));
-    seen.clear();
-    task.files.retain(|s| seen.insert(s.clone()));
+fn checkpoint(c: &Config, s: &mut State, message: &str) -> Result<bool> {
+    stage_project(&s.working_workspace)?;
+    // A model may have staged a control file through a command; never checkpoint it.
+    project::git(
+        &s.working_workspace,
+        &["reset", "-q", "HEAD", "--", ".chuggin", "chuggin.json"],
+    )?;
+    let changed = !project::git(
+        &s.working_workspace,
+        &["diff", "--cached", "--name-only", "-z"],
+    )?
+    .is_empty();
+    if changed {
+        project::git(
+            &s.working_workspace,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                message,
+            ],
+        )?;
+    }
+    s.working_ref = project::git(&s.working_workspace, &["rev-parse", "HEAD"])?;
+    save(&c.state_dir.join("state.json"), s)?;
+    Ok(changed)
 }
-fn criterion_specs(task: &Task) -> Value {
-    json!(
-        task.acceptance
-            .iter()
-            .enumerate()
-            .map(|(i, text)| json!({"id":format!("C{}",i+1),"text":text}))
-            .collect::<Vec<_>>()
-    )
+fn working_tree(workspace: &Path) -> Result<String> {
+    stage_project(workspace)?;
+    project::git(workspace, &["write-tree"])
 }
-fn criterion_satisfied(task: &Task, review: &Review, index: usize) -> bool {
-    let id = format!("C{}", index + 1);
-    let mut matches = review.criteria.iter().filter(|r| {
-        criterion_key(&r.criterion).eq_ignore_ascii_case(&id)
-            || criterion_key(&r.criterion) == criterion_key(&task.acceptance[index])
-    });
-    let Some(result) = matches.next() else {
-        return false;
+fn save_conversation(c: &Config, session: &Conversation) -> Result<()> {
+    save(&c.state_dir.join("conversation.json"), session)
+}
+fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
+    let path = c.state_dir.join("conversation.json");
+    let mut session = if path.exists() {
+        serde_json::from_slice::<Conversation>(&fs::read(path)?)?
+    } else {
+        Conversation::default()
     };
-    result.passed && !result.evidence.trim().is_empty() && matches.next().is_none()
+    if session.messages.is_empty() {
+        session.messages = vec![
+            json!({"role":"system","content":crate::prompts::WORK}),
+            json!({"role":"user","content":json!({"main_goal":c.goal,"workspace":s.working_workspace,"configured_checks":c.checks,"instruction":crate::prompts::ORIENT}).to_string()}),
+        ];
+    }
+    // Schemas remain identical between calls. Intentional tool configuration changes
+    // can update them once when a run starts.
+    session.tools = crate::model::tools();
+    repair_pending_tools(&mut session.messages);
+    save_conversation(c, &session)?;
+    Ok(session)
+}
+fn repair_pending_tools(messages: &mut Vec<Value>) {
+    let Some(index) = messages.iter().rposition(|m| m["role"] == "assistant") else {
+        return;
+    };
+    let calls = messages[index]["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let answered = messages[index + 1..]
+        .iter()
+        .take_while(|m| m["role"] == "tool")
+        .count();
+    for call in calls.iter().skip(answered) {
+        let mut reply = json!({"role":"tool","tool_name":call["function"]["name"],"content":"The process stopped before this tool result was recorded. Execution status is unknown. Inspect current files before deciding whether to retry; no tool has been automatically replayed."});
+        if let Some(id) = call.get("id") {
+            reply["tool_call_id"] = id.clone();
+        }
+        messages.push(reply);
+    }
+}
+fn refresh_conversation(
+    c: &Config,
+    s: &State,
+    session: &mut Conversation,
+    art: &Path,
+    reason: &str,
+    keep_recent: bool,
+) -> Result<()> {
+    save(
+        &art.join(format!(
+            "conversation-before-refresh-{}.json",
+            session.messages.len()
+        )),
+        session,
+    )?;
+    let recent = if keep_recent {
+        let minimum = session.messages.len().saturating_sub(12).max(2);
+        session
+            .messages
+            .iter()
+            .enumerate()
+            .skip(minimum)
+            .find(|(_, m)| m["role"] == "assistant")
+            .map(|(i, _)| session.messages[i..].to_vec())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    session.messages.truncate(2);
+    session.messages.push(json!({"role":"user","content":json!({"reason":reason,"current_task":s.current_task,"working_checkpoint":s.working_ref,"feedback":s.feedback,"progress_note":session.note,"instruction":"Earlier history was archived. Continue with the existing working files; inspect them as needed. Do not rebuild completed work."}).to_string()}));
+    session.messages.extend(recent);
+    session.context_pressure = false;
+    crate::events::log(format!(
+        "Conversation handoff: {reason}. Files and checkpoints are retained."
+    ));
+    save_conversation(c, session)
+}
+
+fn file_target(root: &Path, path: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        path != "chuggin.json",
+        "Project settings are managed by the operator"
+    );
+    project::safe_path(root, path)
 }
 fn inspect_tool(
     root: &Path,
@@ -379,7 +710,6 @@ fn inspect_tool(
     args: &Value,
     research: &mut crate::web_tools::Research,
 ) -> Result<String> {
-    crate::events::send(crate::events::Event::Tool(format!("inspect · {name}")));
     match name {
         "project_map" => Ok(crate::code_index::index(root)?.to_string()),
         "lookup_symbol" => Ok(crate::symbols::lookup(root, args)?.to_string()),
@@ -391,366 +721,151 @@ fn inspect_tool(
         ),
         "list_files" => Ok(project::inventory(root)?.join("\n")),
         "search" => {
-            let text = args["text"].as_str().context("Missing text")?;
+            let text = args["text"].as_str().context("Missing search text")?;
             anyhow::ensure!(!text.is_empty(), "Search text is empty");
-            let mut out = String::new();
+            let mut output = String::new();
             for file in project::inventory(root)? {
-                if let Ok(s) = project::read(root, &file) {
-                    for (i, line) in s.lines().enumerate() {
-                        if line.contains(text) {
-                            out.push_str(&format!(
-                                "{file}:{}: {}\n",
-                                i + 1,
-                                project::excerpt(line, 300)
-                            ));
-                            if out.len() > 6000 {
-                                return Ok(out);
-                            }
+                if let Ok(content) = project::read(root, &file) {
+                    for (line, value) in content
+                        .lines()
+                        .enumerate()
+                        .filter(|(_, v)| v.contains(text))
+                    {
+                        output.push_str(&format!(
+                            "{file}:{}: {}\n",
+                            line + 1,
+                            project::excerpt(value, 400)
+                        ));
+                        if output.len() > 12000 {
+                            return Ok(output);
                         }
                     }
                 }
             }
-            Ok(out)
+            Ok(output)
         }
         "web_search" | "read_web_page" => research.call(name, args),
-        _ => anyhow::bail!("Planning tools are read-only; use implementation for changes"),
+        _ => anyhow::bail!("Unknown tool: {name}"),
     }
 }
-fn test_names(results: &[CheckResult]) -> std::collections::BTreeSet<String> {
-    results
-        .iter()
-        .flat_map(|r| r.output.lines())
-        .filter_map(|line| {
-            line.strip_prefix("test ")
-                .and_then(|s| s.strip_suffix(" ... ok"))
-                .map(str::to_owned)
-        })
-        .collect()
+struct WorkResult {
+    finish_requested: bool,
+    summary: String,
 }
-fn partial_allowed(
-    task: &Task,
-    review: &Review,
-    results: &[CheckResult],
-    baseline: &[CheckResult],
-) -> bool {
-    review.decision == Decision::Partial
-        && !results.is_empty()
-        && results.iter().all(|r| r.passed)
-        && task
-            .acceptance
-            .iter()
-            .enumerate()
-            .any(|(i, _)| criterion_satisfied(task, review, i))
-        && test_names(baseline).is_subset(&test_names(results))
-}
-fn validate_task(task: &Task, root: &Path) -> Result<()> {
-    anyhow::ensure!(
-        !task.objective.trim().is_empty(),
-        "Task needs a nonempty objective"
-    );
-    anyhow::ensure!(
-        !task.acceptance.is_empty() && task.acceptance.iter().all(|a| !a.trim().is_empty()),
-        "Task needs nonempty acceptance criteria"
-    );
-    anyhow::ensure!(
-        !task.files.is_empty(),
-        "Task needs at least one writable file"
-    );
-    for file in &task.files {
-        project::safe_path(root, file).with_context(|| format!("Invalid task path: {file}"))?;
-    }
-    Ok(())
-}
-fn path_in_scope(path: &str, task: &Task, root: &Path) -> bool {
-    task.files.iter().any(|p| p == path)
-        || (Path::new(path)
-            .file_name()
-            .is_some_and(|p| p == "Cargo.lock")
-            && project::safe_path(root, path).is_ok()
-            && root.join(path).with_file_name("Cargo.toml").is_file())
-}
-fn extend_source_access(task: &mut Task, root: &Path, path: &str, reason: &str) -> Result<String> {
-    anyhow::ensure!(
-        !reason.trim().is_empty(),
-        "Explain the dependency change needed for this task"
-    );
-    anyhow::ensure!(
-        !matches!(path, "chuggin.json"),
-        "Project control files cannot be added to task scope"
-    );
-    let content = project::read(root, path)?;
-    if !task.files.iter().any(|p| p == path) {
-        task.files.push(path.into());
-        task.out_of_scope.push(format!("Exception to earlier exclusions: minimal supporting changes in {path} are permitted for this task: {reason}. Preserve existing APIs and tests."));
-    }
-    Ok(format!(
-        "Access granted for minimal supporting changes in {path}.\n{}",
-        project::excerpt(&content, 10000)
-    ))
-}
-fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) -> Result<Outcome> {
-    crate::events::send(crate::events::Event::Phase("Discovery".into()));
-    m.trace_to(art);
-    emit(art, "configuration", c)?;
-    emit(
-        art,
-        "run",
-        &json!({"chuggin_version":env!("CARGO_PKG_VERSION"),"started_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),"base_commit":s.accepted_ref}),
-    )?;
-    emit(art, "prompt-version", &crate::prompts::VERSION)?;
+fn work(
+    c: &Config,
+    s: &mut State,
+    m: &Model,
+    session: &mut Conversation,
+    art: &Path,
+    stop: &AtomicBool,
+) -> Result<WorkResult> {
+    crate::events::send(crate::events::Event::Phase("Orient".into()));
+    session.messages.push(json!({"role":"user","content":json!({"cycle":s.cycle,"current_task":s.current_task,"previous_feedback":s.feedback,"working_checkpoint":s.working_ref,"instruction":"Continue this project from its current files and the conversation above. Address unresolved failures before expanding unrelated work. Use set_task to record or revise the next useful task. This cycle ends with a checkpoint; unfinished work is kept."}).to_string()}));
+    save_conversation(c, session)?;
     let mut research = crate::web_tools::Research::default();
-    let recovery = recoverable(s);
-    let task = if let Some(prior) = &recovery {
-        emit(art, "recovery", prior)?;
-        crate::events::log(format!(
-            "Recovering useful files from cycle {}",
-            prior.cycle
-        ));
-        serde_json::from_slice::<Task>(&fs::read(prior.artifact_dir.join("task.json"))?)?
-    } else {
-        let mut inspection_sequence = 0;
-        let discovery:Discovery=m.investigate(crate::prompts::DISCOVERY,discovery_input(c,s)?,crate::model::inspection_tools(&s.accepted_workspace),|name,args|{
-            let result=inspect_tool(&s.accepted_workspace,name,args,&mut research);
-            inspection_sequence += 1;
-            emit(art,&format!("inspection-{inspection_sequence:03}"),&json!({"tool":name,"arguments":args,"result":result.as_ref().ok(),"error":result.as_ref().err().map(|e|e.to_string())}))?;
-            result
-        })?;
-        emit(art, "discovery", &discovery)?;
-        crate::events::send(crate::events::Event::Phase("Shape".into()));
-        let task:Task=m.structured(crate::prompts::SHAPE,json!({"main_goal":c.goal,"code_index":crate::code_index::index(&s.accepted_workspace)?,"discovery":discovery,"files":project::context(&s.accepted_workspace,&discovery.files,10000),"checks":c.checks,"recent_outcomes":recent_evidence(s)}))?;
-        task
-    };
-    let mut task = task;
-    emit(art, "task-proposed", &task)?;
-    if recovery.is_none() && (task.acceptance.len() > 5 || task.files.len() > 6) {
-        task=m.structured(crate::prompts::SHAPE,json!({"instruction":"Narrow this oversized proposal to one complete behavior, not an already-existing declaration. Keep dependency wiring and focused tests together.","proposed_task":task,"code_index":crate::code_index::index(&s.accepted_workspace)?}))?;
-    }
-    emit(art, "task", &task)?;
-    validate_task(&task, &s.accepted_workspace)?;
-    if s.accepted_workspace.join("Cargo.toml").exists()
-        && task
-            .files
-            .iter()
-            .any(|p| p.starts_with("src/") && p.ends_with(".rs"))
-    {
-        for path in ["src/lib.rs", "src/main.rs"] {
-            if !task.files.iter().any(|p| p == path) {
-                task.files.push(path.into());
-            }
-        }
-        let mut wiring = Vec::new();
-        for file in &task.files {
-            let mut parent = Path::new(file).parent();
-            while let Some(dir) = parent.filter(|p| p.starts_with("src") && *p != Path::new("src"))
-            {
-                for candidate in [dir.with_extension("rs"), dir.join("mod.rs")] {
-                    if s.accepted_workspace.join(&candidate).is_file() {
-                        wiring.push(candidate.to_string_lossy().into_owned());
-                    }
-                }
-                parent = dir.parent();
-            }
-        }
-        for path in wiring {
-            if !task.files.contains(&path) {
-                task.files.push(path);
-            }
-        }
-        task.acceptance.push("The new or changed behavior is compiled and exercised by at least one passing focused test; an unreferenced source file is not completion.".into());
-        task.out_of_scope.push(
-            "Changes to module entry points must be limited to wiring the new code and its tests."
-                .into(),
-        );
-        emit(art, "task", &task)?;
-    }
-    crate::events::log(format!("Cycle {}: {}", s.cycle, task.title));
-    normalize_task(&mut task);
-    emit(art, "task", &task)?;
-    let branch = format!("codex/chuggin-{}-{}", s.run_id, s.cycle);
-    let workspace = art.join("workspace");
-    project::git(
-        &c.repo,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            workspace.to_str().context("Non-UTF8 workspace path")?,
-            &s.accepted_ref,
-        ],
-    )?;
-    emit(
-        art,
-        "attempt",
-        &json!({"base":s.accepted_ref,"branch":branch,"workspace":workspace}),
-    )?;
-    let baseline = checks(c, &workspace, art, "baseline", stop)?;
-    emit(art, "baseline", &baseline)?;
-    let before = project::snapshot(&workspace)?;
-    if let Some(prior) = &recovery {
-        let source = prior.artifact_dir.join("workspace");
-        for path in &task.files {
-            if let Ok(content) = project::read(&source, path) {
-                project::write(&workspace, path, &content)?;
-            }
-        }
-    }
-    let working_checks = if recovery.is_some() {
-        checks(c, &workspace, art, "recovery-check", stop)?
-    } else {
-        baseline.clone()
-    };
-    crate::events::send(crate::events::Event::Phase("Implement".into()));
-    let mut repair_note: RepairNote = recovery
-        .as_ref()
-        .and_then(|prior| fs::read(prior.artifact_dir.join("repair-note.json")).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    let mut messages = vec![
-        json!({"role":"system","content":crate::prompts::IMPLEMENT}),
-        json!({"role":"user","content":json!({"main_goal":c.goal,"task":task,"current_checks":working_checks,"repair_note":repair_note,"recovery_origin":recovery.as_ref().map(|o|o.cycle),"instruction":"When checks fail, fix the first validation failure with a targeted edit before doing any broader work. Then validate the requested outcome.","current_files":project::context(&workspace,&task.files,18000)}).to_string()}),
-    ];
-    let mut notes = String::new();
-    let mut latest_checks = working_checks;
-    let mut validated_snapshot = None;
-    let mut response_errors = 0;
-    let mut completion_nudged = false;
+    let mut finish_requested = false;
+    let mut summary = String::new();
     for step in 0..c.implementation_calls {
         anyhow::ensure!(!stop.load(Ordering::SeqCst), "Stopped by operator");
-        let response = match m.chat(&messages, Some(crate::model::tools_for(&workspace)), false) {
-            Ok(r) => r,
-            Err(e) => {
-                response_errors += 1;
-                notes = format!("Model response failed: {e:#}");
-                repair_note.record("model response", &notes, true);
-                emit(art, "repair-note", &repair_note)?;
-                emit(art, &format!("response-error-{step}"), &notes)?;
-                if response_errors >= 3 {
-                    break;
+        if session.context_pressure {
+            refresh_conversation(
+                c,
+                s,
+                session,
+                art,
+                "Reported token usage is approaching the configured context capacity",
+                true,
+            )?;
+        }
+        crate::events::send(crate::events::Event::Phase("Work".into()));
+        let response = match m.chat(&session.messages, Some(session.tools.clone()), false) {
+            Ok(response) => response,
+            Err(error) => {
+                session.response_errors += 1;
+                emit(
+                    art,
+                    &format!("response-error-{step}"),
+                    &format!("{error:#}"),
+                )?;
+                session
+                    .note
+                    .record("model request", &format!("{error:#}"), true);
+                session.messages.push(json!({"role":"user","content":format!("The model request failed: {error:#}. Existing work and completed tool results are retained. Continue the current task.")}));
+                if session.response_errors == 2 {
+                    refresh_conversation(
+                        c,
+                        s,
+                        session,
+                        art,
+                        "Repeated request recovery failed",
+                        false,
+                    )?;
                 }
-                if response_errors == 2 {
-                    // Last-resort refresh after in-conversation recovery failed, never by byte size.
-                    messages.truncate(1);
-                    messages.push(json!({"role":"user","content":json!({"main_goal":c.goal,"task":task,"repair_note":repair_note,"current_files":project::context(&workspace,&task.files,18000),"latest_checks":latest_checks,"recovery":"Repeated request recovery failed. Fresh conversation, same task and existing edits. Inspect the actual files and continue from the latest failure."}).to_string()}));
-                    emit(art, &format!("context-refresh-{step}"), &messages)?;
-                    crate::events::log("Repeated request recovery failed; refreshing this task from current files and validation.".into());
-                } else {
-                    messages.push(json!({"role":"user","content":format!("The last model request failed: {e:#}. The prior conversation and completed actions are retained. Continue the current task; issue complete tool calls when needed.")}));
+                save_conversation(c, session)?;
+                if session.response_errors >= 3 {
+                    return Err(error);
                 }
                 continue;
             }
         };
-        response_errors = 0;
+        session.response_errors = 0;
+        // Preserve any recovery instructions actually sent, keeping the next
+        // request's prefix and conversational state consistent with the model.
+        if let Some(used) = m.take_completed_messages() {
+            session.messages = used;
+        }
+        session.context_pressure = m.context_pressure();
         emit(art, &format!("implementation-{step}"), &response)?;
         let calls = response["tool_calls"]
             .as_array()
             .cloned()
             .unwrap_or_default();
-        messages.push(response.clone());
+        if let Some(content) = response["content"].as_str() {
+            summary = content.to_owned();
+        }
+        session.messages.push(response);
+        save_conversation(c, session)?;
         if calls.is_empty() {
-            if latest_checks.iter().any(|r| !r.passed)
-                && validated_snapshot != Some(project::snapshot(&workspace)?)
-            {
-                latest_checks = checks(
-                    c,
-                    &workspace,
-                    art,
-                    &format!("completion-check-{step}"),
-                    stop,
-                )?;
-                validated_snapshot = Some(project::snapshot(&workspace)?);
-            }
-            if latest_checks.iter().any(|r| !r.passed) && !completion_nudged {
-                completion_nudged = true;
-                messages.push(json!({"role":"user","content":json!({"current_checks":latest_checks,"instruction":"Validation is still failing. Continue this task using the tool results above. Inspect the failing case and apply a targeted correction with the available tools; do not just describe a fix."}).to_string()}));
-                continue;
-            }
-            notes = response["content"].as_str().unwrap_or("").into();
             break;
         }
-        anyhow::ensure!(calls.len() <= 8, "Too many sibling tool calls");
-        completion_nudged = false;
         for (index, call) in calls.iter().enumerate() {
             let name = call["function"]["name"].as_str().unwrap_or("");
             let args = &call["function"]["arguments"];
             crate::events::send(crate::events::Event::Tool(format!(
-                "{} {}",
-                name,
+                "{name} {}",
                 args["path"].as_str().unwrap_or("")
             )));
+            let root = s.working_workspace.clone();
             let result: Result<String> = (|| match name {
+                "set_task" => {
+                    let task: Task = serde_json::from_value(args.clone())?;
+                    anyhow::ensure!(!task.title.trim().is_empty(), "Task needs a title");
+                    s.current_task = Some(task);
+                    finish_requested = false;
+                    emit(art, "task", s.current_task.as_ref().unwrap())?;
+                    save(&c.state_dir.join("state.json"), s)?;
+                    Ok("Task recorded. All existing working files remain available; these paths and criteria are planning notes, not edit restrictions.".into())
+                }
+                "finish_task" => {
+                    summary = args["summary"]
+                        .as_str()
+                        .context("Missing summary")?
+                        .to_owned();
+                    finish_requested = true;
+                    Ok("Completion intent recorded. The harness will check and save this checkpoint, retaining any unresolved failures for continued repair.".into())
+                }
                 "save_progress_note" => {
-                    repair_note.set_note(args["note"].as_str().context("Missing note")?)?;
-                    Ok("Task-local note saved; verify it against current files and checks.".into())
-                }
-                "project_map" => Ok(crate::code_index::index(&workspace)?.to_string()),
-                "lookup_symbol" => Ok(crate::symbols::lookup(&workspace, args)?.to_string()),
-                "run_command" => {
-                    let result = crate::dev_tools::run(
-                        &workspace,
-                        art,
-                        &format!("{step}-{index}"),
-                        args,
-                        stop,
-                    )?;
-                    Ok(result.to_string())
-                }
-                "compiler_diagnostics" => Ok(crate::dev_tools::diagnostics(
-                    &workspace,
-                    art,
-                    &format!("{step}-{index}"),
-                    stop,
-                )?
-                .to_string()),
-                "read_command_log" => Ok(crate::dev_tools::read_log(art, args)?.to_string()),
-                "web_search" | "read_web_page" => research.call(name, args),
-                "request_file_access" => {
-                    let result = extend_source_access(
-                        &mut task,
-                        &workspace,
-                        args["path"].as_str().context("Missing path")?,
-                        args["reason"].as_str().context("Missing reason")?,
-                    )?;
-                    emit(art, &format!("scope-extension-{step}-{index}"), args)?;
-                    emit(art, "task", &task)?;
-                    Ok(result)
-                }
-                "read_file" => project::read_lines(
-                    &workspace,
-                    args["path"].as_str().context("Missing path")?,
-                    args["start_line"].as_u64().unwrap_or(1) as usize,
-                    args["line_count"].as_u64().unwrap_or(80) as usize,
-                ),
-                "list_files" => Ok(project::inventory(&workspace)?.join("\n")),
-                "search" => {
-                    let needle = args["text"].as_str().context("Missing search text")?;
-                    let mut result = String::new();
-                    for path in project::inventory(&workspace)? {
-                        if let Ok(text) = project::read(&workspace, &path) {
-                            for (line, text) in
-                                text.lines().enumerate().filter(|(_, t)| t.contains(needle))
-                            {
-                                result.push_str(&format!(
-                                    "{path}:{}: {}\n",
-                                    line + 1,
-                                    project::excerpt(text, 300)
-                                ));
-                                if result.len() > 8000 {
-                                    return Ok(result);
-                                }
-                            }
-                        }
-                    }
-                    Ok(result)
+                    session
+                        .note
+                        .set_note(args["note"].as_str().context("Missing note")?)?;
+                    Ok("Progress note saved; verify against current files and checks.".into())
                 }
                 "edit_file" => {
                     let path = args["path"].as_str().context("Missing path")?;
-                    anyhow::ensure!(
-                        task.files.iter().any(|p| p == path),
-                        "Path is outside task specification"
-                    );
+                    file_target(&root, path)?;
                     project::edit(
-                        &workspace,
+                        &root,
                         path,
                         args["old_text"].as_str().context("Missing old_text")?,
                         args["new_text"].as_str().context("Missing new_text")?,
@@ -758,332 +873,261 @@ fn cycle(c: &Config, s: &mut State, m: &Model, art: &Path, stop: &AtomicBool) ->
                 }
                 "write_file" => {
                     let path = args["path"].as_str().context("Missing path")?;
-                    anyhow::ensure!(
-                        task.files.iter().any(|p| p == path),
-                        "Path is outside task specification; ask next discovery cycle to expand scope"
-                    );
+                    file_target(&root, path)?;
                     project::write(
-                        &workspace,
+                        &root,
                         path,
                         args["content"].as_str().context("Missing content")?,
                     )?;
                     Ok(format!("Wrote {path}"))
                 }
                 "run_checks" => {
-                    latest_checks =
-                        checks(c, &workspace, art, &format!("tool-{step}-{index}"), stop)?;
-                    validated_snapshot = Some(project::snapshot(&workspace)?);
-                    Ok(serde_json::to_string(&latest_checks)?)
-                }
-                _ => anyhow::bail!("Unknown tool: {name}"),
-            })();
-            let command_failed = matches!(name, "run_command" | "compiler_diagnostics")
-                && result
-                    .as_ref()
-                    .ok()
-                    .and_then(|v| serde_json::from_str::<Value>(v).ok())
-                    .is_some_and(|v| {
-                        v["passed"] == false
-                            || v["timed_out"] == true
-                            || v["exit_code"].as_i64().is_some_and(|code| code != 0)
+                    crate::events::send(crate::events::Event::Phase("Check".into()));
+                    let results = checks(c, &root, art, &format!("tool-{step}-{index}"), stop);
+                    crate::events::send(crate::events::Event::ValidationDone {
+                        passed: results
+                            .as_ref()
+                            .is_ok_and(|r| !r.is_empty() && r.iter().all(|check| check.passed)),
+                        checkpoint: None,
                     });
+                    Ok(serde_json::to_string(&results?)?)
+                }
+                "run_command" => {
+                    Ok(
+                        crate::dev_tools::run(&root, art, &format!("{step}-{index}"), args, stop)?
+                            .to_string(),
+                    )
+                }
+                "read_command_log" => Ok(crate::dev_tools::read_log(art, args)?.to_string()),
+                "compiler_diagnostics" => Ok(crate::dev_tools::diagnostics(
+                    &root,
+                    art,
+                    &format!("{step}-{index}"),
+                    stop,
+                )?
+                .to_string()),
+                "restore_checkpoint" => {
+                    let reference = args["commit"].as_str().context("Missing commit")?;
+                    let reason = args["reason"]
+                        .as_str()
+                        .context("Explain why this checkpoint should be restored")?;
+                    anyhow::ensure!(
+                        !reason.trim().is_empty()
+                            && reference.len() >= 7
+                            && reference.len() <= 64
+                            && reference.bytes().all(|b| b.is_ascii_hexdigit()),
+                        "Provide a commit hash and a reason"
+                    );
+                    project::git(&root, &["merge-base", "--is-ancestor", reference, "HEAD"])?;
+                    checkpoint(c, s, "chuggin: save work before requested restoration")?;
+                    emit(
+                        art,
+                        &format!("restore-{step}-{index}"),
+                        &json!({"from":s.working_ref,"to":reference,"reason":reason}),
+                    )?;
+                    let mut command = vec![
+                        "restore",
+                        "--source",
+                        reference,
+                        "--staged",
+                        "--worktree",
+                        "--",
+                    ];
+                    command.extend_from_slice(PROJECT_PATHS);
+                    project::git(&root, &command)?;
+                    Ok("Restored the requested checkpoint. Prior work is saved in Git. Inspect the files and run checks again.".into())
+                }
+                _ => inspect_tool(&root, name, args, &mut research),
+            })();
             let value = match result {
-                Ok(v) => json!({"ok":true,"result":project::excerpt(&v,12000)}),
-                Err(e) => json!({"ok":false,"error":e.to_string()}),
+                Ok(value) => json!({"ok":true,"result":project::excerpt(&value,12000)}),
+                Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
             };
+            session
+                .note
+                .record(name, &value.to_string(), value["ok"] == false);
             emit(art, &format!("tool-{step}-{index}"), &value)?;
-            if matches!(
-                name,
-                "edit_file" | "write_file" | "run_command" | "run_checks" | "compiler_diagnostics"
-            ) || value["ok"] == false
-            {
-                let failed = value["ok"] == false
-                    || command_failed
-                    || (name == "run_checks" && latest_checks.iter().any(|r| !r.passed));
-                let evidence = if name == "run_checks" && !failed {
-                    "Configured checks passed; any earlier failure may now be resolved.".to_string()
-                } else if name == "run_checks" {
-                    serde_json::to_string(
-                        &latest_checks
-                            .iter()
-                            .filter(|r| !r.passed)
-                            .collect::<Vec<_>>(),
-                    )?
-                } else {
-                    value.to_string()
-                };
-                repair_note.record(
-                    &format!(
-                        "{name} {}",
-                        args["path"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| args
-                                .get("argv")
-                                .map(Value::to_string)
-                                .unwrap_or_default())
-                    ),
-                    &evidence,
-                    failed,
-                );
-            }
-            emit(art, "repair-note", &repair_note)?;
-            let mut tool_reply =
-                json!({"role":"tool","tool_name":name,"content":value.to_string()});
+            emit(art, "repair-note", &session.note)?;
+            let mut reply = json!({"role":"tool","tool_name":name,"content":value.to_string()});
             if let Some(id) = call.get("id") {
-                tool_reply["tool_call_id"] = id.clone();
+                reply["tool_call_id"] = id.clone();
             }
-            messages.push(tool_reply);
+            session.messages.push(reply);
+            save_conversation(c, session)?;
         }
-        if !latest_checks.is_empty()
-            && latest_checks.iter().all(|r| r.passed)
-            && validated_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot != &before)
-            && validated_snapshot == Some(project::snapshot(&workspace)?)
-        {
-            notes="Implementation changes passed configured validation; handing off to independent verification and review.".into();
+        if finish_requested {
             break;
         }
     }
-    emit(art, "implementation-note", &notes)?;
-    crate::events::send(crate::events::Event::Phase("Verify".into()));
-    let mut result = checks(c, &workspace, art, "verification", stop)?;
-    if result.iter().all(|r| r.passed)
-        && workspace.join("Cargo.toml").exists()
-        && project::snapshot(&workspace)?.iter().any(|(path, hash)| {
-            path.ends_with(".rs") && !path.starts_with("tests/") && before.get(path) != Some(hash)
-        })
-    {
-        match independent_probe(c, m, &workspace, art, &mut task, s.cycle, stop) {
-            Ok(Some(probed)) => result.extend(probed),
-            Ok(None) => {}
-            Err(e) => {
-                emit(
-                    art,
-                    "probe-error",
-                    &format!("Independent probe unavailable: {e:#}"),
-                )?;
-                crate::events::log(format!("Independent probe unavailable: {e:#}"));
-            }
-        }
-    }
-    emit(art, "verification", &result)?;
-    let after = project::snapshot(&workspace)?;
-    let changed_files: Vec<_> = before
-        .keys()
-        .chain(after.keys())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .filter(|p| before.get(*p) != after.get(*p))
-        .cloned()
-        .collect();
-    // Stage all attempt files so review includes new files. Only the private attempt is staged.
-    project::git(&workspace, &["add", "-A"])?;
-    let diff = project::git(
-        &workspace,
-        &["diff", "--cached", "--no-ext-diff", "--no-textconv"],
-    )?;
-    crate::events::send(crate::events::Event::Phase("Review".into()));
-    let review:Review=m.structured(crate::prompts::REVIEW,json!({"main_goal":c.goal,"criteria":criterion_specs(&task),"task":task,"diff":diff,"diff_truncated":false,"changed_files":changed_files,"resulting_files":project::context(&workspace,&task.files,8000),"baseline_test_names":test_names(&baseline),"verification":result,"independent_probe":fs::read(art.join("probe-outcome.json")).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok())}))?;
-    emit(art, "review", &review)?;
-    let staged_names = project::git(&workspace, &["diff", "--cached", "--name-only", "-z"])?;
-    let unexpected: Vec<_> = changed_files
-        .iter()
-        .map(String::as_str)
-        .chain(staged_names.split('\0').filter(|p| !p.is_empty()))
-        .filter(|p| !path_in_scope(p, &task, &workspace))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    let in_scope = unexpected.is_empty();
-    emit(
-        art,
-        "scope",
-        &json!({"allowed_task_files":task.files,"unexpected_files":unexpected,"cargo_lockfiles_allowed":true}),
-    )?;
-    let tests_preserved = test_names(&baseline).is_subset(&test_names(&result));
-    let accepted = in_scope
-        && tests_preserved
-        && !changed_files.is_empty()
-        && (acceptance_allowed(&task, &review, &result, true)
-            || partial_allowed(&task, &review, &result, &baseline));
-    emit(
-        art,
-        "acceptance",
-        &json!({"accepted":accepted,"changed":!changed_files.is_empty(),"checks_pass":result.iter().all(|r|r.passed),"in_scope":in_scope,"tests_preserved":tests_preserved,"review_decision":review.decision,"unmet_criteria":task.acceptance.iter().enumerate().filter(|(i,_)|!criterion_satisfied(&task,&review,*i)).map(|(_,a)|a).collect::<Vec<_>>()}),
-    )?;
-    if accepted {
-        anyhow::ensure!(!stop.load(Ordering::SeqCst), "Stopped before acceptance");
-        project::git(
-            &workspace,
-            &[
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                &format!("chuggin: {}", project::excerpt(&task.title, 100)),
-            ],
-        )?;
-        s.accepted_ref = project::git(&workspace, &["rev-parse", "HEAD"])?;
-        s.accepted_branch = branch;
-        s.accepted_workspace = workspace;
-    }
-    Ok(Outcome {
-        cycle: s.cycle,
-        task: task.title,
-        disposition: if accepted {
-            if review.decision == Decision::Partial {
-                "accepted/partial".into()
-            } else {
-                "accepted".into()
-            }
-        } else {
-            format!("rejected/{:?}", review.decision)
-        },
-        evidence: format!(
-            "{}; unexpected_files={unexpected:?}; in_scope={in_scope}; tests_preserved={tests_preserved}; checks_pass={}",
-            review.reason,
-            result.iter().all(|r| r.passed)
-        ),
-        artifact_dir: art.into(),
+    Ok(WorkResult {
+        finish_requested,
+        summary,
     })
 }
+
 pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()> {
     let c = load(path)?;
     crate::setup::ensure_git_identity(&c.repo)?;
+    let _lock = lock_project(&c)?;
+    let mut state = prepare_state(&c)?;
+    let mut session = load_conversation(&c, &state)?;
     let started = Instant::now();
     let time_up = || {
         let limit = fs::read(path)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .and_then(|v| v["run_duration_seconds"].as_u64())
             .unwrap_or(c.run_duration_seconds);
         limit > 0 && started.elapsed().as_secs() >= limit
     };
-    anyhow::ensure!(
-        c.checks
-            .iter()
-            .all(|x| x.argv[0] != "REPLACE_WITH_YOUR_TEST_COMMAND"),
-        "Set real validation commands before running"
-    );
-    fs::create_dir_all(&c.state_dir)?;
-    let state_dir = fs::canonicalize(&c.state_dir)?;
-    let lock = state_dir.join("run.lock");
-    let _lock_file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock)?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        anyhow::ensure!(
-            unsafe { libc::flock(_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "Another Chuggin process is already running this project"
-        );
-    }
-    let state_path = state_dir.join("state.json");
-    let mut state: State = if state_path.exists() {
-        let saved: State = serde_json::from_slice(&fs::read(&state_path)?)?;
-        anyhow::ensure!(
-            saved.goal == c.goal && saved.repo == fs::canonicalize(&c.repo)?,
-            "This state belongs to a different goal or repository; use a new state_dir"
-        );
-        saved
-    } else {
-        let head = project::git(&c.repo, &["rev-parse", "HEAD"]).context(
-            "Target needs an initial commit. Uncommitted changes are not imported into attempts",
-        )?;
-        let run_id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis()
-            .to_string();
-        let baseline = state_dir.join("baseline");
-        project::git(
-            &c.repo,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                baseline.to_str().context("Non-UTF8 path")?,
-                &head,
-            ],
-        )?;
-        State {
-            goal: c.goal.clone(),
-            repo: fs::canonicalize(&c.repo)?,
-            run_id,
-            accepted_ref: head,
-            accepted_workspace: baseline,
-            ..State::default()
-        }
-    };
-    // A soft stop is observed only between cycles. Stage work must finish normally.
+    // Soft stops finish the current batch and checkpoint. Force-stop remains the
+    // main process's signal handler; pending tools are reconciled on resume.
     let stage_stop = Arc::new(AtomicBool::new(false));
-    let mut m = Model::new(
+    let mut model = Model::new(
         &c.ollama_url,
         &c.model,
         c.context_tokens,
         c.output_tokens,
         stage_stop.clone(),
     )?;
-    m.use_project_settings(path);
-    if state.cycle > 0 && !state.recent.iter().any(|o| o.cycle == state.cycle) {
-        let art = state_dir.join(format!("cycle-{:06}", state.cycle));
-        if let Ok(bytes) = fs::read(art.join("task.json"))
-            && let Ok(task) = serde_json::from_slice::<Task>(&bytes)
-            && art.join("workspace").is_dir()
-        {
-            let interrupted = Outcome {
-                cycle: state.cycle, task: task.title, disposition: "retry".into(),
-                evidence: "Previous process ended before recording an outcome; candidate files require fresh verification.".into(),
-                artifact_dir: art.clone(),
-            };
-            emit(&art, "outcome", &interrupted)?;
-            state.recent.push(interrupted);
-            if state.recent.len() > 6 {
-                state.recent.remove(0);
-            }
-        }
-    }
-    save(&state_path, &state)?;
+    model.use_project_settings(path);
     let mut completed = 0;
     while !stop.load(Ordering::SeqCst) && !time_up() && count.is_none_or(|n| completed < n) {
         state.cycle += 1;
-        crate::events::send(crate::events::Event::Cycle(state.cycle));
+        while c
+            .state_dir
+            .join(format!("cycle-{:06}", state.cycle))
+            .exists()
+        {
+            state.cycle += 1;
+        }
         completed += 1;
-        let art = state_dir.join(format!("cycle-{:06}", state.cycle));
+        let art = c.state_dir.join(format!("cycle-{:06}", state.cycle));
         fs::create_dir(&art)?;
-        save(&state_path, &state)?;
+        save(&c.state_dir.join("state.json"), &state)?;
+        model.trace_to(&art);
+        crate::events::send(crate::events::Event::Cycle(state.cycle));
+        if let Some(task) = &state.current_task {
+            emit(&art, "task", task)?;
+        }
+        emit(&art, "configuration", &c)?;
+        emit(
+            &art,
+            "run",
+            &json!({"chuggin_version":env!("CARGO_PKG_VERSION"),"started_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),"base_commit":state.working_ref,"workspace":state.working_workspace}),
+        )?;
+        emit(&art, "prompt-version", &crate::prompts::VERSION)?;
+        emit(
+            &art,
+            "attempt",
+            &json!({"base":state.working_ref,"branch":state.working_branch,"workspace":state.working_workspace}),
+        )?;
         crate::events::log(format!(
-            "Cycle {}: discovery → task shaping → implementation → verification → review",
+            "Cycle {}: continue working → check → checkpoint",
             state.cycle
         ));
-        let outcome = match cycle(&c, &mut state, &m, &art, &stage_stop) {
-            Ok(o) => o,
-            Err(e) => Outcome {
-                cycle: state.cycle,
-                task: fs::read(art.join("task.json"))
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<Task>(&b).ok())
-                    .map(|t| t.title)
-                    .unwrap_or("incomplete attempt".into()),
-                disposition: "retry".into(),
-                evidence: format!("{e:#}"),
-                artifact_dir: art.clone(),
-            },
+        let result = work(&c, &mut state, &model, &mut session, &art, &stage_stop);
+        let error = result.as_ref().err().map(|e| format!("{e:#}"));
+        if let Some(error) = &error {
+            crate::events::log(format!(
+                "Work request failed: {error}. Saving existing work."
+            ));
+        }
+        crate::events::send(crate::events::Event::Phase("Check".into()));
+        let before_check = working_tree(&state.working_workspace)?;
+        let validation = checks(
+            &c,
+            &state.working_workspace,
+            &art,
+            "verification",
+            &stage_stop,
+        );
+        let after_check = working_tree(&state.working_workspace)?;
+        let check_error = validation.as_ref().err().map(|e| format!("{e:#}"));
+        let results = validation.unwrap_or_default();
+        emit(&art, "verification", &results)?;
+        let checked_same_files = before_check == after_check;
+        let passed = !results.is_empty() && results.iter().all(|r| r.passed) && checked_same_files;
+        crate::events::send(crate::events::Event::Phase("Review".into()));
+        let task_title = state
+            .current_task
+            .as_ref()
+            .map(|t| t.title.clone())
+            .unwrap_or_else(|| "Continue project".into());
+        let summary = result
+            .as_ref()
+            .ok()
+            .map(|r| r.summary.as_str())
+            .unwrap_or("Model request interrupted");
+        let unfinished=results.iter().filter(|r|!r.passed).map(|r|json!({"argv":r.argv,"exit_code":r.exit_code,"timed_out":r.timed_out,"output":r.output})).collect::<Vec<_>>();
+        let feedback = json!({"summary":summary,"checks_passed":passed,"check_results":unfinished,"check_error":check_error,"checked_snapshot_unchanged":checked_same_files,"request_error":error,"instruction":crate::prompts::REVIEW});
+        state.feedback = feedback.to_string();
+        // Save the complete working tree even if requests or checks failed.
+        crate::events::send(crate::events::Event::Phase("Checkpoint".into()));
+        let message = format!(
+            "chuggin: checkpoint {} — {}",
+            state.cycle,
+            project::excerpt(&task_title, 100)
+        );
+        let changed = checkpoint(&c, &mut state, &message)?;
+        if passed {
+            state.last_checks_passed_ref = Some(state.working_ref.clone());
+        }
+        crate::events::send(crate::events::Event::ValidationDone {
+            passed,
+            checkpoint: Some(state.working_ref.clone()),
+        });
+        let finished = result.as_ref().is_ok_and(|r| r.finish_requested) && passed;
+        if finished {
+            state.current_task = None;
+        }
+        let disposition = if !changed {
+            "unchanged"
+        } else if passed {
+            "checkpoint"
+        } else if results.is_empty() || !checked_same_files {
+            "checkpoint/unverified"
+        } else {
+            "checkpoint/checks-failing"
         };
+        let outcome = Outcome {
+            cycle: state.cycle,
+            task: task_title,
+            disposition: disposition.into(),
+            evidence: format!(
+                "Work retained at {}. {} {}",
+                state.working_ref,
+                if passed {
+                    "Configured checks passed."
+                } else {
+                    "Validation needs attention."
+                },
+                state.feedback
+            ),
+            artifact_dir: art.clone(),
+        };
+        emit(
+            &art,
+            "checkpoint",
+            &json!({"commit":state.working_ref,"changed":changed,"checks_passed":passed,"checked_tree":before_check,"saved_tree":after_check,"task_complete":finished,"last_checks_passed_ref":state.last_checks_passed_ref}),
+        )?;
+        session.messages.push(json!({"role":"user","content":json!({"checkpoint":state.working_ref,"task_complete":finished,"feedback":feedback,"instruction":"This checkpoint is saved, including unfinished changes. Continue from these files. If checks failed, inspect and repair the actual failure; do not recreate the feature from scratch. If the task is complete, select the next useful improvement toward the main goal."}).to_string()}));
+        save_conversation(&c, &session)?;
         emit(&art, "outcome", &outcome)?;
-        crate::events::log(format!("{}: {}", outcome.disposition, outcome.evidence));
+        crate::events::log(format!(
+            "{}: {}",
+            outcome.disposition,
+            if passed {
+                "Checkpoint saved; configured checks passed"
+            } else {
+                "Work saved; continue refinement from this checkpoint"
+            }
+        ));
         state.recent.push(outcome);
-        if state.recent.len() > 6 {
+        if state.recent.len() > 20 {
             state.recent.remove(0);
         }
-        save(&state_path, &state)?;
+        save(&c.state_dir.join("state.json"), &state)?;
         if time_up() || count.is_some_and(|n| completed >= n) {
             break;
         }
@@ -1096,434 +1140,35 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
         }
     }
     if time_up() {
-        crate::events::log("Run duration reached; completed the current cycle and saved progress. Resume starts a new timer.".into());
+        crate::events::log(
+            "Run duration reached; finished the cycle and saved work. Resume starts a new timer."
+                .into(),
+        );
     }
+    save(&c.state_dir.join("state.json"), &state)?;
     crate::events::log(format!(
-        "Accepted branch: {}\nArtifacts: {}",
-        state.accepted_branch,
-        state_dir.display()
+        "Working branch: {}\nWorking files: {}\nArtifacts: {}",
+        state.working_branch,
+        state.working_workspace.display(),
+        c.state_dir.display()
     ));
     Ok(())
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn reviewer_cannot_override_failed_checks_or_missing_criteria() {
-        let t = Task {
-            title: "t".into(),
-            objective: "o".into(),
-            acceptance: vec!["roundtrip".into()],
-            files: vec![],
-            out_of_scope: vec![],
-        };
-        let mut r = Review {
-            decision: Decision::Accept,
-            reason: "ok".into(),
-            criteria: vec![],
-        };
-        let mut c = CheckResult {
-            exit_code: None,
-            argv: vec!["test".into()],
-            passed: true,
-            timed_out: false,
-            output: "".into(),
-        };
-        assert!(!acceptance_allowed(&t, &r, &[c.clone()], true));
-        r.criteria.push(Criterion {
-            criterion: "roundtrip".into(),
-            passed: true,
-            evidence: "diff and test evidence".into(),
-        });
-        assert!(acceptance_allowed(&t, &r, &[c.clone()], true));
-        r.criteria[0].criterion = "  `roundtrip`  ".into();
-        assert!(acceptance_allowed(&t, &r, &[c.clone()], true));
-        r.criteria[0].criterion = "different behavior".into();
-        assert!(!acceptance_allowed(&t, &r, &[c.clone()], true));
-        r.criteria[0].criterion = "roundtrip".into();
-        c.passed = false;
-        assert!(!acceptance_allowed(&t, &r, &[c], true));
-        assert!(!acceptance_allowed(&t, &r, &[], true));
-    }
-}
 
 #[cfg(test)]
-mod scope_tests {
+mod conversation_tests {
     use super::*;
     #[test]
-    fn source_dependencies_can_be_added_without_allowing_control_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("src/run.rs"), "pub struct Run;").unwrap();
-        let mut task = Task {
-            title: "Paragraph".into(),
-            objective: "Store runs".into(),
-            acceptance: vec!["tested".into()],
-            files: vec!["src/paragraph.rs".into()],
-            out_of_scope: vec![],
-        };
-        assert!(
-            extend_source_access(&mut task, dir.path(), "src/run.rs", "Need a text accessor")
-                .is_ok()
-        );
-        assert!(task.files.contains(&"src/run.rs".to_string()));
-        fs::write(dir.path().join("NOTES.md"), "Document conventions").unwrap();
-        assert!(
-            extend_source_access(
-                &mut task,
-                dir.path(),
-                "NOTES.md",
-                "Keep documentation consistent"
-            )
-            .is_ok()
-        );
-        assert!(task.files.contains(&"NOTES.md".to_string()));
-        assert!(
-            extend_source_access(&mut task, dir.path(), "../outside.rs", "dependency").is_err()
-        );
-        assert!(extend_source_access(&mut task, dir.path(), ".git/config", "dependency").is_err());
-        assert!(
-            extend_source_access(&mut task, dir.path(), "chuggin.json", "change checks").is_err()
-        );
-        assert!(
-            extend_source_access(&mut task, dir.path(), "src/missing.rs", "dependency").is_err()
-        );
-    }
-    fn task() -> Task {
-        Task {
-            title: "Architecture".into(),
-            objective: "Document architecture".into(),
-            acceptance: (0..7).map(|n| format!("Criterion {n}")).collect(),
-            files: vec!["DESIGN.md".into()],
-            out_of_scope: vec![],
-        }
-    }
-    #[test]
-    fn longer_criteria_lists_are_not_invalid_scope() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut t = task();
-        assert!(validate_task(&t, dir.path()).is_ok());
-        t.files = (0..10).map(|n| format!("src/file{n}.rs")).collect();
-        assert!(validate_task(&t, dir.path()).is_ok());
-        t.files.push("../escape".into());
-        assert!(validate_task(&t, dir.path()).is_err());
-        t.files.clear();
-        assert!(
-            validate_task(&t, dir.path())
-                .unwrap_err()
-                .to_string()
-                .contains("writable file")
-        );
-    }
-    #[test]
-    fn cargo_lock_is_incidental_but_unrelated_source_is_not() {
-        let dir = tempfile::tempdir().unwrap();
-        let t = task();
-        assert!(!path_in_scope("Cargo.lock", &t, dir.path()));
-        fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-        assert!(path_in_scope("Cargo.lock", &t, dir.path()));
-        assert!(path_in_scope("DESIGN.md", &t, dir.path()));
-        assert!(!path_in_scope("src/main.rs", &t, dir.path()));
-        assert!(!path_in_scope("../Cargo.lock", &t, dir.path()));
-    }
-}
-
-fn recent_evidence(s: &State) -> Value {
-    json!(
-        s.recent
-            .iter()
-            .map(|o| {
-                let verification=fs::read(o.artifact_dir.join("verification.json")).ok().and_then(|b|serde_json::from_slice::<Vec<CheckResult>>(&b).ok());
-                let gate=fs::read(o.artifact_dir.join("acceptance.json")).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok());
-                json!({"gate":gate,"cycle":o.cycle,"task":o.task,"accepted":o.disposition.starts_with("accepted"),
-                    "checks_passed":verification.map(|v|v.iter().all(|r|r.passed)),"disposition":o.disposition})
-            })
-            .collect::<Vec<_>>()
-    )
-}
-
-fn recoverable(s: &State) -> Option<Outcome> {
-    s.recent
-        .last()
-        .filter(|o| {
-            if !matches!(
-                o.disposition.as_str(),
-                "rejected/Accept"
-                    | "rejected/Repair"
-                    | "rejected/Replan"
-                    | "rejected/Rollback"
-                    | "retry"
-            ) {
-                return false;
-            }
-            if o.disposition == "rejected/Accept" {
-                let checks = fs::read(o.artifact_dir.join("verification.json"))
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<Vec<CheckResult>>(&b).ok());
-                if !checks.is_some_and(|c| !c.is_empty() && c.iter().all(|r| r.passed)) {
-                    return false;
-                }
-            }
-            if s.recent.iter().filter(|p| p.task == o.task).count() > 2 {
-                return false;
-            }
-            let attempt = fs::read(o.artifact_dir.join("attempt.json"))
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-            attempt.is_some_and(|a| a["base"] == s.accepted_ref)
-                && o.artifact_dir.join("task.json").is_file()
-                && o.artifact_dir.join("workspace").is_dir()
-        })
-        .cloned()
-}
-
-#[cfg(test)]
-mod recovery_tests {
-    use super::*;
-    #[test]
-    fn recover_only_same_baseline_and_bound_retries() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir(dir.path().join("workspace")).unwrap();
-        fs::write(dir.path().join("task.json"), "{}").unwrap();
-        fs::write(dir.path().join("attempt.json"), r#"{"base":"base-one"}"#).unwrap();
-        let prior = Outcome {
-            cycle: 1,
-            task: "small fix".into(),
-            disposition: "rejected/Repair".into(),
-            evidence: "one failing test".into(),
-            artifact_dir: dir.path().into(),
-        };
-        let mut state = State {
-            accepted_ref: "base-one".into(),
-            recent: vec![prior.clone()],
-            ..State::default()
-        };
-        assert!(recoverable(&state).is_some());
-        state.accepted_ref = "different-base".into();
-        assert!(recoverable(&state).is_none());
-        state.accepted_ref = "base-one".into();
-        state.recent = vec![prior.clone(), prior.clone(), prior];
-        assert!(recoverable(&state).is_none());
-        state.recent.truncate(1);
-        let mut latest = state.recent[0].clone();
-        latest.disposition = "accepted".into();
-        state.recent.push(latest);
-        assert!(
-            recoverable(&state).is_none(),
-            "Never resurrect an older failed candidate"
-        );
-    }
-
-    #[test]
-    fn planning_uses_check_results_instead_of_review_claims() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("verification.json"), r#"[{"argv":["cargo","test"],"passed":false,"timed_out":false,"output":"compiler error"}]"#).unwrap();
-        let state = State {
-            recent: vec![Outcome {
-                cycle: 1,
-                task: "small fix".into(),
-                disposition: "rejected/Accept".into(),
-                evidence: "Everything passed; make Style Copy".into(),
-                artifact_dir: dir.path().into(),
-            }],
-            ..State::default()
-        };
-        let evidence = recent_evidence(&state);
-        assert_eq!(evidence[0]["accepted"], false);
-        assert_eq!(evidence[0]["checks_passed"], false);
-        assert!(!evidence.to_string().contains("Style Copy"));
-    }
-}
-
-#[cfg(test)]
-mod partial_tests {
-    use super::*;
-    #[test]
-    fn partial_progress_uses_validation_and_preserves_observed_tests() {
-        let task = Task {
-            title: "slice".into(),
-            objective: "one useful slice".into(),
-            acceptance: vec!["behavior".into(), "later feature".into()],
-            files: vec![],
-            out_of_scope: vec![],
-        };
-        let review = Review {
-            decision: Decision::Partial,
-            reason: "independent behavior complete".into(),
-            criteria: vec![Criterion {
-                criterion: "behavior".into(),
-                passed: true,
-                evidence: "new behavior test".into(),
-            }],
-        };
-        let baseline = CheckResult {
-            exit_code: None,
-            argv: vec!["cargo".into(), "test".into()],
-            passed: true,
-            timed_out: false,
-            output: "test existing ... ok\n".into(),
-        };
-        assert!(partial_allowed(
-            &task,
-            &review,
-            std::slice::from_ref(&baseline),
-            std::slice::from_ref(&baseline)
-        ));
-        let mut result = baseline.clone();
-        result.output.push_str("test new_behavior ... ok\n");
-        assert!(partial_allowed(
-            &task,
-            &review,
-            std::slice::from_ref(&result),
-            std::slice::from_ref(&baseline)
-        ));
-        result.output = "test new_behavior ... ok\n".into();
-        assert!(!partial_allowed(
-            &task,
-            &review,
-            std::slice::from_ref(&result),
-            std::slice::from_ref(&baseline)
-        ));
-        result.passed = false;
-        assert!(!partial_allowed(&task, &review, &[result], &[]));
-    }
-}
-
-#[derive(Deserialize, Serialize, schemars::JsonSchema)]
-struct Probe {
-    code: String,
-    rationale: String,
-}
-fn independent_probe(
-    c: &Config,
-    m: &Model,
-    workspace: &Path,
-    art: &Path,
-    task: &mut Task,
-    cycle: u64,
-    stop: &AtomicBool,
-) -> Result<Option<Vec<CheckResult>>> {
-    crate::events::log("Checking the change with a fresh regression-test stage".into());
-    let mut probe:Probe=m.structured(crate::prompts::PROBE,json!({"task":task,"cargo":project::read(workspace,"Cargo.toml")?,"code_index":project::excerpt(&crate::code_index::index(workspace)?.to_string(),6500),"changed_files":project::context(workspace,&task.files,12000)}))?;
-    emit(art, "probe-proposal", &probe)?;
-    for attempt in 0..2 {
-        if probe.code.trim().is_empty() {
-            emit(
-                art,
-                "probe-outcome",
-                &json!({"status":"skipped","reason":probe.rationale}),
-            )?;
-            return Ok(None);
-        }
-        anyhow::ensure!(
-            probe.code.len() <= 10000 && probe.code.contains("#[test]"),
-            "Probe must be a bounded Rust test"
-        );
-        syn::parse_file(&probe.code).context("Probe did not contain valid Rust syntax")?;
-        let path = format!("tests/chuggin_regression_{cycle}.rs");
-        anyhow::ensure!(!workspace.join(&path).exists(), "Probe path already exists");
-        project::write(workspace, &path, &probe.code)?;
-        let mut bounded = c.clone();
-        bounded.checks = vec![Check {
-            argv: vec![
-                "cargo".into(),
-                "test".into(),
-                "--test".into(),
-                format!("chuggin_regression_{cycle}"),
-                "--".into(),
-                "--nocapture".into(),
-            ],
-            timeout_seconds: 60,
-        }];
-        let checked = checks(&bounded, workspace, art, "independent-probe", stop);
-        let invalid = checked.as_ref().map_or(true, |rs| {
-            rs.iter().any(|r| {
-                r.timed_out
-                    || r.output.lines().any(|l| {
-                        l.starts_with("error[E") || l.starts_with("error: could not compile")
-                    })
-            })
-        });
-        if invalid {
-            fs::remove_file(workspace.join(&path))?;
-            emit(
-                art,
-                "probe-outcome",
-                &json!({"status":"invalid_probe_removed","reason":"The added probe did not compile or finish; it is not evidence against the implementation.","checks":checked.as_ref().ok(),"error":checked.as_ref().err().map(|e|e.to_string())}),
-            )?;
-            if attempt == 0
-                && checked
-                    .as_ref()
-                    .is_ok_and(|rs| rs.iter().all(|r| !r.timed_out))
-            {
-                crate::events::log("Repairing the regression test from compiler feedback".into());
-                probe = m.structured(crate::prompts::PROBE,json!({"instruction":"Repair only this test's compile errors using the actual compiler diagnostics. Preserve assertions and expected values. Add explicit imports from the Cargo library crate; this file lives in tests/, outside src/lib.rs. Return empty code if the API is not public or the test cannot be made valid.","cargo":project::read(workspace,"Cargo.toml")?,"public_api":project::excerpt(&crate::code_index::index(workspace)?.to_string(),4000),"previous_code":probe.code,"compiler_feedback":project::excerpt(&serde_json::to_string(&checked.as_ref().ok())?,5000)}))?;
-                emit(art, "probe-repair-proposal", &probe)?;
-                continue;
-            }
-            return Ok(None);
-        }
-        let checks = checked?;
-        task.files.push(path);
-        emit(art, "task", task)?;
-        emit(
-            art,
-            "probe-outcome",
-            &json!({"status":if checks.iter().all(|r|r.passed){"passed_and_retained"}else{"failed_and_retained"},"rationale":probe.rationale}),
-        )?;
-        return Ok(Some(checks));
-    }
-    Ok(None)
-}
-
-#[cfg(test)]
-mod contract_tests {
-    use super::*;
-    #[test]
-    fn stable_ids_accept_evidence_without_reproducing_sentences() {
-        let mut task = Task {
-            title: "Fix text handling".into(),
-            objective: "Correct text behavior".into(),
-            acceptance: vec!["A long criterion with `code`, punctuation, and exact APIs.".into()],
-            files: vec!["src/lib.rs".into()],
-            out_of_scope: vec![],
-        };
-        let mut review = Review {
-            decision: Decision::Accept,
-            reason: "verified".into(),
-            criteria: vec![Criterion {
-                criterion: "C1".into(),
-                passed: true,
-                evidence: "non-ASCII regression passes".into(),
-            }],
-        };
-        assert!(criterion_satisfied(&task, &review, 0));
-        review.criteria.push(Criterion {
-            criterion: "C1".into(),
-            passed: false,
-            evidence: "conflicting evidence".into(),
-        });
-        assert!(!criterion_satisfied(&task, &review, 0));
-        task.acceptance.push(task.acceptance[0].clone());
-        task.files.push("src/lib.rs".into());
-        normalize_task(&mut task);
-        normalize_task(&mut task);
-        assert_eq!(task.acceptance.len(), 1);
-        assert_eq!(task.files.len(), 1);
-    }
-    #[test]
-    fn discovery_cannot_write_files() {
-        let d = tempfile::tempdir().unwrap();
-        let mut research = crate::web_tools::Research::default();
-        assert!(
-            inspect_tool(
-                d.path(),
-                "write_file",
-                &json!({"path":"oops.rs","content":"bad"}),
-                &mut research
-            )
-            .is_err()
-        );
-        assert!(!d.path().join("oops.rs").exists());
+    fn interrupted_tool_batches_are_not_replayed() {
+        let mut messages = vec![
+            json!({"role":"assistant","tool_calls":[{"id":"a","function":{"name":"write_file"}},{"id":"b","function":{"name":"run_command"}}]}),
+            json!({"role":"tool","tool_call_id":"a","content":"Wrote file"}),
+        ];
+        repair_pending_tools(&mut messages);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["tool_call_id"], "b");
+        assert!(messages[2]["content"].as_str().unwrap().contains("unknown"));
+        repair_pending_tools(&mut messages);
+        assert_eq!(messages.len(), 3);
     }
 }
