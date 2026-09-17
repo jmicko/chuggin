@@ -136,17 +136,23 @@ impl Server {
                         prefix + &(0..20).map(|_| json!({"message":{"content":"I'll try that now. Wait, let me think about it. ","tool_calls":if n == 1 {json!([{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"MUST_NOT_EXECUTE"}}}])} else {json!([])}},"done":false}).to_string()+"\n").collect::<String>()
                     } else {
                         let (content, tools) = reply(&body, n);
-                        if content == "__FAIL_REQUEST__" {
+                        if matches!(
+                            content.as_str(),
+                            "__FAIL_REQUEST__" | "__HTTP_LIMIT__" | "__CREDIT_LIMIT__"
+                        ) {
                             content
+                        } else if content == "__STREAM_LIMIT__" {
+                            json!({"error":"weekly usage limit reached"}).to_string() + "\n"
                         } else {
                             json!({"message":{"role":"assistant","content":content,"tool_calls":tools},"done":true,"done_reason":"stop"}).to_string()+"\n"
                         }
                     }
                 };
-                let status = if data == "__FAIL_REQUEST__" {
-                    "503 Service Unavailable"
-                } else {
-                    "200 OK"
+                let status = match data.as_str() {
+                    "__FAIL_REQUEST__" => "400 Bad Request",
+                    "__HTTP_LIMIT__" => "429 Too Many Requests\nRetry-After: 1",
+                    "__CREDIT_LIMIT__" => "402 Payment Required",
+                    _ => "200 OK",
                 };
                 let response = format!(
                     "HTTP/1.1 {status}
@@ -2071,4 +2077,159 @@ fn exercise_project_tools(failing: bool) {
         !artifact.join("probe-outcome.json").exists(),
         "Rust probes should not run automatically"
     );
+}
+
+#[test]
+fn provider_rate_limit_retries_identical_conversation_without_replaying_edits() {
+    let server = Server::custom(false, false, None, |_, n| match n {
+        0 => (
+            String::new(),
+            json!([task_tool("Provider recovery"),{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"KEPT"}}}]),
+        ),
+        1 => ("__HTTP_LIMIT__".into(), json!([])),
+        _ => ("Recovered".into(), json!([])),
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    let calls = server.requests.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[1], calls[2]);
+    let saved = state(root.path());
+    assert_eq!(
+        git(
+            Path::new(saved["working_workspace"].as_str().unwrap()),
+            &["show", "HEAD:value.txt"]
+        ),
+        "KEPT"
+    );
+    assert!(!root.path().join("state/provider-wait.json").exists());
+    assert!(
+        root.path()
+            .join("state/cycle-000001/provider-error-001.json")
+            .exists()
+    );
+    let session: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
+            .unwrap();
+    assert_eq!(session["response_errors"], 0);
+}
+#[test]
+fn provider_credits_pause_once_and_checkpoint_edits() {
+    let server = Server::custom(false, false, None, |_, n| {
+        if n == 0 {
+            (
+                String::new(),
+                json!([{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"SAVED_BEFORE_QUOTA"}}}]),
+            )
+        } else {
+            ("__CREDIT_LIMIT__".into(), json!([]))
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 10);
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    let saved = state(root.path());
+    assert_eq!(saved["cycle"], 1);
+    assert_eq!(
+        git(
+            Path::new(saved["working_workspace"].as_str().unwrap()),
+            &["show", "HEAD:value.txt"]
+        ),
+        "SAVED_BEFORE_QUOTA"
+    );
+    assert!(
+        saved["feedback"]
+            .as_str()
+            .unwrap()
+            .contains("No automatic retries")
+    );
+}
+#[test]
+fn provider_stream_limit_timer_and_restart_preserve_cooldown() {
+    let server = Server::custom(false, false, None, |_, _| {
+        ("__STREAM_LIMIT__".into(), json!([]))
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["run_duration_seconds"] = json!(1);
+    fs::write(&path, config.to_string()).unwrap();
+    let start = std::time::Instant::now();
+    run_cycles(root.path(), 10);
+    assert!(start.elapsed() < Duration::from_secs(5));
+    let wait = fs::read(root.path().join("state/provider-wait.json")).unwrap();
+    run_cycles(root.path(), 10);
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        wait,
+        fs::read(root.path().join("state/provider-wait.json")).unwrap()
+    );
+    let session: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
+            .unwrap();
+    assert_eq!(session["response_errors"], 0);
+    assert!(
+        !fs::read_dir(root.path().join("state/cycle-000001"))
+            .unwrap()
+            .flatten()
+            .any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("conversation-before-refresh"))
+    );
+}
+#[test]
+fn provider_wait_allows_soft_stop_and_model_change() {
+    let server = Server::custom(false, false, None, |body, _| {
+        if body["model"] == "fake" {
+            ("__STREAM_LIMIT__".into(), json!([]))
+        } else {
+            ("Recovered on selected model".into(), json!([]))
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut child = command(root.path())
+        .args(["run", "--cycles", "1"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !root.path().join("state/provider-wait.json").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    while child.try_wait().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    let mut child = command(root.path())
+        .args(["run", "--cycles", "1"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["model"] = json!("other");
+    let temp = path.with_extension("tmp");
+    fs::write(&temp, config.to_string()).unwrap();
+    fs::rename(temp, &path).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    assert!(!root.path().join("state/provider-wait.json").exists());
 }

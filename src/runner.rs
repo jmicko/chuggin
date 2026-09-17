@@ -782,6 +782,9 @@ fn work(
         let response = match m.chat(&session.messages, Some(session.tools.clone()), false) {
             Ok(response) => response,
             Err(error) => {
+                if error.downcast_ref::<crate::provider::Stopped>().is_some() {
+                    return Err(error);
+                }
                 session.response_errors += 1;
                 emit(
                     art,
@@ -991,6 +994,7 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
         stage_stop.clone(),
     )?;
     model.use_project_settings(path);
+    model.use_run_controls(stop.clone(), started);
     let mut completed = 0;
     while !stop.load(Ordering::SeqCst) && !time_up() && count.is_none_or(|n| completed < n) {
         state.cycle += 1;
@@ -1027,6 +1031,10 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
             state.cycle
         ));
         let result = work(&c, &mut state, &model, &mut session, &art, &stage_stop);
+        let provider_stopped = result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.downcast_ref::<crate::provider::Stopped>().is_some());
         let error = result.as_ref().err().map(|e| format!("{e:#}"));
         if let Some(error) = &error {
             crate::events::log(format!(
@@ -1128,6 +1136,13 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
             state.recent.remove(0);
         }
         save(&c.state_dir.join("state.json"), &state)?;
+        if provider_stopped {
+            crate::events::send(crate::events::Event::Phase(format!(
+                "Paused · {}",
+                error.as_deref().unwrap_or("Provider unavailable")
+            )));
+            break;
+        }
         if time_up() || count.is_some_and(|n| completed >= n) {
             break;
         }

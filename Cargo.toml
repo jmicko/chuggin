@@ -1,6 +1,6 @@
 [package]
 name = "chuggin"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "A terminal harness for persistent projects and continuous local model refinement"
@@ -10,6 +10,7 @@ include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICEN
 
 [dependencies]
 anyhow = "1"
+httpdate = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

@@ -3,13 +3,13 @@ use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug)]
@@ -36,6 +36,8 @@ pub struct Model {
     settings_path: Option<PathBuf>,
     completed_messages: RefCell<Option<Vec<Value>>>,
     context_pressure: Cell<bool>,
+    run_controls: Option<(Arc<AtomicBool>, Instant)>,
+    request_target: RefCell<(String, String)>,
 }
 impl Model {
     pub fn new(
@@ -59,6 +61,11 @@ impl Model {
             settings_path: None,
             completed_messages: RefCell::new(None),
             context_pressure: Cell::new(false),
+            run_controls: None,
+            request_target: RefCell::new((
+                name.into(),
+                format!("{}/api/chat", url.trim_end_matches('/')),
+            )),
         })
     }
     pub fn take_completed_messages(&self) -> Option<Vec<Value>> {
@@ -69,6 +76,73 @@ impl Model {
     }
     pub fn use_project_settings(&mut self, path: &Path) {
         self.settings_path = Some(path.to_owned());
+    }
+    pub fn use_run_controls(&mut self, stop: Arc<AtomicBool>, started: Instant) {
+        self.run_controls = Some((stop, started));
+    }
+    fn provider_target(&self) -> Result<(String, String, Option<PathBuf>)> {
+        if let Some(path) = &self.settings_path {
+            let c = crate::runner::load(path)?;
+            Ok((
+                c.model,
+                format!("{}/api/chat", c.ollama_url.trim_end_matches('/')),
+                Some(c.state_dir.join("provider-wait.json")),
+            ))
+        } else {
+            Ok((self.name.clone(), self.url.clone(), None))
+        }
+    }
+    fn wait_for_provider(&self, record: &Value) -> Result<()> {
+        let until = record["until"].as_u64().unwrap_or(0);
+        let mut last_seconds = u64::MAX;
+        loop {
+            let current = self.provider_target()?;
+            if self.stop.load(Ordering::SeqCst)
+                || self
+                    .run_controls
+                    .as_ref()
+                    .is_some_and(|(s, _)| s.load(Ordering::SeqCst))
+            {
+                return Err(crate::provider::Stopped(
+                    "Stopped while waiting for provider; work and conversation retained".into(),
+                )
+                .into());
+            }
+            if let Some((_, started)) = &self.run_controls {
+                let c = crate::runner::load(
+                    self.settings_path
+                        .as_ref()
+                        .context("Missing run settings")?,
+                )?;
+                if c.run_duration_seconds > 0
+                    && started.elapsed().as_secs() >= c.run_duration_seconds
+                {
+                    return Err(crate::provider::Stopped(
+                        "Run timer reached while waiting for provider; saving work".into(),
+                    )
+                    .into());
+                }
+            }
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            if current.0 != record["model"] || current.1 != record["url"] || now >= until {
+                if let Some(path) = current.2 {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Ok(());
+            }
+            let seconds = until.saturating_sub(now);
+            if seconds != last_seconds {
+                crate::events::send(crate::events::Event::ProviderWait {
+                    reason: record["reason"]
+                        .as_str()
+                        .unwrap_or("Provider unavailable")
+                        .into(),
+                    seconds,
+                });
+                last_seconds = seconds;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
     pub fn trace_to(&self, path: &Path) {
         *self.trace.borrow_mut() = Some(path.into());
@@ -92,10 +166,51 @@ impl Model {
         let mut conversation = messages.to_vec();
         let mut transport_retries = 0;
         let mut generation_retries = 0;
+        let mut provider_attempts = 0u32;
+        if let Some(path) = self.provider_target()?.2
+            && path.exists()
+        {
+            let record: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            provider_attempts = record["attempt"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32;
+            self.wait_for_provider(&record)?;
+        }
         loop {
             let result = self.chat_format_once(&conversation, tools.clone(), format.clone());
             if let Err(error) = &result {
                 crate::events::send(crate::events::Event::RequestFinished);
+                if let Some(provider) = error.downcast_ref::<crate::provider::Unavailable>() {
+                    provider_attempts = provider_attempts.saturating_add(1);
+                    let delay = provider
+                        .retry_after
+                        .unwrap_or_else(|| crate::provider::backoff(provider_attempts));
+                    let (model, url) = self.request_target.borrow().clone();
+                    // Round up to the next second so persistence never shortens Retry-After.
+                    let record = json!({"reason":provider.reason,"pause":provider.pause,"model":model,"url":url,"attempt":provider_attempts,"until":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs().saturating_add(delay.as_secs()).saturating_add(1),"delay_seconds":delay.as_secs()});
+                    if let Some(path) = self.trace.borrow().as_ref() {
+                        std::fs::write(
+                            path.join(format!(
+                                "provider-error-{:03}.json",
+                                self.sequence.get().saturating_sub(1)
+                            )),
+                            serde_json::to_vec_pretty(&record)?,
+                        )?;
+                    }
+                    if provider.pause {
+                        return Err(crate::provider::Stopped(format!("{}. Resolve billing/access or select another model, then resume. No automatic retries.",provider.reason)).into());
+                    }
+                    if let Some(path) = self.provider_target()?.2 {
+                        let temp = path.with_extension("tmp");
+                        std::fs::write(&temp, serde_json::to_vec_pretty(&record)?)?;
+                        std::fs::rename(temp, path)?;
+                    }
+                    crate::events::log(format!(
+                        "{}; waiting {} seconds before retrying the same conversation.",
+                        provider.reason,
+                        delay.as_secs()
+                    ));
+                    self.wait_for_provider(&record)?;
+                    continue;
+                }
                 let transient = error.chain().any(|e| {
                     e.downcast_ref::<reqwest::Error>()
                         .is_some_and(|e| e.is_timeout() || e.is_connect())
@@ -173,6 +288,7 @@ impl Model {
             .as_ref()
             .map(|c| c.request_timeout_seconds)
             .unwrap_or(1800);
+        *self.request_target.borrow_mut() = (name.to_owned(), url.clone());
         crate::events::send(crate::events::Event::RequestModel(name.to_owned()));
         crate::events::send(crate::events::Event::Request);
         anyhow::ensure!(!self.stop.load(Ordering::SeqCst), "Stopped by operator");
@@ -209,7 +325,23 @@ impl Model {
         } else {
             request.timeout(Duration::from_secs(timeout))
         };
-        let response = request.send()?.error_for_status()?;
+        let response = request.send()?;
+        let retry_after = crate::provider::retry_after(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            SystemTime::now(),
+        );
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let mut body = String::new();
+            response.take(16384).read_to_string(&mut body)?;
+            if let Some(provider) = crate::provider::classify(status, &body, retry_after) {
+                return Err(provider.into());
+            }
+            bail!("Ollama HTTP {status}: request rejected");
+        }
         let mut content = String::new();
         let mut thinking = String::new();
         let mut calls = Vec::new();
@@ -225,6 +357,10 @@ impl Model {
             }
             let d: Value = serde_json::from_str(&line).context("Invalid Ollama stream JSON")?;
             if let Some(e) = d.get("error") {
+                if let Some(provider) = crate::provider::classify(200, &e.to_string(), retry_after)
+                {
+                    return Err(provider.into());
+                }
                 bail!("Ollama: {e}")
             }
             if let Some(s) = d["message"]["content"].as_str() {

@@ -605,6 +605,7 @@ struct Dashboard {
     generated: u64,
     speed: f64,
     request_active: bool,
+    provider_wait: Option<u64>,
     checkpoints: u64,
     completed_cycles: u64,
     started: Instant,
@@ -645,6 +646,7 @@ impl Dashboard {
             generated: 0,
             speed: 0.,
             request_active: false,
+            provider_wait: None,
             checkpoints: 0,
             completed_cycles: 0,
             started: Instant::now(),
@@ -754,8 +756,14 @@ impl Dashboard {
         match event {
             Event::RequestModel(name) => self.active_model = name,
             Event::RequestFinished => self.request_active = false,
+            Event::ProviderWait { reason, seconds } => {
+                self.request_active = false;
+                self.provider_wait = Some(seconds);
+                self.phase = format!("Waiting for provider · {seconds}s · {reason}");
+            }
             Event::Log(s) => self.push(Kind::Activity, s),
             Event::Phase(s) => {
+                self.provider_wait = None;
                 self.request_active = false;
                 self.flush_model();
                 if s == "Check" {
@@ -772,6 +780,9 @@ impl Dashboard {
             }
             Event::Task(s) => self.task = s,
             Event::Request => {
+                if self.provider_wait.take().is_some() {
+                    self.phase = "Work".into();
+                }
                 self.flush_model();
                 self.calls += 1;
                 self.request_active = true;
@@ -1151,11 +1162,13 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             Line::from("MODEL").fg(CYAN).bold(),
             Line::from(d.active_model.clone()),
             Line::from(if d.finished.is_some() {
-                "○ Idle · no work running"
+                "○ Idle · no work running".to_owned()
+            } else if let Some(seconds) = d.provider_wait {
+                format!("◷ Provider retry in {seconds}s")
             } else if d.request_active {
-                "● Receiving response"
+                "● Receiving response".to_owned()
             } else {
-                "○ Between requests"
+                "○ Between requests".to_owned()
             })
             .fg(if d.request_active { GREEN } else { MUTED }),
             Line::from(format!("{:.1} tok/s · last reply", d.speed)),
@@ -1681,6 +1694,25 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn provider_wait_is_visible_and_clears_when_requests_resume() {
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::Request);
+        d.apply(Event::ProviderWait {
+            reason: "Usage limit reached".into(),
+            seconds: 601,
+        });
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
+        assert!(screen_text(&t).contains("Waiting for provider"));
+        assert!(screen_text(&t).contains("601s"));
+        assert!(!d.request_active);
+        d.apply(Event::Request);
+        assert!(d.request_active);
+        assert!(d.provider_wait.is_none());
+        assert_eq!(d.phase, "Work");
     }
     #[test]
     fn scrollback_stays_put_and_search_filters_actual_output() {

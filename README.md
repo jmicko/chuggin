@@ -283,6 +283,27 @@ restarting earlier stages. If the retry fails, the existing files are still
 retained for continued work.
 Request settings and failed attempts are recorded alongside the response traces.
 
+Cloud provider limits use a separate recovery path. Legacy session/weekly limits,
+HTTP 429 responses, and temporary HTTP 5xx outages preserve the exact working
+conversation and retry after waiting. `Retry-After` seconds or HTTP dates take
+precedence; without that header, delays increase from 1 to 2, 4, 8, then 15 minutes.
+The dashboard shows **Waiting for provider** and a countdown. Provider errors do
+not trigger conversation compaction or count as reasoning failures. Limit errors
+inside an otherwise successful Ollama stream are handled too.
+
+Credit/payment exhaustion without a supplied retry time, and authentication/access
+errors, save the current work and stop without automatic retries. Resolve the
+account issue or select another model, then resume. Chuggin never purchases credits
+or changes your billing plan. An unrecognized quota message returned with HTTP 429
+still receives the bounded-frequency retry policy; a reset time cannot be inferred
+reliably from every provider's prose.
+
+Pending waits persist in `.chuggin/provider-wait.json`, so restarting does not bypass
+the cooldown. Changing the selected model/server releases its old wait. A soft stop
+or the run timer ends a provider wait promptly, then runs checks and saves work;
+time waiting counts toward the run duration. Each provider failure and chosen
+retry delay is recorded in the cycle's `provider-error-NNN.json` files.
+
 `.chuggin/state.json` records `working_ref`, `working_branch`, `working_workspace`,
 `last_checks_passed_ref`, the current task, feedback, and recent outcomes.
 New projects use `.chuggin/working` on a `codex/chuggin-working-...` branch.

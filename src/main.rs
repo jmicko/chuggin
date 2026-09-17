@@ -5,6 +5,7 @@ mod menu;
 mod model;
 mod project;
 mod prompts;
+mod provider;
 mod repetition;
 mod runner;
 mod setup;

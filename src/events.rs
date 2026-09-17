@@ -15,6 +15,10 @@ pub enum Event {
     Request,
     RequestModel(String),
     RequestFinished,
+    ProviderWait {
+        reason: String,
+        seconds: u64,
+    },
     Delta(String),
     Metrics {
         prompt: u64,
