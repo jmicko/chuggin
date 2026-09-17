@@ -1009,23 +1009,31 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     } else {
         "LIVE"
     };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" CHUGGIN ", Style::default().fg(BG).bg(ACCENT).bold()),
-            Span::styled(
-                format!("  {state}  ·  cycle {}", d.cycle),
-                Style::default().fg(if stopping { GOLD } else { CYAN }),
+    let wide = f.area().width >= 100;
+    let mut header = vec![Line::from(vec![
+        Span::styled(" CHUGGIN ", Style::default().fg(BG).bg(ACCENT).bold()),
+        Span::styled(
+            format!("  {state}"),
+            Style::default().fg(if stopping { GOLD } else { CYAN }),
+        ),
+        Span::styled(
+            format!(
+                "  ·  {}",
+                c.repo.file_name().unwrap_or_default().to_string_lossy()
             ),
-            Span::styled(
-                format!(
-                    "  ·  {}",
-                    c.repo.file_name().unwrap_or_default().to_string_lossy()
-                ),
-                Style::default().fg(FG),
-            ),
-        ])),
-        r[0],
-    );
+            Style::default().fg(FG),
+        ),
+    ])];
+    if !wide {
+        header.push(
+            Line::from(format!(
+                "Overall cycle: #{} · session {} done",
+                d.cycle, d.completed_cycles
+            ))
+            .fg(MUTED),
+        );
+    }
+    f.render_widget(Paragraph::new(header), r[0]);
     let phases = ["Orient", "Work", "Check", "Review", "Checkpoint"];
     let mut steps = Vec::new();
     for (i, s) in phases.iter().enumerate() {
@@ -1077,7 +1085,6 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         })),
         r[2],
     );
-    let wide = f.area().width >= 100;
     let body = Layout::horizontal(if wide {
         vec![Constraint::Min(40), Constraint::Length(29)]
     } else {
@@ -1154,7 +1161,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         let side = Layout::vertical([
             Constraint::Length(7),
             Constraint::Length(4),
-            Constraint::Length(7),
+            Constraint::Length(9),
             Constraint::Min(0),
         ])
         .split(inner);
@@ -1193,11 +1200,10 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             );
         }
         let session = vec![
-            Line::from("THIS SESSION").fg(CYAN).bold(),
-            Line::from(format!(
-                "Saved: {} · cycles: {}",
-                d.checkpoints, d.completed_cycles
-            )),
+            Line::from("CYCLES & SESSION").fg(CYAN).bold(),
+            Line::from(format!("Overall cycle: #{}", d.cycle)),
+            Line::from(format!("This session: {} finished", d.completed_cycles)),
+            Line::from(format!("Checkpoints saved: {}", d.checkpoints)),
             Line::from(format!(
                 "Elapsed {}",
                 duration(
@@ -1854,7 +1860,9 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
         t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
         let text = screen_text(&t);
-        assert!(text.contains("Saved: 2 · cycles: 2"));
+        assert!(text.contains("Overall cycle: #2"));
+        assert!(text.contains("This session: 2 finished"));
+        assert!(text.contains("Checkpoints saved: 2"));
         assert!(text.contains("work is kept for repair"));
         assert!(text.contains("Last passing: abc12345"));
         assert!(text.contains("Saved · checks failing"));

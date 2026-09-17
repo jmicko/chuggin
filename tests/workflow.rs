@@ -1774,7 +1774,7 @@ mod terminal_ui {
         ui.wait("Resume project");
         ui.send(b"\r");
         ui.wait("LIVE");
-        ui.wait("cycle 1");
+        ui.wait("Overall cycle: #1");
         ui.send(b"?");
         ui.wait("Keyboard guide");
         ui.send(b"?");
@@ -1796,12 +1796,12 @@ mod terminal_ui {
         assert_eq!(state["recent"][0]["disposition"], "checkpoint");
         // Resume directly after the worker has actually stopped.
         ui.send(b"r");
-        ui.wait("cycle 2");
+        ui.wait("Overall cycle: #2");
         ui.send(b"\x03");
         ui.wait("Finishing this cycle");
         ui.send(b"r");
         ui.wait("Stop cancelled");
-        ui.wait("cycle 3");
+        ui.wait("Overall cycle: #3");
         ui.send(b"\x03");
         ui.wait("Run saved");
         let resumed: Value =
