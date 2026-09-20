@@ -1766,6 +1766,55 @@ mod terminal_ui {
         }
     }
     #[test]
+    fn resume_prompts_for_missing_git_identity_before_starting_the_worker() {
+        let server = Server::new(false, true);
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        // A cloned repository does not inherit the source's local Git identity.
+        fs::write(root.path().join(".chuggin/test-gitconfig"), "").unwrap();
+        ui.send(b"\r");
+        ui.wait("Git author name");
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert!(!root.path().join("state").exists());
+        ui.send(b"Benchmark Operator\r");
+        ui.wait("Git author email");
+        assert!(server.requests.lock().unwrap().is_empty());
+        ui.send(b"benchmark@example.com\r");
+        ui.wait("Overall cycle: #1");
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        ui.send(b"\r");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+
+        let repo = root.path().join("repo");
+        assert_eq!(
+            git(&repo, &["config", "--local", "user.name"]),
+            "Benchmark Operator"
+        );
+        assert_eq!(
+            git(&repo, &["config", "--local", "user.email"]),
+            "benchmark@example.com"
+        );
+        let saved = state(root.path());
+        assert_eq!(
+            git(
+                &repo,
+                &[
+                    "show",
+                    "-s",
+                    "--format=%an <%ae>",
+                    saved["working_ref"].as_str().unwrap()
+                ]
+            ),
+            "Benchmark Operator <benchmark@example.com>"
+        );
+        assert!(!server.requests.lock().unwrap().is_empty());
+    }
+    #[test]
     fn full_screen_run_streams_soft_stops_and_restores_the_terminal() {
         let server = Server::new(false, true);
         let root = tempfile::tempdir().unwrap();

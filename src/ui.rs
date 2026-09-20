@@ -1342,6 +1342,8 @@ pub fn dashboard(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -
 
 fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<bool> {
     let mut config = runner::load(path)?;
+    // Identity setup can prompt, so complete it on the thread that owns the terminal.
+    crate::setup::ensure_git_identity(&config.repo)?;
     let mut d = Dashboard::new(&config);
     let rx = events::subscribe();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
