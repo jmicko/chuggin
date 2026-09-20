@@ -30,6 +30,7 @@ pub struct Model {
     name: String,
     context: u32,
     output: u32,
+    output_cap: Cell<Option<u32>>,
     stop: Arc<AtomicBool>,
     trace: RefCell<Option<PathBuf>>,
     sequence: Cell<u32>,
@@ -55,6 +56,7 @@ impl Model {
             name: name.into(),
             context,
             output,
+            output_cap: Cell::new(None),
             stop,
             trace: RefCell::new(None),
             sequence: Cell::new(0),
@@ -155,6 +157,12 @@ impl Model {
         structured: bool,
     ) -> Result<Value> {
         self.chat_format(messages, tools, structured.then(|| json!("json")))
+    }
+    pub fn diagnostic_chat(&self, messages: &[Value], tools: Value) -> Result<Value> {
+        let previous = self.output_cap.replace(Some(2048));
+        let result = self.chat(messages, Some(tools), false);
+        self.output_cap.set(previous);
+        result
     }
     fn chat_format(
         &self,
@@ -289,7 +297,11 @@ impl Model {
         crate::events::send(crate::events::Event::RequestModel(name.to_owned()));
         crate::events::send(crate::events::Event::Request);
         anyhow::ensure!(!self.stop.load(Ordering::SeqCst), "Stopped by operator");
-        let mut body = json!({"model":name,"messages":messages,"stream":true,"think":false,"options":{"num_ctx":self.context,"num_predict":self.output,"temperature":0.4}});
+        let output = self
+            .output_cap
+            .get()
+            .map_or(self.output, |cap| self.output.min(cap));
+        let mut body = json!({"model":name,"messages":messages,"stream":true,"think":false,"options":{"num_ctx":self.context,"num_predict":output,"temperature":0.4}});
         if let Some(t) = tools {
             body["tools"] = t;
         }

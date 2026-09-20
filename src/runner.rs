@@ -96,12 +96,15 @@ struct Conversation {
     response_errors: u32,
     prompt_version: String,
     action_watch: crate::action_watch::ActionWatch,
+    command_watch: crate::command_watch::CommandWatch,
 }
 
 /// Compact evidence accompanies the transcript and survives conversation handoffs.
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct RepairNote {
     model_note: String,
+    task_id: Option<u64>,
     recent_actions: Vec<String>,
     last_failure: String,
 }
@@ -118,10 +121,11 @@ impl RepairNote {
     }
     fn set_note(&mut self, note: &str) -> Result<()> {
         self.model_note = note.trim().into();
+        self.task_id = None;
         Ok(())
     }
     fn context(&self) -> Value {
-        json!({"model_note_excerpt":project::excerpt(&self.model_note,6000),"model_note_bytes":self.model_note.len(),"instruction":"Use read_progress_note to retrieve the complete note. Notes and past failures may be stale; verify against current files.","recent_actions":self.recent_actions,"last_observed_failure":self.last_failure})
+        json!({"model_note_excerpt":project::excerpt(&self.model_note,6000),"model_note_bytes":self.model_note.len(),"note_task_id":self.task_id,"instruction":"Use read_progress_note to retrieve the complete note. A missing or different note_task_id means the note is not tied to the current task. Notes and past failures may be stale; verify against current files.","recent_actions":self.recent_actions,"last_observed_failure":self.last_failure})
     }
     fn page(&self, offset: usize) -> Result<Value> {
         let text = &self.model_note;
@@ -134,7 +138,7 @@ impl RepairNote {
             end -= 1;
         }
         Ok(
-            json!({"text":&text[offset..end],"offset":offset,"total_bytes":text.len(),"next_offset":if end < text.len() {Some(end)} else {None}}),
+            json!({"text":&text[offset..end],"note_task_id":self.task_id,"offset":offset,"total_bytes":text.len(),"next_offset":if end < text.len() {Some(end)} else {None}}),
         )
     }
 }
@@ -818,6 +822,90 @@ fn inspect_tool(
         _ => anyhow::bail!("Unknown tool: {name}"),
     }
 }
+fn recover_commands(
+    c: &Config,
+    s: &State,
+    m: &Model,
+    session: &mut Conversation,
+    art: &Path,
+) -> Result<()> {
+    if !session.command_watch.pending_diagnosis {
+        return Ok(());
+    }
+    let current = working_tree(&s.working_workspace).ok();
+    let observed = session
+        .command_watch
+        .recent
+        .last()
+        .and_then(|v| v["project_tree"].as_str());
+    if current.as_deref() != observed || current.is_none() {
+        session.command_watch.reset_streak();
+        return save_conversation(c, session);
+    }
+    session.command_watch.diagnoses += 1;
+    let id = session.command_watch.diagnoses;
+    let input = json!({"goal":c.goal,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"checkpoint":s.working_ref,"observed_project_tree":current,"repetitions":session.command_watch.count,"command":session.command_watch.command,"recent_commands":session.command_watch.recent,"recent_activity_including_inspections":session.command_watch.activity,"latest_check_feedback":project::excerpt(&s.feedback,4000),"progress_note_metadata":{"note_task_id":session.note.task_id,"bytes":session.note.model_note.len(),"instruction":"Use read_progress_note only if needed. It may describe an earlier task; historical fixes are not evidence of progress during these repeated commands."},"instruction":"Determine whether this repeated work is justified. The project snapshot excludes ignored build outputs and cannot establish external side effects. Inspect evidence, then propose a concrete next action. The full main conversation has deliberately not been copied."});
+    save_conversation(c, session)?;
+    crate::events::send(crate::events::Event::Phase("Diagnose".into()));
+    crate::events::log(format!(
+        "Assessing repeated commands in a fresh read-only conversation (diagnostic {id})"
+    ));
+    let mut research = crate::web_tools::Research::default();
+    let assessment =
+        crate::stall_diagnostic::diagnose(m, input, art, id, |name, args| match name {
+            "read_command_log" => Ok(crate::dev_tools::read_log(art, args)?.to_string()),
+            "read_progress_note" => {
+                let offset = match args.get("offset") {
+                    Some(v) => usize::try_from(v.as_u64().context("offset must be nonnegative")?)?,
+                    None => 0,
+                };
+                Ok(session.note.page(offset)?.to_string())
+            }
+            _ => inspect_tool(&s.working_workspace, name, args, &mut research),
+        });
+    let mut productive = false;
+    let feedback = match assessment {
+        Ok(report) => {
+            productive = report.verdict == crate::stall_diagnostic::Verdict::Productive;
+            emit(art, &format!("command-diagnostic-{id}-report"), &report)?;
+            if report.verdict == crate::stall_diagnostic::Verdict::Stalled {
+                session.note.recent_actions.clear();
+                refresh_conversation(
+                    c,
+                    s,
+                    session,
+                    art,
+                    "Fresh diagnostic suggests a persistent command loop; repetitive history was archived",
+                    false,
+                )?;
+                session.action_watch.recovered();
+                session.command_watch.reset_streak();
+            }
+            crate::events::log(format!(
+                "Command diagnostic: {:?}. {}",
+                report.verdict, report.next_action
+            ));
+            json!({"command_diagnostic":report,"instruction":"This is advisory, not a task completion or approval. Verify its evidence and pursue the proposed investigation or another justified next action. Repeated testing, sampling or polling is allowed when it resolves a concrete uncertainty. All existing work is retained."})
+        }
+        Err(error) => {
+            if error.downcast_ref::<crate::provider::Stopped>().is_some() {
+                return Err(error);
+            }
+            let error = format!("{error:#}");
+            emit(art, &format!("command-diagnostic-{id}-error"), &error)?;
+            crate::events::log(format!(
+                "Command diagnostic unavailable: {error}. Continuing with saved work."
+            ));
+            json!({"command_diagnostic_error":error,"repetition_evidence":session.command_watch.notice(),"instruction":"Assessment was inconclusive. Inspect relevant files or full logs and state what evidence the next action will obtain. No work has been discarded."})
+        }
+    };
+    session.command_watch.reviewed(productive);
+    session
+        .messages
+        .push(json!({"role":"user","content":feedback.to_string()}));
+    save_conversation(c, session)
+}
+
 struct WorkResult {
     finish_requested: Option<u64>,
     summary: String,
@@ -838,6 +926,13 @@ fn work(
     let mut summary = String::new();
     for step in 0..c.implementation_calls {
         anyhow::ensure!(!stop.load(Ordering::SeqCst), "Stopped by operator");
+        recover_commands(c, s, m, session, art)?;
+        if std::mem::take(&mut session.command_watch.notice_pending) {
+            session
+                .messages
+                .push(json!({"role":"user","content":session.command_watch.notice()}));
+            save_conversation(c, session)?;
+        }
         if session.action_watch.pending_refresh {
             session.note.recent_actions.clear();
             refresh_conversation(
@@ -927,6 +1022,13 @@ fn work(
                 args["path"].as_str().unwrap_or("")
             )));
             let root = s.working_workspace.clone();
+            let command = matches!(name, "run_command" | "run_checks" | "compiler_diagnostics");
+            let before_command = if command {
+                working_tree(&root).ok()
+            } else {
+                None
+            };
+            let previous_task = s.task_serial;
             let result: Result<String> = (|| match name {
                 "set_task" => {
                     let task: Task = serde_json::from_value(args.clone())?;
@@ -965,6 +1067,7 @@ fn work(
                         note.to_owned()
                     };
                     session.note.set_note(&note)?;
+                    session.note.task_id = s.current_task.as_ref().map(|_| s.task_serial);
                     Ok("Complete progress note saved. Use read_progress_note to retrieve it; context handoffs carry an excerpt. Verify notes against current files and checks.".into())
                 }
                 "read_progress_note" => {
@@ -1072,12 +1175,48 @@ fn work(
                 }
                 Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
             };
+            if command {
+                let after_command = working_tree(&root).ok();
+                let observed_args = if name == "run_checks" {
+                    json!({"checks":c.checks})
+                } else {
+                    args.clone()
+                };
+                session.command_watch.observe(
+                    name,
+                    &observed_args,
+                    &value,
+                    before_command.as_deref(),
+                    after_command.as_deref(),
+                    s.task_serial,
+                );
+                if session.command_watch.count == 8 || session.command_watch.count == 16 {
+                    emit(
+                        art,
+                        &format!("command-repetition-{step}-{index}"),
+                        &session.command_watch,
+                    )?;
+                    crate::events::log(session.command_watch.notice());
+                }
+            } else if s.task_serial != previous_task
+                || (value["ok"] == true
+                    && (value["result"]["changed"] == true || name == "restore_checkpoint"))
+            {
+                session.command_watch.reset_streak();
+            }
+            session.command_watch.record_activity(name, args, &value);
             session
                 .note
                 .record(name, &value.to_string(), value["ok"] == false);
             emit(art, &format!("tool-{step}-{index}"), &value)?;
             emit(art, "repair-note", &session.note)?;
-            let mut reply = json!({"role":"tool","tool_name":name,"content":value.to_string()});
+            let reply_value = if command {
+                crate::command_watch::compact_reply(&value, session.command_watch.count)
+            } else {
+                value.clone()
+            };
+            let mut reply =
+                json!({"role":"tool","tool_name":name,"content":reply_value.to_string()});
             if let Some(id) = call.get("id") {
                 reply["tool_call_id"] = id.clone();
             }
@@ -1275,7 +1414,7 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
         emit(
             &art,
             "checkpoint",
-            &json!({"commit":state.working_ref,"changed":changed,"checks_passed":passed,"checked_tree":before_check,"saved_tree":after_check,"task_complete":finished,"completed_task":if finished {state.completed_tasks.last()} else {None},"action_recovery_interventions":session.action_watch.interventions,"last_checks_passed_ref":state.last_checks_passed_ref}),
+            &json!({"commit":state.working_ref,"changed":changed,"checks_passed":passed,"checked_tree":before_check,"saved_tree":after_check,"task_complete":finished,"completed_task":if finished {state.completed_tasks.last()} else {None},"action_recovery_interventions":session.action_watch.interventions,"command_diagnostics":session.command_watch.diagnoses,"last_checks_passed_ref":state.last_checks_passed_ref}),
         )?;
         session.messages.push(json!({"role":"user","content":json!({"checkpoint":state.working_ref,"task_complete":finished,"feedback":feedback,"instruction":"This checkpoint is saved, including unfinished changes. Continue from these files. If checks failed, inspect and repair the actual failure; do not recreate the feature from scratch. If the task is complete, select the next useful improvement toward the main goal."}).to_string()}));
         save_conversation(&c, &session)?;
@@ -1343,5 +1482,65 @@ mod conversation_tests {
         assert!(messages[2]["content"].as_str().unwrap().contains("unknown"));
         repair_pending_tools(&mut messages);
         assert_eq!(messages.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod stall_replay_tests {
+    use super::*;
+    #[test]
+    #[ignore = "Live read-only diagnostic replay; set CHUGGIN_DIAGNOSTIC_CONFIG, CHUGGIN_DIAGNOSTIC_INPUT and CHUGGIN_DIAGNOSTIC_OUTPUT"]
+    fn live_stall_diagnostic_replay() {
+        let c = load(Path::new(
+            &std::env::var("CHUGGIN_DIAGNOSTIC_CONFIG").unwrap(),
+        ))
+        .unwrap();
+        let input: Value = serde_json::from_slice(
+            &fs::read(std::env::var("CHUGGIN_DIAGNOSTIC_INPUT").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let art = PathBuf::from(std::env::var("CHUGGIN_DIAGNOSTIC_OUTPUT").unwrap());
+        fs::create_dir_all(&art).unwrap();
+        // Read existing state directly: never prepare/migrate/lock or save this project.
+        let s: State =
+            serde_json::from_slice(&fs::read(c.state_dir.join("state.json")).unwrap()).unwrap();
+        let session: Conversation =
+            serde_json::from_slice(&fs::read(c.state_dir.join("conversation.json")).unwrap())
+                .unwrap();
+        let source_art = c.state_dir.join(format!("cycle-{:06}", s.cycle));
+        let m = Model::new(
+            &c.ollama_url,
+            &c.model,
+            c.context_tokens,
+            2048,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        // No project-settings path: provider retries cannot write into the source project.
+        m.trace_to(&art);
+        let mut research = crate::web_tools::Research::default();
+        let report =
+            crate::stall_diagnostic::diagnose(&m, input, &art, 1, |name, args| match name {
+                "read_command_log" => {
+                    Ok(crate::dev_tools::read_log(&source_art, args)?.to_string())
+                }
+                "read_progress_note" => Ok(session
+                    .note
+                    .page(args["offset"].as_u64().unwrap_or(0) as usize)?
+                    .to_string()),
+                _ => inspect_tool(&s.working_workspace, name, args, &mut research),
+            })
+            .unwrap();
+        fs::write(
+            art.join("report.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        assert_eq!(
+            report.verdict,
+            crate::stall_diagnostic::Verdict::Stalled,
+            "The model did not recognize the recorded command loop"
+        );
     }
 }

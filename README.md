@@ -225,9 +225,44 @@ pattern persists, Chuggin archives the conversation and resumes with the goal,
 current task, completed-task information, notes, and check feedback, excluding
 the repetitive history. It neither pauses the run nor rolls back files.
 Distinct investigative reads and changed results are allowed. Commands reset this
-detector because identical output does not establish identical side effects.
+exact-action detector because identical output does not establish identical side effects.
 Recovery events appear in live output and `action-recovery-N.json` cycle artifacts;
 the detector's observations and cumulative intervention count persist in the conversation.
+
+Version 0.7.1 adds a separate **command repetition assessment**. It tracks model-issued
+commands, configured-check requests, and compiler diagnostics against the observed
+project files, task ID, and outcome status. Eight repeated executions with unchanged
+observed files produce a brief question about what another execution should establish.
+After sixteen, a fresh conversation with the selected model assesses the evidence.
+These are assessment thresholds, not command limits: commands are not blocked or
+silently replaced with cached results. Checks run by Chuggin at cycle boundaries
+do not count toward this detector.
+
+The diagnostic runs sequentially and can read files, inspect the inventory, search,
+and retrieve command logs or progress notes. It cannot execute commands, edit files,
+complete tasks, or reject checkpoints. It sees the goal, active task, recent commands
+and inspections, project snapshot, and check feedback instead of the entire repetitive
+conversation. It reports **productive**, **stalled**, or **uncertain**, with a reason,
+next action, and expected new evidence. Its opinion is advisory. For a reported stall,
+Chuggin archives the repetitive conversation and resumes from saved work with that
+advice. Productive or uncertain assessments keep the main conversation intact.
+An inconclusive or failed assessment also returns to normal work; it does not pause
+the project. Provider waits retain the existing backoff and stop/timer behavior.
+
+Each assessment has up to five inspection rounds followed by a final reporting round,
+up to eight read-only tool requests per reply, and at most 2,048 output tokens per
+response. Existing transport/provider retries still apply. Continued repetition is reassessed
+after another sixteen executions, or sixty-four when judged productive. Changed
+project files, task identity, command arguments, or outcome status reset the streak.
+Optional `run_command.reason` explains deliberate trials or polling. Identical files
+and exit codes alone cannot establish unchanged external state or ignored artifacts;
+the diagnostic must consider that uncertainty. It can still make mistakes.
+
+Successful repeated command output gets a shorter, explicitly labeled excerpt with
+the full log ID. Full output remains on disk and retrievable. **Diagnose** appears
+in the observation view, and `command-repetition-*` and `command-diagnostic-*` cycle
+artifacts record the evidence, read-only actions, report, or failure. Recovery state
+survives cycles and restarts. Healthy runs do not pay for a diagnostic on every cycle.
 
 ## Execution, compiler diagnostics, and symbols
 

@@ -2549,3 +2549,259 @@ fn schema_two_upgrade_preserves_active_task_and_original_state() {
         bytes
     );
 }
+
+fn diagnostic_reply(verdict: &str) -> Value {
+    json!([{"function":{"name":"report_diagnosis","arguments":{
+        "verdict":verdict,"reason":"Inspected the current task and recorded command evidence.",
+        "next_action":"Inspect the remaining task criteria and update the project only if needed.",
+        "expected_new_evidence":"Whether the current artifact satisfies the outstanding requirement."
+    }}}])
+}
+fn is_diagnostic(body: &Value) -> bool {
+    body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["function"]["name"] == "report_diagnosis")
+}
+
+#[test]
+fn command_stall_survives_restart_and_recovers_with_read_only_diagnosis() {
+    let mut work = 0;
+    let mut diagnostics = 0;
+    let output = "stable evidence\n".repeat(180);
+    let server = Server::custom(false, false, None, move |body, _| {
+        if is_diagnostic(body) {
+            assert_eq!(body["options"]["num_predict"], 2048);
+            assert!(
+                !body["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["function"]["name"] == "run_command")
+            );
+            diagnostics += 1;
+            if diagnostics == 1 {
+                assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+                assert!(
+                    !body["messages"]
+                        .to_string()
+                        .contains("OUTDATED_OTHER_TASK_NOTE")
+                );
+                return (
+                    String::new(),
+                    json!([
+                        {"function":{"name":"read_file","arguments":{"path":"value.txt"}}},
+                        {"function":{"name":"run_command","arguments":{"argv":["touch","diagnostic-must-not-execute"]}}}
+                    ]),
+                );
+            }
+            assert!(
+                body["messages"]
+                    .to_string()
+                    .contains("no action was executed")
+            );
+            if diagnostics < 6 {
+                return (
+                    String::new(),
+                    json!([{"function":{"name":"read_file","arguments":{"path":"value.txt"}}}]),
+                );
+            }
+            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+            return (String::new(), diagnostic_reply("stalled"));
+        }
+        assert_eq!(body["options"]["num_predict"], 4096);
+        let n = work;
+        work += 1;
+        if n == 16 {
+            assert!(body["messages"].to_string().contains("command_diagnostic"));
+            assert!(body["messages"].as_array().unwrap().len() < 10);
+            return (
+                String::new(),
+                json!([
+                    {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"refined"}}},
+                    {"function":{"name":"finish_task","arguments":{"summary":"Refined after assessment","task_id":1}}}
+                ]),
+            );
+        }
+        let mut calls = vec![];
+        if n == 0 {
+            calls.push(json!({"function":{"name":"save_progress_note","arguments":{"note":"OUTDATED_OTHER_TASK_NOTE"}}}));
+            calls.push(task_tool("Inspect and refine"));
+        }
+        calls.push(
+            json!({"function":{"name":"run_command","arguments":{"argv":["printf","%s",output]}}}),
+        );
+        (String::new(), json!(calls))
+    });
+    let root = tempfile::tempdir().unwrap();
+    let config = fixture(root.path(), &server.url, true);
+    let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    settings["implementation_calls"] = json!(8);
+    fs::write(config, settings.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    run_cycles(root.path(), 1);
+    let session: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
+            .unwrap();
+    assert_eq!(session["command_watch"]["count"], 16);
+    assert_eq!(session["command_watch"]["pending_diagnosis"], true);
+    run_cycles(root.path(), 1);
+    let s = state(root.path());
+    let workspace = Path::new(s["working_workspace"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(workspace.join("value.txt")).unwrap(),
+        "refined"
+    );
+    assert!(!workspace.join("diagnostic-must-not-execute").exists());
+    assert_eq!(s["completed_tasks"][0]["id"], 1);
+    let art = root.path().join("state/cycle-000003");
+    assert!(art.join("command-diagnostic-1-report.json").exists());
+    assert!(fs::read_dir(art).unwrap().flatten().any(|e| {
+        e.file_name()
+            .to_string_lossy()
+            .starts_with("conversation-before-refresh")
+    }));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 23);
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("output_compacted")
+    );
+    let full: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000001/tool-1-0.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(full["result"]["output_tail"].as_str().unwrap().len() > 1200);
+}
+
+#[test]
+fn legitimate_repeated_commands_keep_the_conversation_and_continue() {
+    let mut work = 0;
+    let server = Server::custom(false, false, None, move |body, _| {
+        if is_diagnostic(body) {
+            return (String::new(), diagnostic_reply("productive"));
+        }
+        let n = work;
+        work += 1;
+        if n == 24 {
+            assert!(
+                body["messages"]
+                    .to_string()
+                    .contains("PURPOSEFUL_REPETITION")
+            );
+            return (
+                String::new(),
+                json!([{"function":{"name":"finish_task","arguments":{"summary":"Collected all observations"}}}]),
+            );
+        }
+        let mut calls = vec![];
+        if n == 0 {
+            calls.push(task_tool("Repeat observation 24 times"));
+        }
+        calls.push(json!({"function":{"name":"run_command","arguments":{"argv":["printf","observation"],"reason":"Collect the requested repeated observations"}}}));
+        (
+            if n == 0 {
+                "PURPOSEFUL_REPETITION".into()
+            } else {
+                String::new()
+            },
+            json!(calls),
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    let config = fixture(root.path(), &server.url, true);
+    let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    settings["implementation_calls"] = json!(32);
+    settings["goal"] = json!("Repeat the observation 24 times and record the outcome.");
+    fs::write(config, settings.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    assert!(state(root.path())["current_task"].is_null());
+    assert_eq!(server.requests.lock().unwrap().len(), 26);
+    let art = root.path().join("state/cycle-000001");
+    assert!(!fs::read_dir(&art).unwrap().flatten().any(|e| {
+        e.file_name()
+            .to_string_lossy()
+            .starts_with("conversation-before-refresh")
+    }));
+    assert!(art.join("command-23-0.log").exists());
+}
+
+#[test]
+fn commands_that_change_project_files_do_not_trigger_stall_diagnosis() {
+    let mut work = 0;
+    let server = Server::custom(false, false, None, move |body, _| {
+        assert!(!is_diagnostic(body));
+        let n = work;
+        work += 1;
+        if n == 20 {
+            return (
+                String::new(),
+                json!([{"function":{"name":"finish_task","arguments":{"summary":"Recorded measurements"}}}]),
+            );
+        }
+        let mut calls = vec![];
+        if n == 0 {
+            calls.push(task_tool("Collect measurements"));
+        }
+        calls.push(json!({"function":{"name":"run_command","arguments":{"argv":["sh","-c","printf x >> value.txt"]}}}));
+        (String::new(), json!(calls))
+    });
+    let root = tempfile::tempdir().unwrap();
+    let config = fixture(root.path(), &server.url, true);
+    let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    settings["implementation_calls"] = json!(24);
+    fs::write(config, settings.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    let s = state(root.path());
+    assert!(s["current_task"].is_null());
+    assert!(
+        fs::read_to_string(Path::new(s["working_workspace"].as_str().unwrap()).join("value.txt"))
+            .unwrap()
+            .ends_with(&"x".repeat(20))
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 21);
+}
+
+#[test]
+fn unavailable_diagnostic_is_bounded_and_does_not_stop_project_work() {
+    let mut work = 0;
+    let server = Server::custom(false, false, None, move |body, _| {
+        if is_diagnostic(body) {
+            return ("I need to think more.".into(), json!([]));
+        }
+        let n = work;
+        work += 1;
+        if n == 16 {
+            assert!(
+                body["messages"]
+                    .to_string()
+                    .contains("command_diagnostic_error")
+            );
+            return (
+                String::new(),
+                json!([{"function":{"name":"finish_task","arguments":{"summary":"Inspected the evidence and finished"}}}]),
+            );
+        }
+        let mut calls = vec![];
+        if n == 0 {
+            calls.push(task_tool("Inspect evidence"));
+        }
+        calls.push(json!({"function":{"name":"run_command","arguments":{"argv":["true"]}}}));
+        (String::new(), json!(calls))
+    });
+    let root = tempfile::tempdir().unwrap();
+    let config = fixture(root.path(), &server.url, true);
+    let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    settings["implementation_calls"] = json!(24);
+    fs::write(config, settings.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    assert!(state(root.path())["current_task"].is_null());
+    assert_eq!(server.requests.lock().unwrap().len(), 23);
+    assert!(
+        root.path()
+            .join("state/cycle-000001/command-diagnostic-1-error.json")
+            .exists()
+    );
+}

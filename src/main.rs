@@ -1,5 +1,6 @@
 mod action_watch;
 mod code_index;
+mod command_watch;
 mod dev_tools;
 mod events;
 mod menu;
@@ -10,6 +11,7 @@ mod provider;
 mod repetition;
 mod runner;
 mod setup;
+mod stall_diagnostic;
 mod symbols;
 mod ui;
 mod web_tools;
