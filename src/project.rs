@@ -60,20 +60,29 @@ pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 pub fn read(root: &Path, path: &str) -> Result<String> {
     let p = safe_path(root, path)?;
-    anyhow::ensure!(
-        fs::metadata(&p)?.len() <= 100_000,
-        "File exceeds 100KB; narrow the task"
-    );
     Ok(fs::read_to_string(p)?)
 }
-pub fn write(root: &Path, path: &str, content: &str) -> Result<()> {
-    anyhow::ensure!(content.len() <= 100_000, "Write exceeds 100KB");
+pub fn write(root: &Path, path: &str, content: &str) -> Result<bool> {
+    use std::io::Write;
     let p = safe_path(root, path)?;
+    match fs::read(&p) {
+        Ok(previous) if previous == content.as_bytes() => return Ok(false),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(p, content)?;
-    Ok(())
+    let mut temp =
+        tempfile::NamedTempFile::new_in(p.parent().context("Missing parent directory")?)?;
+    if let Ok(metadata) = fs::metadata(&p) {
+        temp.as_file().set_permissions(metadata.permissions())?;
+    }
+    temp.write_all(content.as_bytes())?;
+    temp.as_file().sync_all()?;
+    temp.persist(&p)?;
+    Ok(true)
 }
 pub fn inventory(root: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
@@ -228,46 +237,194 @@ mod tests {
 }
 
 pub fn read_lines(root: &Path, path: &str, start: usize, count: usize) -> Result<String> {
+    use std::io::BufRead;
     anyhow::ensure!(
         start > 0 && count > 0,
         "start_line and line_count must be positive"
     );
-    let text = read(root, path)?;
-    let lines: Vec<_> = text.lines().collect();
-    let end = start
-        .saturating_sub(1)
-        .saturating_add(count.min(120))
-        .min(lines.len());
-    let mut out = format!(
-        "{path}: {} lines total; showing from line {start}\n",
-        lines.len()
-    );
-    for (i, line) in lines.iter().enumerate().take(end).skip(start - 1) {
-        if out.len() + line.len() > 10000 {
-            out.push_str(&format!("\nContinue with start_line={}", i + 1));
-            return Ok(out);
+    let mut reader = std::io::BufReader::new(fs::File::open(safe_path(root, path)?)?);
+    let mut line = String::new();
+    let mut total = 0;
+    let mut byte_offset = 0;
+    let mut shown = String::new();
+    let mut continuation = None;
+    let end = start.saturating_add(count.min(120));
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
         }
-        out.push_str(&format!("{}: {line}\n", i + 1));
+        total += 1;
+        if total >= start && continuation.is_none() {
+            if total >= end || (!shown.is_empty() && shown.len() + line.len() > 9000) {
+                continuation = Some(format!("Continue with start_line={total}"));
+            } else if line.len() > 9000 {
+                let mut cut = 8000;
+                while !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                shown.push_str(&format!("{total}: {}\n", &line[..cut]));
+                continuation = Some(format!(
+                    "Long line continues: call read_file with byte_offset={} for exact text chunks",
+                    byte_offset + cut
+                ));
+            } else {
+                shown.push_str(&format!(
+                    "{total}: {}\n",
+                    line.trim_end_matches(['\r', '\n'])
+                ));
+            }
+        }
+        byte_offset += bytes;
     }
-    if end < lines.len() {
-        out.push_str(&format!("Continue with start_line={}", end + 1));
+    let mut out = format!("{path}: {total} lines total; showing from line {start}\n{shown}");
+    if let Some(continuation) = continuation {
+        out.push_str(&continuation);
     }
     Ok(out)
+}
+pub fn read_bytes(root: &Path, path: &str, offset: u64) -> Result<serde_json::Value> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(safe_path(root, path)?)?;
+    let total = file.metadata()?.len();
+    anyhow::ensure!(offset <= total, "byte_offset exceeds file size");
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.take(9000).read_to_end(&mut bytes)?;
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(e) if e.error_len().is_none() => std::str::from_utf8(&bytes[..e.valid_up_to()])?,
+        Err(e) => {
+            return Err(e)
+                .context("Use the next_byte_offset returned by read_file; file must be UTF-8");
+        }
+    };
+    let next = offset + text.len() as u64;
+    anyhow::ensure!(
+        next > offset || offset == total,
+        "File contains incomplete UTF-8"
+    );
+    Ok(
+        serde_json::json!({"path":path,"text":text,"byte_offset":offset,"total_bytes":total,"next_byte_offset":if next<total{Some(next)}else{None}}),
+    )
 }
 pub fn edit(root: &Path, path: &str, old: &str, new: &str) -> Result<String> {
     anyhow::ensure!(!old.is_empty(), "old_text must not be empty");
     let text = read(root, path)?;
+    let matches = text.matches(old).count();
     anyhow::ensure!(
-        text.matches(old).count() == 1,
-        "old_text must match exactly once; read the relevant lines first"
+        matches == 1,
+        "old_text matched {matches} locations; expected exactly one. Read the current text and include enough surrounding context to identify a unique match."
     );
-    write(root, path, &text.replacen(old, new, 1))?;
-    Ok(format!("Edited {path}"))
+    let line = text[..text.find(old).context("Missing match")?]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count()
+        + 1;
+    let changed = write(root, path, &text.replacen(old, new, 1))?;
+    Ok(serde_json::json!({"path":path,"changed":changed,"line":line,"message":if changed {"Replacement applied"} else {"No bytes changed: old_text and new_text are identical. Inspect the result or choose a different action."}}).to_string())
 }
 
 #[cfg(test)]
 mod editing_tests {
     use super::*;
+    #[test]
+    fn large_files_are_readable_and_edits_report_real_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = format!(
+            "{}unique target\n",
+            "padding padding padding\n".repeat(10000)
+        );
+        assert!(write(dir.path(), "large.txt", &content).unwrap());
+        let before = fs::metadata(dir.path().join("large.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(!write(dir.path(), "large.txt", &content).unwrap());
+        let noop: serde_json::Value = serde_json::from_str(
+            &edit(dir.path(), "large.txt", "unique target", "unique target").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(noop["changed"], false);
+        assert_eq!(
+            fs::metadata(dir.path().join("large.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before
+        );
+        assert!(
+            read_lines(dir.path(), "large.txt", 10001, 1)
+                .unwrap()
+                .contains("10001: unique target")
+        );
+        let changed: serde_json::Value = serde_json::from_str(
+            &edit(dir.path(), "large.txt", "unique target", "actual change").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(changed["changed"], true);
+        assert_eq!(changed["line"], 10001);
+        assert!(
+            read(dir.path(), "large.txt")
+                .unwrap()
+                .ends_with("actual change\n")
+        );
+        assert!(
+            edit(dir.path(), "large.txt", "absent", "new")
+                .unwrap_err()
+                .to_string()
+                .contains("0 locations")
+        );
+        assert!(
+            edit(dir.path(), "large.txt", "padding", "new")
+                .unwrap_err()
+                .to_string()
+                .contains("30000 locations")
+        );
+    }
+
+    #[test]
+    fn long_unicode_lines_have_lossless_byte_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "界\"".repeat(10000);
+        write(dir.path(), "long.txt", &content).unwrap();
+        assert!(
+            read_lines(dir.path(), "long.txt", 1, 80)
+                .unwrap()
+                .contains("byte_offset=")
+        );
+        let mut offset = 0;
+        let mut restored = String::new();
+        loop {
+            let page = read_bytes(dir.path(), "long.txt", offset).unwrap();
+            restored.push_str(page["text"].as_str().unwrap());
+            let Some(next) = page["next_byte_offset"].as_u64() else {
+                break;
+            };
+            offset = next;
+        }
+        assert_eq!(restored, content);
+        assert!(read_bytes(dir.path(), "long.txt", 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_edits_preserve_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "script", "before").unwrap();
+        fs::set_permissions(dir.path().join("script"), fs::Permissions::from_mode(0o755)).unwrap();
+        edit(dir.path(), "script", "before", "after").unwrap();
+        assert_eq!(
+            fs::metadata(dir.path().join("script"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
     #[test]
     fn reads_can_continue_past_the_first_page() {
         let dir = tempfile::tempdir().unwrap();

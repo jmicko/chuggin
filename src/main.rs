@@ -1,3 +1,4 @@
+mod action_watch;
 mod code_index;
 mod dev_tools;
 mod events;

@@ -139,6 +139,10 @@ files. These are planning hints, not file allowlists or rigid acceptance rules.
 `finish_task` expresses completion intent. Chuggin marks the task complete only
 when the configured checks pass; failures are appended to the conversation and
 the task remains unfinished for repair. **Every result still preserves the files.**
+Tasks have persistent IDs and completed-task records. Completion is tied to the
+active task; repeating an old completion does not end another work interval.
+The agent receives guidance to select useful next work. Research and other tasks
+can complete without file edits; backend, document, and non-code work are valid.
 There is no mandatory separate planning agent or reviewer, and no review veto.
 An ordinary prose response can end a work interval without marking the task done.
 
@@ -155,8 +159,8 @@ needs to be undone, the agent can make a targeted correction or explicitly use
 the current work in Git, then restores the requested project files. It does not
 erase the prior history or automatically certify the restored files.
 
-Conversation recovery happens for reported context pressure or repeated request
-failures, not simply because a task or cycle ended or a text-size estimate was
+Conversation recovery happens for reported context pressure, repeated request
+failures, or sustained repeated tool actions, not simply because a task or cycle ended or a text-size estimate was
 exceeded. Before a handoff, Chuggin archives the full conversation. It preserves
 the stable instructions and goal, then supplies the current task, checkpoint,
 progress notes, and latest feedback. A token-pressure handoff also retains recent
@@ -165,10 +169,12 @@ and never resets project files. The interface distinguishes checkpoints,
 unresolved failures, and the last revision whose configured checks passed.
 A passing check is evidence about that check, not proof of project completeness.
 
-The agent can use `save_progress_note` for a short factual handoff: what changed,
+The agent can use `save_progress_note` for a factual handoff: what changed,
 what it checked, outstanding problems, and a useful next action. Recent actions
 and failures are recorded too. These notes work with any language or artifact
 format and remain advisory; current files and observed validation take precedence.
+Notes are stored in full, with replacement or append support. Handoffs include a
+6KB excerpt; `read_progress_note` retrieves the full note through byte pagination.
 
 ## Tools and recovery
 
@@ -184,6 +190,10 @@ consistency checkers, or custom scripts. A validation command is still required.
 The model can list files, search literal text, read numbered line ranges, replace
 a file, make an exact targeted edit, and run configured checks. Long reads include
 continuation positions. Unique-match edits prevent accidental broad replacement.
+File size alone does not block reads or edits. Very long lines can be retrieved
+exactly using `read_file` byte pagination. Edits and writes replace files atomically,
+preserve existing permissions, and report `changed: false` if the bytes are identical.
+Structured tool results expose fields directly instead of nesting escaped JSON.
 Edits can address any relevant project file, including supporting work omitted from
 the original plan. Chuggin configuration, runtime state, and Git control files remain
 protected.
@@ -208,11 +218,24 @@ responses are regenerated whole. Generation-limit interruptions also request a
 shorter complete response. Each failure and continuation request is logged.
 Goal-drafting failures preserve the pitch and offer Retry, Settings, or Back.
 
+A separate action detector catches repetition across responses and restarts:
+identical no-op edits, reads, searches, and invalid completions. Four repetitions
+of the same action or a short repeating sequence trigger feedback. If that same
+pattern persists, Chuggin archives the conversation and resumes with the goal,
+current task, completed-task information, notes, and check feedback, excluding
+the repetitive history. It neither pauses the run nor rolls back files.
+Distinct investigative reads and changed results are allowed. Commands reset this
+detector because identical output does not establish identical side effects.
+Recovery events appear in live output and `action-recovery-N.json` cycle artifacts;
+the detector's observations and cumulative intervention count persist in the conversation.
+
 ## Execution, compiler diagnostics, and symbols
 
 The working agent can use **run_command** with an executable and argument array,
 for example `["cargo", "test", "unicode"]` or `["cargo", "fmt"]`. Commands run
 in the persistent workspace, with no implicit shell and no interactive stdin.
+If the model supplies a valid JSON-encoded argument array, Chuggin decodes it and
+reports `arguments_normalized: true`. Arbitrary command strings are not interpreted.
 The default timeout is 120 seconds; a call can select 1–600 seconds. Chuggin
 returns the exit code, timeout status, a bounded output tail, and a log ID.
 **read_command_log** retrieves the full log in chunks, including logs from earlier
@@ -313,7 +336,8 @@ time waiting counts toward the run duration. Each provider failure and chosen
 retry delay is recorded in the cycle's `provider-error-NNN.json` files.
 
 `.chuggin/state.json` records `working_ref`, `working_branch`, `working_workspace`,
-`last_checks_passed_ref`, the current task, feedback, and recent outcomes.
+`last_checks_passed_ref`, the current task and ID, the latest 32 completed tasks,
+feedback, and recent outcomes. Full completion evidence remains in cycle artifacts.
 New projects use `.chuggin/working` on a `codex/chuggin-working-...` branch.
 The initial worktree includes the original checkout's current project files,
 including uncommitted edits, deletions, and untracked files that Git does not ignore.
@@ -321,6 +345,11 @@ The original checkout is not overwritten or automatically merged. The persistent
 worktree is the developing project; checkpoint commits can contain failing or
 unfinished work. `.chuggin/conversation.json` preserves the working conversation
 across tasks, cycles, and restarts.
+
+Version 0.7 upgrades project state to schema 3 on resume, preserving existing work
+and the active task and saving the previous state as `state-before-v3.json`.
+Older binaries cannot resume the upgraded state. Prompt and tool updates apply
+once at run startup; they do not replace a healthy conversation on every request.
 
 Existing projects adopt their latest compatible candidate with actual changes,
 skipping newer attempts that stopped before editing. They adopt that work in place and

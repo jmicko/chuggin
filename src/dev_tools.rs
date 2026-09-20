@@ -18,8 +18,16 @@ pub fn schemas() -> Vec<Value> {
     ]
 }
 pub fn run(root: &Path, art: &Path, id: &str, args: &Value, stop: &AtomicBool) -> Result<Value> {
+    // Some models encode the array twice. Decode only valid JSON, never shell text.
+    let normalized = args["argv"].is_string();
+    let raw = if let Some(text) = args["argv"].as_str() {
+        serde_json::from_str(text)
+            .context("argv must be a JSON array of strings, not a shell command")?
+    } else {
+        args["argv"].clone()
+    };
     let argv: Vec<String> =
-        serde_json::from_value(args["argv"].clone()).context("argv must be an array of strings")?;
+        serde_json::from_value(raw).context("argv must be an array of strings")?;
     anyhow::ensure!(
         !argv.is_empty() && !argv[0].is_empty() && argv.len() <= 128,
         "Supply an executable and at most 127 arguments"
@@ -53,7 +61,7 @@ pub fn run(root: &Path, art: &Path, id: &str, args: &Value, stop: &AtomicBool) -
     let bytes = fs::metadata(log)?.len();
     let log_id = qualified_log_id(art, &filename);
     Ok(
-        json!({"exit_code":result.exit_code,"passed":result.passed,"timed_out":result.timed_out,"output_tail":output_tail(&result.output,7000),"log_id":log_id,"log_bytes":bytes,"instruction":"Use read_command_log for full output. A successful command does not replace configured final checks."}),
+        json!({"exit_code":result.exit_code,"passed":result.passed,"timed_out":result.timed_out,"output_tail":output_tail(&result.output,7000),"log_id":log_id,"log_bytes":bytes,"arguments_normalized":normalized,"instruction":"Use read_command_log for full output. A successful command does not replace configured final checks."}),
     )
 }
 fn output_tail(text: &str, limit: usize) -> &str {
@@ -238,6 +246,41 @@ fn summarize(root: &Path, raw: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn json_encoded_argv_is_normalized_without_shell_interpretation() {
+        let root = tempfile::tempdir().unwrap();
+        let art = tempfile::tempdir().unwrap();
+        let stop = AtomicBool::new(false);
+        let argv = json!(["printf", "%s", "$(touch unexpected) ; | >"]);
+        let result = run(
+            root.path(),
+            art.path(),
+            "normalized",
+            &json!({"argv":argv.to_string()}),
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(result["arguments_normalized"], true);
+        assert_eq!(result["output_tail"], "$(touch unexpected) ; | >");
+        assert!(!root.path().join("unexpected").exists());
+        for invalid in [
+            "touch unexpected",
+            "[\"echo\", 4]",
+            "{\"command\":\"echo\"}",
+        ] {
+            assert!(
+                run(
+                    root.path(),
+                    art.path(),
+                    "invalid",
+                    &json!({"argv":invalid}),
+                    &stop
+                )
+                .is_err()
+            );
+        }
+        assert!(!art.path().join("command-invalid.log").exists());
+    }
     #[test]
     fn execution_preserves_arguments_exit_status_and_log_continuation() {
         let root = tempfile::tempdir().unwrap();

@@ -53,6 +53,8 @@ struct State {
     working_workspace: PathBuf,
     last_checks_passed_ref: Option<String>,
     current_task: Option<Task>,
+    task_serial: u64,
+    completed_tasks: Vec<CompletedTask>,
     feedback: String,
     seed_from_repo: bool,
     recent: Vec<Outcome>,
@@ -65,7 +67,7 @@ struct Outcome {
     evidence: String,
     artifact_dir: PathBuf,
 }
-#[derive(Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 struct Task {
     title: String,
     #[serde(default)]
@@ -77,6 +79,13 @@ struct Task {
     #[serde(default)]
     out_of_scope: Vec<String>,
 }
+#[derive(Serialize, Deserialize)]
+struct CompletedTask {
+    id: u64,
+    title: String,
+    summary: String,
+    checkpoint: String,
+}
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Conversation {
@@ -85,6 +94,8 @@ struct Conversation {
     note: RepairNote,
     context_pressure: bool,
     response_errors: u32,
+    prompt_version: String,
+    action_watch: crate::action_watch::ActionWatch,
 }
 
 /// Compact evidence accompanies the transcript and survives conversation handoffs.
@@ -106,12 +117,25 @@ impl RepairNote {
         }
     }
     fn set_note(&mut self, note: &str) -> Result<()> {
-        anyhow::ensure!(
-            note.len() <= 1600,
-            "Keep the progress note within 1600 bytes"
-        );
         self.model_note = note.trim().into();
         Ok(())
+    }
+    fn context(&self) -> Value {
+        json!({"model_note_excerpt":project::excerpt(&self.model_note,6000),"model_note_bytes":self.model_note.len(),"instruction":"Use read_progress_note to retrieve the complete note. Notes and past failures may be stale; verify against current files.","recent_actions":self.recent_actions,"last_observed_failure":self.last_failure})
+    }
+    fn page(&self, offset: usize) -> Result<Value> {
+        let text = &self.model_note;
+        anyhow::ensure!(
+            offset <= text.len() && text.is_char_boundary(offset),
+            "offset must be a UTF-8 byte boundary within the note; use next_offset from the previous page"
+        );
+        let mut end = offset.saturating_add(6000).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        Ok(
+            json!({"text":&text[offset..end],"offset":offset,"total_bytes":text.len(),"next_offset":if end < text.len() {Some(end)} else {None}}),
+        )
     }
 }
 
@@ -142,11 +166,23 @@ mod repair_note_tests {
     }
 
     #[test]
-    fn notes_are_replaced_bounded_and_clearable() {
+    fn notes_are_preserved_paginated_and_clearable() {
         let mut note = RepairNote::default();
         note.set_note("Previous observation").unwrap();
-        assert!(note.set_note(&"x".repeat(1601)).is_err());
-        assert_eq!(note.model_note, "Previous observation");
+        let long = "界".repeat(5000);
+        note.set_note(&long).unwrap();
+        let mut restored = String::new();
+        let mut offset = 0;
+        loop {
+            let page = note.page(offset).unwrap();
+            restored.push_str(page["text"].as_str().unwrap());
+            let Some(next) = page["next_offset"].as_u64() else {
+                break;
+            };
+            offset = next as usize;
+        }
+        assert_eq!(restored, long);
+        assert!(note.context().to_string().len() < long.len());
         note.set_note("New observation").unwrap();
         note.record("check", &"界".repeat(2000), true);
         assert!(note.last_failure.len() < 750);
@@ -443,7 +479,7 @@ fn prepare_state(c: &Config) -> Result<State> {
         let bytes = fs::read(&path)?;
         let mut s: State = serde_json::from_slice(&bytes)?;
         anyhow::ensure!(
-            s.schema_version <= 2,
+            s.schema_version <= 3,
             "This state needs a newer Chuggin version"
         );
         anyhow::ensure!(
@@ -540,6 +576,17 @@ fn prepare_state(c: &Config) -> Result<State> {
         }
         // HEAD may have advanced just before an interrupted state save.
         s.working_ref = project::git(&s.working_workspace, &["rev-parse", "HEAD"])?;
+        if s.schema_version < 3 {
+            let backup = c.state_dir.join("state-before-v3.json");
+            if !backup.exists() {
+                fs::write(backup, &bytes)?;
+            }
+            if s.current_task.is_some() {
+                s.task_serial = s.task_serial.max(1);
+            }
+            s.schema_version = 3;
+            save(&path, &s)?;
+        }
         Ok(s)
     } else {
         let head = project::git(&c.repo, &["rev-parse", "HEAD"])
@@ -551,7 +598,7 @@ fn prepare_state(c: &Config) -> Result<State> {
         let (workspace, branch, seed) = create_workspace(c, &id, &head)?;
         let working_ref = project::git(&workspace, &["rev-parse", "HEAD"])?;
         let mut state = State {
-            schema_version: 2,
+            schema_version: 3,
             run_id: id,
             goal: c.goal.clone(),
             repo: fs::canonicalize(&c.repo)?,
@@ -632,6 +679,17 @@ fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
             json!({"role":"user","content":json!({"main_goal":c.goal,"workspace":s.working_workspace,"configured_checks":c.checks,"instruction":crate::prompts::ORIENT}).to_string()}),
         ];
     }
+    if session.prompt_version != crate::prompts::VERSION {
+        // Intentional upgrade once on resume; healthy requests retain a stable prefix.
+        if session
+            .messages
+            .first()
+            .is_some_and(|m| m["role"] == "system")
+        {
+            session.messages[0]["content"] = json!(crate::prompts::WORK);
+        }
+        session.prompt_version = crate::prompts::VERSION.into();
+    }
     // Schemas remain identical between calls. Intentional tool configuration changes
     // can update them once when a run starts.
     session.tools = crate::model::tools();
@@ -667,13 +725,17 @@ fn refresh_conversation(
     reason: &str,
     keep_recent: bool,
 ) -> Result<()> {
-    save(
-        &art.join(format!(
-            "conversation-before-refresh-{}.json",
-            session.messages.len()
-        )),
-        session,
-    )?;
+    // Several recoveries can have identical message counts in one cycle.
+    // Never overwrite the evidence of an earlier recovery.
+    let mut archive_index = 0;
+    let archive = loop {
+        let candidate = art.join(format!("conversation-before-refresh-{archive_index}.json"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        archive_index += 1;
+    };
+    save(&archive, session)?;
     let recent = if keep_recent {
         let minimum = session.messages.len().saturating_sub(12).max(2);
         session
@@ -688,7 +750,7 @@ fn refresh_conversation(
         Vec::new()
     };
     session.messages.truncate(2);
-    session.messages.push(json!({"role":"user","content":json!({"reason":reason,"current_task":s.current_task,"working_checkpoint":s.working_ref,"feedback":s.feedback,"progress_note":session.note,"instruction":"Earlier history was archived. Continue with the existing working files; inspect them as needed. Do not rebuild completed work."}).to_string()}));
+    session.messages.push(json!({"role":"user","content":json!({"reason":reason,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"working_checkpoint":s.working_ref,"feedback":s.feedback,"progress_note":session.note.context(),"instruction":"Earlier history was archived. Continue with existing files. Closed tasks remain closed. If there is no current task, use set_task to select useful work toward the main goal; do not report an old completion again. Research and foundational work are valid. Inspect files and evidence rather than repeating prior narration."}).to_string()}));
     session.messages.extend(recent);
     session.context_pressure = false;
     crate::events::log(format!(
@@ -713,6 +775,14 @@ fn inspect_tool(
     match name {
         "project_map" => Ok(crate::code_index::index(root)?.to_string()),
         "lookup_symbol" => Ok(crate::symbols::lookup(root, args)?.to_string()),
+        "read_file" if args.get("byte_offset").is_some() => Ok(project::read_bytes(
+            root,
+            args["path"].as_str().context("Missing path")?,
+            args["byte_offset"]
+                .as_u64()
+                .context("byte_offset must be nonnegative")?,
+        )?
+        .to_string()),
         "read_file" => project::read_lines(
             root,
             args["path"].as_str().context("Missing path")?,
@@ -749,7 +819,7 @@ fn inspect_tool(
     }
 }
 struct WorkResult {
-    finish_requested: bool,
+    finish_requested: Option<u64>,
     summary: String,
 }
 fn work(
@@ -761,13 +831,30 @@ fn work(
     stop: &AtomicBool,
 ) -> Result<WorkResult> {
     crate::events::send(crate::events::Event::Phase("Orient".into()));
-    session.messages.push(json!({"role":"user","content":json!({"cycle":s.cycle,"current_task":s.current_task,"previous_feedback":s.feedback,"working_checkpoint":s.working_ref,"instruction":"Continue this project from its current files and the conversation above. Address unresolved failures before expanding unrelated work. Use set_task to record or revise the next useful task. This cycle ends with a checkpoint; unfinished work is kept."}).to_string()}));
+    session.messages.push(json!({"role":"user","content":json!({"cycle":s.cycle,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"working_checkpoint":s.working_ref,"instruction":if s.current_task.is_some() {"Continue the active task from existing files and the latest check feedback. Investigate and repair unresolved failures. All work is retained."} else {"There is no active task. Previous completions are already saved. Inspect what is needed toward the main goal and use set_task for the next useful task, then work on it. Research and foundational work count; do not report an old task complete again."}}).to_string()}));
     save_conversation(c, session)?;
     let mut research = crate::web_tools::Research::default();
-    let mut finish_requested = false;
+    let mut finish_requested = None;
     let mut summary = String::new();
     for step in 0..c.implementation_calls {
         anyhow::ensure!(!stop.load(Ordering::SeqCst), "Stopped by operator");
+        if session.action_watch.pending_refresh {
+            session.note.recent_actions.clear();
+            refresh_conversation(
+                c,
+                s,
+                session,
+                art,
+                "Repeated identical tool actions continued after feedback; repetitive history was archived",
+                false,
+            )?;
+            session.action_watch.recovered();
+            save_conversation(c, session)?;
+        }
+        if session.action_watch.take_notice() {
+            session.messages.push(json!({"role":"user","content":"Action-loop recovery: identical tool actions and results repeated without new evidence. Choose a different diagnostic or approach. If no task is active, select new work instead of repeating an old completion. Existing files and results remain available."}));
+            save_conversation(c, session)?;
+        }
         if session.context_pressure {
             refresh_conversation(
                 c,
@@ -844,25 +931,50 @@ fn work(
                 "set_task" => {
                     let task: Task = serde_json::from_value(args.clone())?;
                     anyhow::ensure!(!task.title.trim().is_empty(), "Task needs a title");
-                    s.current_task = Some(task);
-                    finish_requested = false;
+                    if s.current_task.as_ref() != Some(&task) {
+                        s.task_serial += 1;
+                        s.current_task = Some(task);
+                    }
+                    finish_requested = None;
                     emit(art, "task", s.current_task.as_ref().unwrap())?;
                     save(&c.state_dir.join("state.json"), s)?;
-                    Ok("Task recorded. All existing working files remain available; these paths and criteria are planning notes, not edit restrictions.".into())
+                    Ok(json!({"task_id":s.task_serial,"message":"Task recorded. Files and criteria are planning hints, not edit restrictions. Existing work is retained."}).to_string())
                 }
                 "finish_task" => {
+                    if s.current_task.is_none() {
+                        return Ok(json!({"completion_recorded":false,"last_completed_task":s.completed_tasks.last(),"message":"No task is active. Previous completions are already saved. Use set_task to select the next useful work toward the main goal; this call does not end the work interval."}).to_string());
+                    }
+                    if let Some(id) = args.get("task_id") {
+                        anyhow::ensure!(
+                            id.as_u64() == Some(s.task_serial),
+                            "Task id is not current. Inspect the current task before reporting completion."
+                        );
+                    }
                     summary = args["summary"]
                         .as_str()
                         .context("Missing summary")?
                         .to_owned();
-                    finish_requested = true;
+                    finish_requested = Some(s.task_serial);
                     Ok("Completion intent recorded. The harness will check and save this checkpoint, retaining any unresolved failures for continued repair.".into())
                 }
                 "save_progress_note" => {
-                    session
-                        .note
-                        .set_note(args["note"].as_str().context("Missing note")?)?;
-                    Ok("Progress note saved; verify against current files and checks.".into())
+                    let note = args["note"].as_str().context("Missing note")?;
+                    let note = if args["append"] == true {
+                        format!("{}\n{}", session.note.model_note, note)
+                    } else {
+                        note.to_owned()
+                    };
+                    session.note.set_note(&note)?;
+                    Ok("Complete progress note saved. Use read_progress_note to retrieve it; context handoffs carry an excerpt. Verify notes against current files and checks.".into())
+                }
+                "read_progress_note" => {
+                    let offset = match args.get("offset") {
+                        Some(v) => {
+                            usize::try_from(v.as_u64().context("offset must be nonnegative")?)?
+                        }
+                        None => 0,
+                    };
+                    Ok(session.note.page(offset)?.to_string())
                 }
                 "edit_file" => {
                     let path = args["path"].as_str().context("Missing path")?;
@@ -877,12 +989,12 @@ fn work(
                 "write_file" => {
                     let path = args["path"].as_str().context("Missing path")?;
                     file_target(&root, path)?;
-                    project::write(
+                    let changed = project::write(
                         &root,
                         path,
                         args["content"].as_str().context("Missing content")?,
                     )?;
-                    Ok(format!("Wrote {path}"))
+                    Ok(json!({"path":path,"changed":changed,"message":if changed {"File written"} else {"No bytes changed; the file already has this content."}}).to_string())
                 }
                 "run_checks" => {
                     crate::events::send(crate::events::Event::Phase("Check".into()));
@@ -943,7 +1055,21 @@ fn work(
                 _ => inspect_tool(&root, name, args, &mut research),
             })();
             let value = match result {
-                Ok(value) => json!({"ok":true,"result":project::excerpt(&value,12000)}),
+                Ok(value) => {
+                    let value = if name == "read_progress_note"
+                        || (name == "read_file" && args.get("byte_offset").is_some())
+                    {
+                        value
+                    } else {
+                        project::excerpt(&value, 12000)
+                    };
+                    // Keep typed results as objects rather than JSON inside a JSON string.
+                    let result = serde_json::from_str::<Value>(&value)
+                        .ok()
+                        .filter(|v| v.is_object() || v.is_array())
+                        .unwrap_or(Value::String(value));
+                    json!({"ok":true,"result":result})
+                }
                 Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
             };
             session
@@ -956,9 +1082,25 @@ fn work(
                 reply["tool_call_id"] = id.clone();
             }
             session.messages.push(reply);
+            if let Some(intervention) = session.action_watch.observe(name, args, &value) {
+                let reason = format!(
+                    "Repeated tool action: {name}. Identical actions and results have repeated without new evidence. Inspect a different relevant source, change the approach, or select new work if the previous task is closed. Files and completed actions are retained."
+                );
+                emit(
+                    art,
+                    &format!("action-recovery-{}", session.action_watch.interventions),
+                    &json!({"intervention":format!("{intervention:?}"),"tool":name,"reason":reason}),
+                )?;
+                crate::events::log(reason);
+            }
             save_conversation(c, session)?;
         }
-        if finish_requested {
+        // Append feedback only after every tool reply, preserving tool protocol order.
+        if !session.action_watch.pending_refresh && session.action_watch.take_notice() {
+            session.messages.push(json!({"role":"user","content":"Action-loop recovery: the same tool actions returned identical results repeatedly. No new information was obtained. Use a different diagnostic or approach; if no task is active, select new work with set_task. Do not repeat the same completion or no-op edit. Existing files and results remain available."}));
+            save_conversation(c, session)?;
+        }
+        if finish_requested.is_some() {
             break;
         }
     }
@@ -1085,9 +1227,25 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
             passed,
             checkpoint: Some(state.working_ref.clone()),
         });
-        let finished = result.as_ref().is_ok_and(|r| r.finish_requested) && passed;
+        let finished = result
+            .as_ref()
+            .is_ok_and(|r| r.finish_requested == Some(state.task_serial))
+            && state.current_task.is_some()
+            && passed;
         if finished {
-            state.current_task = None;
+            let task = state
+                .current_task
+                .take()
+                .expect("Active task checked above");
+            state.completed_tasks.push(CompletedTask {
+                id: state.task_serial,
+                title: task.title,
+                summary: project::excerpt(summary, 4000),
+                checkpoint: state.working_ref.clone(),
+            });
+            if state.completed_tasks.len() > 32 {
+                state.completed_tasks.remove(0);
+            }
         }
         let disposition = if !changed {
             "unchanged"
@@ -1117,7 +1275,7 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
         emit(
             &art,
             "checkpoint",
-            &json!({"commit":state.working_ref,"changed":changed,"checks_passed":passed,"checked_tree":before_check,"saved_tree":after_check,"task_complete":finished,"last_checks_passed_ref":state.last_checks_passed_ref}),
+            &json!({"commit":state.working_ref,"changed":changed,"checks_passed":passed,"checked_tree":before_check,"saved_tree":after_check,"task_complete":finished,"completed_task":if finished {state.completed_tasks.last()} else {None},"action_recovery_interventions":session.action_watch.interventions,"last_checks_passed_ref":state.last_checks_passed_ref}),
         )?;
         session.messages.push(json!({"role":"user","content":json!({"checkpoint":state.working_ref,"task_complete":finished,"feedback":feedback,"instruction":"This checkpoint is saved, including unfinished changes. Continue from these files. If checks failed, inspect and repair the actual failure; do not recreate the feature from scratch. If the task is complete, select the next useful improvement toward the main goal."}).to_string()}));
         save_conversation(&c, &session)?;

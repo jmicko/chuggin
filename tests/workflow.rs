@@ -299,7 +299,7 @@ fn checkpoints_advance_in_one_workspace_and_keep_the_user_checkout_isolated() {
     let first = state(root.path());
     run_cycles(root.path(), 1);
     let second = state(root.path());
-    assert_eq!(second["schema_version"], 2);
+    assert_eq!(second["schema_version"], 3);
     assert_eq!(first["working_workspace"], second["working_workspace"]);
     assert_ne!(first["working_ref"], second["working_ref"]);
     assert_eq!(second["last_checks_passed_ref"], second["working_ref"]);
@@ -609,7 +609,7 @@ fn legacy_migration_recovers_the_entire_interrupted_workspace_including_staged_c
     fs::write(art.join("task.json"), json!({"title":"Continue interrupted reorganization","objective":"Retain unfinished work","acceptance":["Files reorganized"],"files":["value.txt","renamed.txt","staged.txt"],"out_of_scope":[]}).to_string()).unwrap();
     run_cycles(root.path(), 1);
     let saved = state(root.path());
-    assert_eq!(saved["schema_version"], 2);
+    assert_eq!(saved["schema_version"], 3);
     assert_eq!(
         serde_json::from_slice::<Value>(&fs::read(state_dir.join("state-v1-backup.json")).unwrap())
             .unwrap(),
@@ -859,7 +859,7 @@ fn legacy_root_workspace_migrates_all_dirty_files_without_starting_a_cycle() {
     fs::write(state_dir.join("state.json"), legacy.to_string()).unwrap();
     run_cycles(root.path(), 0);
     assert_imported_dirty_checkout(root.path(), &original);
-    assert_eq!(state(root.path())["schema_version"], 2);
+    assert_eq!(state(root.path())["schema_version"], 3);
     assert_eq!(
         serde_json::from_slice::<Value>(&fs::read(state_dir.join("state-v1-backup.json")).unwrap())
             .unwrap(),
@@ -2152,7 +2152,12 @@ fn exercise_project_tools(failing: bool) {
     let log: Value =
         serde_json::from_slice(&fs::read(artifact.join("tool-1-0.json")).unwrap()).unwrap();
     assert_eq!(log["ok"], true);
-    assert!(log["result"].as_str().unwrap().contains("COMMAND_FINISHED"));
+    assert!(
+        log["result"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("COMMAND_FINISHED")
+    );
     assert!(
         !artifact.join("probe-outcome.json").exists(),
         "Rust probes should not run automatically"
@@ -2339,4 +2344,208 @@ fn provider_credits_automatically_resume_after_repeated_exhaustion() {
         serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
             .unwrap();
     assert_eq!(session["response_errors"], 0);
+}
+
+#[test]
+fn duplicate_completion_after_restart_selects_new_work() {
+    let server = Server::custom(false, false, None, |_, n| {
+        let finish =
+            json!({"function":{"name":"finish_task","arguments":{"summary":"Research complete"}}});
+        (
+            String::new(),
+            match n {
+                0 => json!([task_tool("Inspect existing work"), finish]),
+                1..=4 => json!([finish]),
+                _ => {
+                    json!([task_tool("New work"),{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"new"}}},finish])
+                }
+            },
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    // Research can complete without edits; the baseline must be clean for this case.
+    fs::write(root.path().join("repo/value.txt"), "0").unwrap();
+    run_cycles(root.path(), 1);
+    let first = state(root.path());
+    assert!(first["current_task"].is_null());
+    assert_eq!(first["completed_tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(first["recent"][0]["disposition"], "unchanged");
+    run_cycles(root.path(), 1);
+    let saved = state(root.path());
+    assert_eq!(saved["completed_tasks"].as_array().unwrap().len(), 2);
+    assert_eq!(saved["completed_tasks"][1]["title"], "New work");
+    assert_eq!(saved["task_serial"], 2);
+    assert_eq!(server.requests.lock().unwrap().len(), 6);
+    assert!(
+        root.path()
+            .join("state/cycle-000002/action-recovery-1.json")
+            .exists()
+    );
+    assert_eq!(
+        fs::read_to_string(
+            Path::new(saved["working_workspace"].as_str().unwrap()).join("value.txt")
+        )
+        .unwrap(),
+        "new"
+    );
+}
+
+#[test]
+fn repeated_tool_recovery_archives_loop_and_preserves_work() {
+    let server = Server::custom(false, false, None, |body, n| {
+        if [9, 17, 25].contains(&n) {
+            let text = body["messages"].to_string();
+            assert!(text.contains("repetitive history was archived"));
+            assert!(body["messages"].as_array().unwrap().len() < 10);
+            assert!(!text.contains("PRIVATE_REPEATED_READ"));
+        }
+        (
+            String::new(),
+            match n {
+                0 => {
+                    json!([task_tool("Investigate"),{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"PRIVATE_REPEATED_READ"}}}])
+                }
+                1..=24 => {
+                    json!([{"function":{"name":"read_file","arguments":{"path":"value.txt"}}}])
+                }
+                _ => {
+                    json!([{"function":{"name":"finish_task","arguments":{"summary":"Investigation completed; existing work retained","task_id":1}}}])
+                }
+            },
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    let config = fixture(root.path(), &server.url, true);
+    let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    settings["implementation_calls"] = json!(32);
+    fs::write(config, settings.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    let saved = state(root.path());
+    assert_eq!(server.requests.lock().unwrap().len(), 26);
+    assert_eq!(
+        fs::read_to_string(
+            Path::new(saved["working_workspace"].as_str().unwrap()).join("value.txt")
+        )
+        .unwrap(),
+        "PRIVATE_REPEATED_READ"
+    );
+    assert!(
+        root.path()
+            .join("state/cycle-000001/action-recovery-6.json")
+            .exists()
+    );
+    assert_eq!(
+        fs::read_dir(root.path().join("state/cycle-000001"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("conversation-before-refresh-"))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn task_completion_is_bound_to_current_task_in_multi_tool_replies() {
+    let server = Server::custom(false, false, None, |_, n| {
+        (
+            String::new(),
+            match n {
+                0 => {
+                    json!([task_tool("Old task"),{"function":{"name":"finish_task","arguments":{"summary":"old done","task_id":1}}},task_tool("Replacement task")])
+                }
+                1 => {
+                    json!([{"function":{"name":"finish_task","arguments":{"summary":"stale completion","task_id":1}}}])
+                }
+                _ => {
+                    json!([{"function":{"name":"finish_task","arguments":{"summary":"replacement done","task_id":2}}}])
+                }
+            },
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    let saved = state(root.path());
+    assert_eq!(server.requests.lock().unwrap().len(), 3);
+    assert_eq!(saved["completed_tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(saved["completed_tasks"][0]["title"], "Replacement task");
+    let stale: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000001/tool-1-0.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stale["ok"], false);
+}
+
+#[test]
+fn complete_progress_notes_survive_restart_and_are_retrievable() {
+    let note = "Quote: \"界\"\n".repeat(2000);
+    let expected = note.clone();
+    let server = Server::custom(false, false, None, move |_, n| {
+        (
+            String::new(),
+            match n {
+                0 => json!([{"function":{"name":"save_progress_note","arguments":{"note":note}}}]),
+                1 => json!([]),
+                2 => json!([{"function":{"name":"read_progress_note","arguments":{"offset":0}}}]),
+                _ => json!([]),
+            },
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    run_cycles(root.path(), 1);
+    let conversation: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
+            .unwrap();
+    assert_eq!(conversation["note"]["model_note"], expected.trim());
+    let result: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000002/tool-0-0.json")).unwrap(),
+    )
+    .unwrap();
+    let page = &result["result"];
+    assert!(page["next_offset"].as_u64().unwrap() > 0);
+    assert!(expected.starts_with(page["text"].as_str().unwrap()));
+}
+
+#[test]
+fn schema_two_upgrade_preserves_active_task_and_original_state() {
+    let server = Server::custom(false, false, None, |_, n| {
+        (
+            String::new(),
+            match n {
+                0 => json!([task_tool("Existing research")]),
+                1 => json!([]),
+                _ => {
+                    json!([{"function":{"name":"finish_task","arguments":{"summary":"Research supported by checks","task_id":1}}}])
+                }
+            },
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    let mut old = state(root.path());
+    let before_ref = old["working_ref"].clone();
+    let before_workspace = old["working_workspace"].clone();
+    old["schema_version"] = json!(2);
+    old.as_object_mut().unwrap().remove("task_serial");
+    old.as_object_mut().unwrap().remove("completed_tasks");
+    let bytes = serde_json::to_vec(&old).unwrap();
+    fs::write(root.path().join("state/state.json"), &bytes).unwrap();
+    run_cycles(root.path(), 1);
+    let upgraded = state(root.path());
+    assert_eq!(upgraded["schema_version"], 3);
+    assert_eq!(upgraded["working_ref"], before_ref);
+    assert_eq!(upgraded["working_workspace"], before_workspace);
+    assert_eq!(upgraded["completed_tasks"][0]["title"], "Existing research");
+    assert_eq!(upgraded["completed_tasks"][0]["id"], 1);
+    assert_eq!(
+        fs::read(root.path().join("state/state-before-v3.json")).unwrap(),
+        bytes
+    );
 }
