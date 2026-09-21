@@ -8,6 +8,7 @@ mod dev_tools;
 mod events;
 mod menu;
 mod model;
+mod nudge;
 mod project;
 mod prompts;
 mod provider;

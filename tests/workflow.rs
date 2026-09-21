@@ -2998,3 +2998,59 @@ fn unavailable_watchdog_keeps_command_alive_and_final_checks_collect_all_results
     assert!(!root.path().join("state/provider-wait.json").exists());
     assert_eq!(server.requests.lock().unwrap().len(), 2);
 }
+
+#[test]
+fn nudge_completion_keeps_working_and_survives_resume() {
+    let server = Server::custom(false, false, None, |_, n| match n {
+        0 => (
+            String::new(),
+            json!([task_tool("Temporary priority"), {"function":{"name":"finish_nudge","arguments":{"nudge_id":1,"summary":"Compared options","evidence":"Recorded alternatives"}}}]),
+        ),
+        1 => (
+            String::new(),
+            json!([{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"Continued after nudge"}}}]),
+        ),
+        _ => ("Checkpoint".into(), json!([])),
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    fs::create_dir_all(root.path().join("state")).unwrap();
+    fs::write(root.path().join("state/nudges.json"),json!({"revision":1,"serial":1,"active":{"id":1,"request":"Compare alternatives","created_unix":1,"status":"active"},"history":[]}).to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    run_cycles(root.path(), 1);
+    let store: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/nudges.json")).unwrap()).unwrap();
+    assert!(store["active"].is_null());
+    assert_eq!(store["history"][0]["status"], "completed");
+    let saved = state(root.path());
+    assert_eq!(
+        fs::read_to_string(
+            Path::new(saved["working_workspace"].as_str().unwrap()).join("value.txt")
+        )
+        .unwrap(),
+        "Continued after nudge"
+    );
+    let calls = server.requests.lock().unwrap();
+    assert!(
+        calls[0]["messages"]
+            .to_string()
+            .contains("Compare alternatives")
+    );
+    assert!(calls[1]["messages"].to_string().contains("nudge_completed"));
+    let updates = calls.last().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("priority_update")
+        })
+        .count();
+    assert_eq!(
+        updates, 2,
+        "Send priority once, and completion once; don't repeat on resume"
+    );
+}

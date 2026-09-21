@@ -495,6 +495,22 @@ and passing tests do not establish completion of a broad product goal. Compare
 actual changes, unresolved findings, and validation results across longer runs
 before treating harness changes as a performance improvement.
 
+## Nudges
+
+Press **N** in the observation view, including while paused, to give the model a
+persistent temporary priority within the project goal. Enter saves it; Esc closes
+the editor. Ctrl+U clears the draft, Ctrl+D cancels the active nudge, and Ctrl+R
+reopens the latest closed nudge. One nudge is active at a time; replacing one
+preserves its history. Adding a nudge while paused does not resume work.
+
+The next model call receives the update without discarding conversation history
+or interrupting a request or command already underway. A nudge can span multiple
+tasks. The model calls `finish_nudge` with a summary and evidence, then returns to
+the overall goal. This records the model's completion claim, not independent
+verification. The Goal tab shows requests, completion reports, and history; reopen
+a nudge if more work is needed. State lives in `.chuggin/nudges.json` separately
+from worker state so concurrent UI and model updates cannot overwrite one another.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).

@@ -617,6 +617,10 @@ struct Dashboard {
     settings_selected: usize,
     settings_edit: Option<String>,
     settings_error: String,
+    nudges: crate::nudge::Store,
+    nudge_edit: Option<String>,
+    nudge_error: String,
+    nudge_id: Option<u64>,
     follow: bool,
     scroll: usize,
     rows: usize,
@@ -660,6 +664,10 @@ impl Dashboard {
             settings_selected: 0,
             settings_edit: None,
             settings_error: String::new(),
+            nudges: crate::nudge::Store::default(),
+            nudge_edit: None,
+            nudge_error: String::new(),
+            nudge_id: None,
             follow: true,
             scroll: 0,
             rows: 1,
@@ -960,7 +968,26 @@ impl Dashboard {
             }
         };
         if self.tab == 3 {
-            for line in clean(goal).lines() {
+            let mut detail = goal.to_owned();
+            if let Some(n) = &self.nudges.active {
+                detail.push_str(&format!("\n\nACTIVE NUDGE #{}\n{}", n.id, n.request));
+            }
+            for n in self.nudges.history.iter().rev() {
+                detail.push_str(&format!(
+                    "\n\nNudge #{} · {}{}\n{}\n{}\n{}",
+                    n.id,
+                    n.status,
+                    if n.status == "completed" {
+                        " (model reported)"
+                    } else {
+                        ""
+                    },
+                    n.request,
+                    n.summary,
+                    n.evidence
+                ));
+            }
+            for line in clean(&detail).lines() {
                 for part in textwrap::wrap(line, width) {
                     lines.push(Line::from(part.into_owned()).fg(FG));
                 }
@@ -1088,7 +1115,7 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
 fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stopping: bool) {
     base(f);
     let a = f.area().inner(Margin::new(1, 0));
-    if d.finished.is_some() && (a.height < 20 || a.width < 44) {
+    if d.nudge_edit.is_none() && d.finished.is_some() && (a.height < 20 || a.width < 44) {
         f.render_widget(
             p(format!(
                 "WORK PAUSED\nNo work is running.\n\n{}\n\nR resume · Enter / Q home",
@@ -1107,7 +1134,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     let r = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(3),
-        Constraint::Length(3),
+        Constraint::Length(if d.nudges.active.is_some() { 5 } else { 3 }),
         Constraint::Min(4),
         Constraint::Length(2),
         Constraint::Length(if d.finished.is_some() { 6 } else { 1 }),
@@ -1189,7 +1216,11 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         r[1],
     );
     f.render_widget(
-        p(d.task.clone()).block(panel(if d.finished.is_some() {
+        p(match &d.nudges.active {
+            Some(n) => format!("{}\nNudge #{}: {}", d.task, n.id, n.request),
+            None => d.task.clone(),
+        })
+        .block(panel(if d.finished.is_some() {
             "Last task"
         } else {
             "Current task"
@@ -1429,7 +1460,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         "Finishing this cycle · R resume · Ctrl+C again force-stops".into()
     } else if c.run_duration_seconds > 0 {
         format!(
-            "Time left {} · Ctrl+C finish cycle · ? help",
+            "Time left {} · Ctrl+C finish cycle · N nudge · ? help",
             duration(
                 c.run_duration_seconds
                     .saturating_sub(d.started.elapsed().as_secs())
@@ -1444,7 +1475,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
                 Line::from("WORK PAUSED").bold(),
                 Line::from("No work is running."),
                 Line::from(reason.clone()),
-                Line::from("R resume work  ·  Enter / Q return home"),
+                Line::from("R resume work  ·  N nudge  ·  Enter / Q return home"),
             ])
             .alignment(Alignment::Center)
             .style(Style::default().fg(GOLD).bg(Color::Rgb(42, 34, 20)))
@@ -1461,6 +1492,16 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             r[5],
         );
     }
+    if let Some(draft) = &d.nudge_edit {
+        let area = Rect::new(
+            a.x + 2,
+            a.y + 2,
+            a.width.saturating_sub(4),
+            a.height.saturating_sub(4),
+        );
+        f.render_widget(Clear, area);
+        f.render_widget(p(format!("Temporary priority within the project goal.\nApplies on the next model call; paused work stays paused.\n\n{draft}▏\n\n{}\n\nEnter save · Esc close · Ctrl+U clear\nCtrl+D cancel active · Ctrl+R reopen latest\nCompletion reports and history: Goal tab", d.nudge_error)).block(panel("Nudge")), area);
+    }
     if d.help {
         let area = Rect::new(
             a.x + a.width / 8,
@@ -1469,7 +1510,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             a.height * 2 / 3,
         );
         f.render_widget(Clear, area);
-        f.render_widget(p("Observe without interrupting work\n\n↑ / ↓ or mouse wheel    Scroll a few lines\nPgUp / PgDn             Scroll a page\nHome / End              Oldest / latest output\nF                       Resume live following\nE                       Expand / collapse command output\n1–5 or Tab              Live, model, checks, goal, settings\n/                       Search the current view\nEsc                     Clear search / close help\nCtrl+C or Q             Finish this cycle, then stop\nR                       Cancel stop / resume saved run\nCtrl+C again            Force stop immediately\n\nScrollback is bounded; complete logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.\nContext and token speed update after each model response.").block(panel("Keyboard guide · ? / Esc closes")),area);
+        f.render_widget(p("Observe without interrupting work\n\n↑ / ↓ or mouse wheel    Scroll a few lines\nPgUp / PgDn             Scroll a page\nHome / End              Oldest / latest output\nF                       Resume live following\nE                       Expand / collapse command output\nN                       Add / manage a temporary nudge\n1–5 or Tab              Live, model, checks, goal, settings\n/                       Search the current view\nEsc                     Clear search / close help\nCtrl+C or Q             Finish this cycle, then stop\nR                       Cancel stop / resume saved run\nCtrl+C again            Force stop immediately\n\nScrollback is bounded; complete logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.\nContext and token speed update after each model response.").block(panel("Keyboard guide · ? / Esc closes")),area);
     }
 }
 
@@ -1504,6 +1545,10 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                 d.apply(e);
             }
             d.poll_tail();
+            match crate::nudge::read(&config.state_dir) {
+                Ok(store) => d.nudges = store,
+                Err(e) => d.nudge_error = e.to_string(),
+            }
             d.resources.refresh();
             if let Ok(updated) = runner::load(path) {
                 config = updated;
@@ -1529,6 +1574,16 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                         _ => {}
                     }
                 }
+                if let Input::Paste(value) = &e
+                    && let Some(draft) = d.nudge_edit.as_mut()
+                {
+                    if draft.len() + value.len() <= 8000 {
+                        draft.push_str(value);
+                    } else {
+                        d.nudge_error = "Nudge is limited to 8000 bytes".into();
+                    }
+                    continue;
+                }
                 if let Some(k) = pressed(&e) {
                     if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
                         if d.finished.is_some() {
@@ -1538,6 +1593,53 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                             restore();
                             crate::project::kill_active_check();
                             std::process::exit(130);
+                        }
+                        continue;
+                    }
+                    if let Some(draft) = d.nudge_edit.as_mut() {
+                        let action = match k.code {
+                            KeyCode::Esc => {
+                                d.nudge_edit = None;
+                                continue;
+                            }
+                            KeyCode::Enter => {
+                                Some(crate::nudge::set(&config.state_dir, draft, d.nudge_id))
+                            }
+                            KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Some(
+                                    d.nudge_id
+                                        .context("No active nudge")
+                                        .and_then(|id| crate::nudge::cancel(&config.state_dir, id)),
+                                )
+                            }
+                            KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Some(crate::nudge::reopen(&config.state_dir))
+                            }
+                            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                                draft.clear();
+                                None
+                            }
+                            KeyCode::Backspace => {
+                                draft.pop();
+                                None
+                            }
+                            KeyCode::Char(ch) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if draft.len() + ch.len_utf8() <= 8000 {
+                                    draft.push(ch);
+                                }
+                                None
+                            }
+                            _ => None,
+                        };
+                        if let Some(result) = action {
+                            match result {
+                                Ok(store) => {
+                                    d.nudges = store;
+                                    d.nudge_edit = None;
+                                    d.nudge_error.clear();
+                                }
+                                Err(e) => d.nudge_error = e.to_string(),
+                            }
                         }
                         continue;
                     }
@@ -1620,6 +1722,17 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                         continue;
                     }
                     match k.code {
+                        KeyCode::Char('n' | 'N') => {
+                            d.nudge_id = d.nudges.active.as_ref().map(|n| n.id);
+                            d.nudge_edit = Some(
+                                d.nudges
+                                    .active
+                                    .as_ref()
+                                    .map(|n| n.request.clone())
+                                    .unwrap_or_default(),
+                            );
+                            d.nudge_error.clear();
+                        }
                         KeyCode::Char('r' | 'R') if d.finished.is_some() => return Ok(true),
                         KeyCode::Char('r' | 'R') => {
                             if stop.swap(false, Ordering::SeqCst) {
@@ -1755,6 +1868,19 @@ pub fn busy<T: Send + 'static>(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    #[test]
+    fn nudge_editor_visible_while_paused() {
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        d.finished = Some("Run saved".into());
+        d.nudge_edit = Some("Make it usable".into());
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
+        let text = screen_text(&t);
+        assert!(text.contains("Make it usable"));
+        assert!(text.contains("paused work stays paused"));
+        assert!(text.contains("Ctrl+D cancel active"));
+    }
     #[test]
     fn input_cursor_edits_unicode_without_splitting_codepoints() {
         let mut e = Editor::new("héllo");

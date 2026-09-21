@@ -102,6 +102,8 @@ struct Conversation {
     prompt_version: String,
     action_watch: crate::action_watch::ActionWatch,
     command_watch: crate::command_watch::CommandWatch,
+    nudge_revision: Option<u64>,
+    delivered_nudge_id: Option<u64>,
 }
 
 /// Compact evidence accompanies the transcript and survives conversation handoffs.
@@ -735,6 +737,8 @@ fn refresh_conversation(
         Vec::new()
     };
     session.messages.truncate(2);
+    session.nudge_revision = None;
+    session.delivered_nudge_id = None;
     session.messages.push(json!({"role":"user","content":json!({"reason":reason,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"working_checkpoint":s.working_ref,"feedback":s.feedback,"progress_note":session.note.context(),"instruction":"Earlier history was archived. Continue with existing files. Closed tasks remain closed. If there is no current task, use set_task to select useful work toward the main goal; do not report an old completion again. Research and foundational work are valid. Inspect files and evidence rather than repeating prior narration."}).to_string()}));
     session.messages.extend(recent);
     session.context_pressure = false;
@@ -887,6 +891,22 @@ fn recover_commands(
     save_conversation(c, session)
 }
 
+fn sync_nudge(c: &Config, session: &mut Conversation) -> Result<()> {
+    let store = crate::nudge::read(&c.state_dir)?;
+    if session.nudge_revision == Some(store.revision) {
+        return Ok(());
+    }
+    session.nudge_revision = Some(store.revision);
+    session.delivered_nudge_id = store.active.as_ref().map(|n| n.id);
+    if store.revision > 0 {
+        let content = json!({"priority_update":{"active_nudge":store.active,"latest_closed_nudge":store.history.last().map(|n|json!({"id":n.id,"status":n.status,"summary":project::excerpt(&n.summary,600)})),"instruction":crate::nudge::INSTRUCTION}});
+        session
+            .messages
+            .push(json!({"role":"user","content":content.to_string()}));
+    }
+    save_conversation(c, session)
+}
+
 struct WorkResult {
     finish_requested: Option<u64>,
     summary: String,
@@ -949,6 +969,7 @@ fn work(
                 true,
             )?;
         }
+        sync_nudge(c, session)?;
         crate::events::send(crate::events::Event::Phase("Work".into()));
         let response = match m.chat(&session.messages, Some(session.tools.clone()), false) {
             Ok(response) => response,
@@ -1029,6 +1050,7 @@ fn work(
                             | "write_file"
                             | "restore_checkpoint"
                             | "finish_task"
+                            | "finish_nudge"
                             | "set_task"
                     )
                 {
@@ -1048,6 +1070,29 @@ fn work(
                         emit(art, "task", s.current_task.as_ref().unwrap())?;
                         save(&c.state_dir.join("state.json"), s)?;
                         Ok(json!({"task_id":s.task_serial,"message":"Task recorded. Files and criteria are planning hints, not edit restrictions. Existing work is retained."}).to_string())
+                    }
+                    "finish_nudge" => {
+                        let id = args["nudge_id"].as_u64().context("Missing nudge_id")?;
+                        anyhow::ensure!(
+                            session.delivered_nudge_id == Some(id),
+                            "Only complete the nudge delivered in the latest priority update"
+                        );
+                        let store = crate::nudge::finish(
+                            &c.state_dir,
+                            id,
+                            args["summary"].as_str().context("Missing summary")?,
+                            args["evidence"].as_str().context("Missing evidence")?,
+                            &s.working_ref,
+                        )?;
+                        emit(
+                            art,
+                            &format!("nudge-completed-{id}"),
+                            store.history.last().context("Missing completion")?,
+                        )?;
+                        crate::events::log(format!(
+                            "Nudge #{id} reported complete. Returning to the overall goal."
+                        ));
+                        Ok(json!({"nudge_completed":id,"message":"Nudge completion recorded with your evidence. The overall goal and current task remain; continue choosing useful work. This is a model report, not independent verification."}).to_string())
                     }
                     "finish_task" => {
                         if s.current_task.is_none() {

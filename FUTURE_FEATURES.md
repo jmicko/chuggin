@@ -86,3 +86,27 @@ Do not interrupt live runs just to update the executable or add this feature.
 References:
 - https://docs.ollama.com/faq#how-does-ollama-handle-concurrent-requests
 - https://www.anthropic.com/engineering/multi-agent-research-system
+
+## Shared Loop, Finish, and Chat modes (September 20)
+
+Nudges shipped locally in 0.9.0: one durable temporary user priority, next-call
+injection into the existing conversation, explicit evidence-bearing completion,
+reopen/cancel/replace history, and no extra acceptance gate. They are separate
+from task completion and never complete the overall project goal.
+
+Next, add Finish mode over the same execution engine. Disable forced next-work
+scheduling and tell the model to close remaining work toward the agreed goal.
+An explicit finish_project tool should produce a handoff (what works, how to use
+it, validation, known limitations), checkpoint, and pause. It must also permit
+reporting a blocker or asking for user input rather than claiming completion.
+The user can resume Loop at any time. Preserve existing conversation, settings,
+commands, repetition recovery, watchdog, and provider backoff. Completion remains
+a model claim; do not reinvent an acceptance/rejection pipeline.
+
+Then add Chat mode: schedule work in response to user messages, allow multiple
+tool calls and commands within a turn, and wait after an answer or question.
+Support read-only questions about results as well as explicitly requested edits.
+Mode transitions should be persisted, take effect at safe boundaries, and be
+clearly visible. Keep the stable prompt prefix and use a short mode update in
+the conversation instead of separate agent implementations or long explanations.
+These modes are proposed next steps, not implemented in 0.9.0.
