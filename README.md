@@ -264,6 +264,27 @@ in the observation view, and `command-repetition-*` and `command-diagnostic-*` c
 artifacts record the evidence, read-only actions, report, or failure. Recovery state
 survives cycles and restarts. Healthy runs do not pay for a diagnostic on every cycle.
 
+## Reading the observation view
+
+**Live** combines model text, command summaries, tool notices and checkpoints.
+**Model** shows only streamed model text; **Checks** shows commands and validation.
+Command output is collapsed by default. Recognized Rust, pytest, Jest/Vitest and TAP
+summaries show passed/total counts, failures and skipped tests. Multiple Rust suites
+are aggregated without counting individual test lines twice. Other commands show
+exit status and output-line counts instead of guessed test totals. A few error or
+slow-test messages remain visible even when collapsed.
+
+Press **E** in Live or Checks to expand/collapse command output. The expanded view
+retains a bounded recent excerpt and shows the full log path; full diagnostic logs
+are unchanged on disk. Searching also searches retained command details. Summaries
+are computed locally, without extra model requests, and never alter what the agent
+sees or how verification is evaluated. Repeated identical stage headings are omitted.
+
+When output is quiet, a small moving ASCII indicator appears beside the current
+stage. It labels waiting for a response, a running command, or provider waiting;
+it indicates an active harness, not a completion percentage or proof of progress.
+It stops when the run is paused.
+
 ## Execution, compiler diagnostics, and symbols
 
 The working agent can use **run_command** with an executable and argument array,

@@ -15,8 +15,7 @@ use ratatui::{prelude::*, widgets::*};
 use std::{
     cell::RefCell,
     collections::VecDeque,
-    fs,
-    io::{self, Read, Seek, SeekFrom},
+    fs, io,
     path::Path,
     sync::{
         Arc,
@@ -95,7 +94,7 @@ fn p(text: impl Into<Text<'static>>) -> Paragraph<'static> {
         .style(Style::default().fg(FG))
         .wrap(Wrap { trim: false })
 }
-fn clean(s: &str) -> String {
+pub(crate) fn clean(s: &str) -> String {
     let mut result = String::new();
     let mut escape = false;
     let mut csi = false;
@@ -516,6 +515,7 @@ enum Kind {
 struct Entry {
     kind: Kind,
     text: String,
+    command: Option<crate::command_output::CommandOutput>,
 }
 struct Resource {
     previous: Option<(u64, u64)>,
@@ -586,10 +586,6 @@ impl Resource {
         }
     }
 }
-struct Tail {
-    file: fs::File,
-    offset: u64,
-}
 pub(crate) fn outcome_label(disposition: &str) -> &str {
     match disposition {
         "checkpoint" => "Saved · checks passed",
@@ -630,7 +626,8 @@ struct Dashboard {
     help: bool,
     finished: Option<String>,
     finished_at: Option<Instant>,
-    tail: Option<Tail>,
+    expanded_commands: bool,
+    last_output: Instant,
     partial_model: String,
     partial_check: String,
     command_status: Option<(String, u64, u64, Instant)>,
@@ -672,7 +669,8 @@ impl Dashboard {
             help: false,
             finished: None,
             finished_at: None,
-            tail: None,
+            expanded_commands: false,
+            last_output: Instant::now(),
             partial_model: String::new(),
             partial_check: String::new(),
             command_status: None,
@@ -711,6 +709,7 @@ impl Dashboard {
             self.entries.push_back(Entry {
                 kind,
                 text: crate::project::excerpt(line, 12000),
+                command: None,
             });
             if self.entries.len() > 2000 {
                 self.entries.pop_front();
@@ -744,18 +743,43 @@ impl Dashboard {
         self.push(Kind::Model, s);
     }
     fn poll_tail(&mut self) {
-        let mut text = String::new();
-        if let Some(t) = self.tail.as_mut() {
-            let _ = t.file.seek(SeekFrom::Start(t.offset));
-            let mut bytes = Vec::new();
-            let _ = (&mut t.file).take(32768).read_to_end(&mut bytes);
-            t.offset += bytes.len() as u64;
-            text = String::from_utf8_lossy(&bytes).into();
+        let mut budget = 65536;
+        for entry in &mut self.entries {
+            if let Some(command) = &mut entry.command {
+                let n = command.poll(budget);
+                budget = budget.saturating_sub(n);
+                if n > 0 {
+                    self.last_activity = Instant::now();
+                    self.last_output = Instant::now();
+                }
+                if budget == 0 {
+                    break;
+                }
+            }
         }
-        if !text.is_empty() {
-            self.last_activity = Instant::now();
-            self.stream(Kind::Check, &text);
+    }
+    fn quiet_activity(&self) -> Option<String> {
+        if self.finished.is_some() || self.last_output.elapsed() < Duration::from_millis(1500) {
+            return None;
         }
+        let message = if self.provider_wait.is_some() {
+            "Waiting for provider"
+        } else if self.request_active {
+            "Waiting for response"
+        } else if self.command_status.is_some()
+            || self
+                .entries
+                .iter()
+                .any(|e| e.command.as_ref().is_some_and(|c| c.completed.is_none()))
+        {
+            "Command running"
+        } else {
+            "Working"
+        };
+        Some(format!(
+            "{} {message}",
+            activity_bar(self.started.elapsed().as_millis() as u64)
+        ))
     }
     fn apply(&mut self, event: Event) {
         self.last_activity = Instant::now();
@@ -767,7 +791,7 @@ impl Dashboard {
                 self.provider_wait = Some(seconds);
                 self.phase = format!("Waiting for provider · {seconds}s · {reason}");
             }
-            Event::Log(s) => self.push(Kind::Activity, s),
+            Event::Log(s) => self.push(Kind::Activity, concise_activity(&s)),
             Event::Phase(s) => {
                 self.provider_wait = None;
                 self.request_active = false;
@@ -775,9 +799,11 @@ impl Dashboard {
                 if s == "Check" {
                     self.last_check = None;
                 }
-                self.phase = s;
-                self.phase_started = Instant::now();
-                self.push(Kind::Activity, format!("── {} ──", self.phase));
+                if self.phase != s {
+                    self.phase = s;
+                    self.phase_started = Instant::now();
+                    self.push(Kind::Activity, format!("── {} ──", self.phase));
+                }
             }
             Event::Cycle(n) => {
                 self.cycle = n;
@@ -793,7 +819,10 @@ impl Dashboard {
                 self.calls += 1;
                 self.request_active = true;
             }
-            Event::Delta(s) => self.stream(Kind::Model, &s),
+            Event::Delta(s) => {
+                self.last_output = Instant::now();
+                self.stream(Kind::Model, &s);
+            }
             Event::Metrics {
                 prompt,
                 generated,
@@ -815,10 +844,15 @@ impl Dashboard {
             }
             Event::Check { command, path } => {
                 self.poll_tail();
-                self.tail = fs::File::open(path)
-                    .ok()
-                    .map(|file| Tail { file, offset: 0 });
-                self.push(Kind::Check, format!("$ {command}"));
+                self.entries.push_back(Entry {
+                    kind: Kind::Check,
+                    text: String::new(),
+                    command: Some(crate::command_output::CommandOutput::new(command, &path)),
+                });
+                if self.entries.len() > 2000 {
+                    self.entries.pop_front();
+                    self.dropped += 1;
+                }
             }
             Event::CommandStatus {
                 id,
@@ -830,19 +864,26 @@ impl Dashboard {
             }
             Event::CheckDone(ok) => {
                 self.command_status = None;
-                self.poll_tail();
-                self.tail = None;
-                let s = std::mem::take(&mut self.partial_check);
-                self.push(Kind::Check, s);
-                self.push(
-                    Kind::Check,
-                    if ok {
-                        "✓ Command succeeded"
-                    } else {
-                        "× Command failed · work is kept for repair"
-                    }
-                    .into(),
-                );
+                if let Some(command) = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .filter_map(|e| e.command.as_mut())
+                    .find(|c| c.completed.is_none())
+                {
+                    command.finish(ok);
+                    self.poll_tail();
+                } else {
+                    self.push(
+                        Kind::Check,
+                        if ok {
+                            "✓ Command succeeded"
+                        } else {
+                            "× Command failed · work is kept for repair"
+                        }
+                        .into(),
+                    );
+                }
             }
             Event::ValidationDone { passed, checkpoint } => {
                 self.last_check = Some(passed);
@@ -903,6 +944,14 @@ impl Dashboard {
                 match kind {
                     Kind::Activity => CYAN,
                     Kind::Model => FG,
+                    Kind::Check if text.contains(" failed") => GOLD,
+                    Kind::Check if text.trim_start().starts_with('✓') => GREEN,
+                    Kind::Check
+                        if text.trim_start().starts_with('×') || text.contains(" ... FAILED") =>
+                    {
+                        GOLD
+                    }
+                    Kind::Check if text.starts_with("▸") || text.starts_with("▾") => CYAN,
                     Kind::Check => MUTED,
                 }
             };
@@ -918,13 +967,50 @@ impl Dashboard {
             }
         } else {
             for entry in &self.entries {
-                add(entry.kind, &entry.text);
+                if let Some(command) = &entry.command {
+                    for line in command.display(self.expanded_commands || !query.is_empty()) {
+                        add(Kind::Check, &line);
+                    }
+                } else {
+                    add(entry.kind, &entry.text);
+                }
             }
             add(Kind::Model, &self.partial_model);
             add(Kind::Check, &self.partial_check);
         }
         lines
     }
+}
+fn concise_activity(text: &str) -> String {
+    if text.starts_with("Watchdog ")
+        && let Some(start) = text.find('{')
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text[start..])
+    {
+        let decision = match v["verdict"].as_str() {
+            Some("stalled") => "Hang detected",
+            Some("productive") => "Keep running",
+            Some("uncertain") => "Needs more observation",
+            _ => "Assessment unavailable; keep running",
+        };
+        let reason = v["reason"]
+            .as_str()
+            .or_else(|| v["error"].as_str())
+            .unwrap_or("");
+        return format!(
+            "Watchdog · {decision}\n{}",
+            crate::project::excerpt(reason, 240)
+        );
+    }
+    text.into()
+}
+fn activity_bar(milliseconds: u64) -> String {
+    let step = (milliseconds / 140) % 14;
+    let position = if step <= 7 { step } else { 14 - step } as usize;
+    let mut cells = [' '; 10];
+    cells[position] = '=';
+    cells[position + 1] = '=';
+    cells[position + 2] = '>';
+    format!("[{}]", cells.iter().collect::<String>())
 }
 fn duration(s: u64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
@@ -1080,7 +1166,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     }
     f.render_widget(
         Paragraph::new(Line::from(steps)).block(panel(&format!(
-            "{} · {}",
+            "{} · {}{}",
             if d.finished.is_some() {
                 "Last stage"
             } else {
@@ -1091,7 +1177,10 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
                     .unwrap_or_else(Instant::now)
                     .saturating_duration_since(d.phase_started)
                     .as_secs()
-            )
+            ),
+            d.quiet_activity()
+                .map(|s| format!(" · {s}"))
+                .unwrap_or_default()
         ))),
         r[1],
     );
@@ -1135,6 +1224,18 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         "Output · following live".into()
     } else {
         "Output · scrollback · F to follow".into()
+    };
+    let label = if matches!(d.tab, 0 | 2) {
+        format!(
+            "{label} · E {}",
+            if d.expanded_commands {
+                "collapse output"
+            } else {
+                "expand output"
+            }
+        )
+    } else {
+        label
     };
     let block = panel(&label);
     let inner = block.inner(log[1]);
@@ -1320,7 +1421,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             )
         )
     } else {
-        "↑↓ / wheel scroll · PgUp/PgDn · F follow · 1–5 views · / search · ? help · Ctrl+C finish cycle".into()
+        "↑↓ / wheel scroll · PgUp/PgDn · F follow · 1–5 views · E output · / search · ? help · Ctrl+C finish cycle".into()
     };
     if let Some(reason) = &d.finished {
         f.render_widget(
@@ -1353,7 +1454,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             a.height * 2 / 3,
         );
         f.render_widget(Clear, area);
-        f.render_widget(p("Observe without interrupting work\n\n↑ / ↓ or mouse wheel    Scroll a few lines\nPgUp / PgDn             Scroll a page\nHome / End              Oldest / latest output\nF                       Resume live following\n1–5 or Tab              Live, model, checks, goal, settings\n/                       Search the current view\nEsc                     Clear search / close help\nCtrl+C or Q             Finish this cycle, then stop\nR                       Cancel stop / resume saved run\nCtrl+C again            Force stop immediately\n\nScrollback is bounded; complete logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.\nContext and token speed update after each model response.").block(panel("Keyboard guide · ? / Esc closes")),area);
+        f.render_widget(p("Observe without interrupting work\n\n↑ / ↓ or mouse wheel    Scroll a few lines\nPgUp / PgDn             Scroll a page\nHome / End              Oldest / latest output\nF                       Resume live following\nE                       Expand / collapse command output\n1–5 or Tab              Live, model, checks, goal, settings\n/                       Search the current view\nEsc                     Clear search / close help\nCtrl+C or Q             Finish this cycle, then stop\nR                       Cancel stop / resume saved run\nCtrl+C again            Force stop immediately\n\nScrollback is bounded; complete logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.\nContext and token speed update after each model response.").block(panel("Keyboard guide · ? / Esc closes")),area);
     }
 }
 
@@ -1515,6 +1616,9 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                             stop.store(true, Ordering::SeqCst);
                         }
                         KeyCode::Char('?') => d.help = true,
+                        KeyCode::Char('e' | 'E') if matches!(d.tab, 0 | 2) => {
+                            d.expanded_commands = !d.expanded_commands;
+                        }
                         KeyCode::Up | KeyCode::Char('k') => d.back(3),
                         KeyCode::Down | KeyCode::Char('j') => d.forward(3),
                         KeyCode::PageUp => d.back(d.rows.saturating_sub(1)),
@@ -1850,7 +1954,11 @@ mod tests {
         assert!(
             d.entries
                 .iter()
-                .any(|e| e.text.contains("focused_behavior"))
+                .filter_map(|e| e.command.as_ref())
+                .any(|c| c
+                    .display(true)
+                    .iter()
+                    .any(|s| s.contains("focused_behavior")))
         );
         // An arbitrary command completing is not the configured validation result.
         assert_eq!(d.last_check, None);
@@ -1963,5 +2071,45 @@ mod tests {
         });
         assert_eq!(d.last_check, Some(false));
         assert!(d.last_passing_checkpoint.is_none());
+    }
+    #[test]
+    fn command_cards_collapse_expand_and_quiet_animation_stops_when_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("command.log");
+        fs::write(&path,"running 150 tests\ntest hidden_success ... ok\ntest broken_example ... FAILED\ntest result: FAILED. 145 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1s\n").unwrap();
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::Check {
+            command: "cargo test".into(),
+            path,
+        });
+        d.apply(Event::CheckDone(false));
+        d.request_active = true;
+        d.last_output = Instant::now() - Duration::from_secs(3);
+        d.phase = "Work".into();
+        d.task = "Repair the remaining test failures".into();
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        let collapsed = screen_text(&terminal);
+        assert!(collapsed.contains("145/150 tests passed"));
+        assert!(!collapsed.contains("hidden_success"));
+        assert!(collapsed.contains("broken_example"));
+        assert!(collapsed.contains("E expand output"));
+        assert!(collapsed.contains("Waiting for response"));
+        if let Ok(dir) = std::env::var("CHUGGIN_UI_SNAPSHOTS") {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(Path::new(&dir).join("collapsed-commands.txt"), &collapsed).unwrap();
+        }
+        d.expanded_commands = true;
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        assert!(screen_text(&terminal).contains("hidden_success"));
+        assert_ne!(activity_bar(0), activity_bar(280));
+        assert_eq!(activity_bar(0).len(), 12);
+        d.finished = Some("Run saved".into());
+        assert!(d.quiet_activity().is_none());
     }
 }
