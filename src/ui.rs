@@ -1004,12 +1004,19 @@ fn concise_activity(text: &str) -> String {
     text.into()
 }
 fn activity_bar(milliseconds: u64) -> String {
-    let step = (milliseconds / 140) % 14;
-    let position = if step <= 7 { step } else { 14 - step } as usize;
+    let step = (milliseconds / 140) % 28;
+    let (position, arrow) = if step < 14 {
+        (step as i32 - 3, ['=', '=', '>'])
+    } else {
+        (10 - (step - 14) as i32, ['<', '=', '='])
+    };
     let mut cells = [' '; 10];
-    cells[position] = '=';
-    cells[position + 1] = '=';
-    cells[position + 2] = '>';
+    for (offset, ch) in arrow.into_iter().enumerate() {
+        let index = position + offset as i32;
+        if (0..10).contains(&index) {
+            cells[index as usize] = ch;
+        }
+    }
     format!("[{}]", cells.iter().collect::<String>())
 }
 fn duration(s: u64) -> String {
@@ -1166,7 +1173,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     }
     f.render_widget(
         Paragraph::new(Line::from(steps)).block(panel(&format!(
-            "{} · {}{}",
+            "{} · {}",
             if d.finished.is_some() {
                 "Last stage"
             } else {
@@ -1177,10 +1184,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
                     .unwrap_or_else(Instant::now)
                     .saturating_duration_since(d.phase_started)
                     .as_secs()
-            ),
-            d.quiet_activity()
-                .map(|s| format!(" · {s}"))
-                .unwrap_or_default()
+            )
         ))),
         r[1],
     );
@@ -1240,13 +1244,24 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     let block = panel(&label);
     let inner = block.inner(log[1]);
     f.render_widget(block, log[1]);
+    let show_activity = d.tab <= 2 && d.finished.is_none() && inner.height >= 2;
+    let output = Rect {
+        height: inner.height.saturating_sub(u16::from(show_activity)),
+        ..inner
+    };
+    if show_activity && let Some(activity) = d.quiet_activity() {
+        f.render_widget(
+            Paragraph::new(activity).fg(CYAN),
+            Rect::new(inner.x, inner.y + output.height, inner.width, 1),
+        );
+    }
     let lines = if d.tab == 4 {
         settings_lines(d, c)
     } else {
         d.lines(inner.width.saturating_sub(1) as usize, &c.goal)
     };
     d.total_rows = lines.len();
-    d.rows = inner.height as usize;
+    d.rows = output.height as usize;
     if d.follow {
         d.scroll = d.total_rows.saturating_sub(d.rows);
     } else {
@@ -1260,7 +1275,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
                 .take(d.rows)
                 .collect::<Vec<_>>(),
         )),
-        inner,
+        output,
     );
     if d.total_rows > d.rows {
         let mut state = ScrollbarState::new(d.total_rows.saturating_sub(d.rows)).position(d.scroll);

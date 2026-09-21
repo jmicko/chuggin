@@ -280,8 +280,8 @@ are unchanged on disk. Searching also searches retained command details. Summari
 are computed locally, without extra model requests, and never alter what the agent
 sees or how verification is evaluated. Repeated identical stage headings are omitted.
 
-When output is quiet, a small moving ASCII indicator appears beside the current
-stage. It labels waiting for a response, a running command, or provider waiting;
+When output is quiet, a small moving ASCII indicator appears at the bottom of the output
+box. Its arrow travels behind each bracket and reverses direction. It labels waiting for a response, a running command, or provider waiting;
 it indicates an active harness, not a completion percentage or proof of progress.
 It stops when the run is paused.
 
