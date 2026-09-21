@@ -268,6 +268,12 @@ survives cycles and restarts. Healthy runs do not pay for a diagnostic on every 
 
 **Live** combines model text, command summaries, tool notices and checkpoints.
 **Model** shows only streamed model text; **Checks** shows commands and validation.
+On a cold start, Live and Model restore recent model text from the saved
+conversation; Live also restores tool names and file/task hints. A New session
+divider separates this history from new activity. This display uses the last 200
+saved messages within the normal bounded scrollback; older conversation archives
+and full command logs remain on disk. It does not replay actions, reconstruct old
+command-output panels, or add anything to model context or session counters.
 Command output is collapsed by default. Recognized Rust, pytest, Jest/Vitest and TAP
 summaries show passed/total counts, failures and skipped tests. Multiple Rust suites
 are aggregated without counting individual test lines twice. Other commands show

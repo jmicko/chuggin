@@ -706,11 +706,70 @@ impl Dashboard {
                 }
             }
         }
+        d.restore_history(&config.state_dir);
         d.push(
             Kind::Activity,
-            "Session started. Full diagnostic history remains in .chuggin/.".into(),
+            "── New session · full diagnostic history remains in .chuggin/ ──".into(),
         );
         d
+    }
+    fn restore_history(&mut self, dir: &Path) {
+        let path = dir.join("conversation.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(e) => {
+                self.push(Kind::Activity, format!("Saved history unavailable: {e}"));
+                return;
+            }
+        };
+        let saved: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(saved) => saved,
+            Err(e) => {
+                self.push(
+                    Kind::Activity,
+                    format!("Saved history could not be displayed: {e}"),
+                );
+                return;
+            }
+        };
+        let Some(messages) = saved["messages"].as_array() else {
+            return;
+        };
+        self.push(
+            Kind::Activity,
+            "── Recent saved conversation · model messages and tool activity ──".into(),
+        );
+        for message in messages.iter().skip(messages.len().saturating_sub(200)) {
+            if message["role"] == "assistant" {
+                for field in ["thinking", "content"] {
+                    if let Some(text) = message[field].as_str() {
+                        // Only a display tail: never change the saved conversation.
+                        let start = text
+                            .char_indices()
+                            .rev()
+                            .nth(24000)
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        if start > 0 {
+                            self.push(Kind::Model, "[Earlier text omitted from display]".into());
+                        }
+                        self.push(Kind::Model, text[start..].into());
+                    }
+                }
+                if let Some(calls) = message["tool_calls"].as_array() {
+                    for call in calls {
+                        let name = call["function"]["name"].as_str().unwrap_or("tool");
+                        let args = &call["function"]["arguments"];
+                        let detail = args["path"]
+                            .as_str()
+                            .or(args["title"].as_str())
+                            .unwrap_or("");
+                        self.push(Kind::Activity, format!("↳ {name} {detail}"));
+                    }
+                }
+            }
+        }
     }
     fn push(&mut self, kind: Kind, text: String) {
         for line in clean(&text).lines() {
@@ -1879,6 +1938,53 @@ pub fn busy<T: Send + 'static>(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    #[test]
+    fn cold_start_restores_visible_history_without_session_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config();
+        c.state_dir = dir.path().to_owned();
+        let bytes = serde_json::json!({"messages":[
+            {"role":"system","content":"INTERNAL_SYSTEM_PROMPT"},
+            {"role":"assistant","content":"Earlier progress 🌱","tool_calls":[{"function":{"name":"write_file","arguments":{"path":"example.txt"}}}]},
+            {"role":"tool","content":"RAW_TOOL_RESULT"}
+        ]}).to_string();
+        fs::write(dir.path().join("conversation.json"), &bytes).unwrap();
+        let mut d = Dashboard::new(&c);
+        let live = d
+            .lines(100, &c.goal)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(live.contains("Earlier progress 🌱"));
+        assert!(live.contains("write_file example.txt"));
+        assert!(!live.contains("INTERNAL_SYSTEM_PROMPT"));
+        assert!(!live.contains("RAW_TOOL_RESULT"));
+        assert!(live.find("Earlier progress").unwrap() < live.find("New session").unwrap());
+        d.tab = 1;
+        let model = d
+            .lines(100, &c.goal)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(model.contains("Earlier progress"));
+        assert!(!model.contains("write_file"));
+        assert_eq!(d.calls, 0);
+        assert_eq!(d.generated, 0);
+        assert_eq!(d.completed_cycles, 0);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("conversation.json")).unwrap(),
+            bytes
+        );
+        fs::write(dir.path().join("conversation.json"), "invalid").unwrap();
+        let d = Dashboard::new(&c);
+        assert!(
+            d.entries
+                .iter()
+                .any(|e| e.text.contains("could not be displayed"))
+        );
+    }
     #[test]
     fn nudge_editor_visible_while_paused() {
         let c = config();
