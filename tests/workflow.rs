@@ -3054,3 +3054,135 @@ fn nudge_completion_keeps_working_and_survives_resume() {
         "Send priority once, and completion once; don't repeat on resume"
     );
 }
+
+#[test]
+fn project_completion_is_opt_in_saved_and_sticky_across_restart() {
+    for enabled in [false, true] {
+        let server = Server::custom(false, false, None, |_, n| match n {
+            0 => (
+                String::new(),
+                json!([
+                    task_tool("Goal work"),
+                    {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"Finished goal"}}},
+                    {"function":{"name":"finish_project","arguments":{"summary":"Goal achieved","evidence":"Inspected results"}}},
+                    {"function":{"name":"write_file","arguments":{"path":"after.txt","content":"Should not run after completion"}}}
+                ]),
+            ),
+            _ => ("Continue".into(), json!([])),
+        });
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let path = root.path().join("chuggin.json");
+        let mut c: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        c["allow_goal_completion"] = json!(enabled);
+        fs::write(&path, c.to_string()).unwrap();
+        run_cycles(root.path(), 3);
+        let saved = state(root.path());
+        let workspace = Path::new(saved["working_workspace"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(workspace.join("value.txt")).unwrap(),
+            "Finished goal"
+        );
+        assert_eq!(workspace.join("after.txt").exists(), !enabled);
+        assert_eq!(saved["cycle"], if enabled { 1 } else { 3 });
+        let report = root.path().join("state/goal-completion.json");
+        assert_eq!(report.exists(), enabled);
+        let before = server.requests.lock().unwrap().len();
+        run_cycles(root.path(), 1);
+        if enabled {
+            assert_eq!(server.requests.lock().unwrap().len(), before);
+            let r: Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+            assert_eq!(r["checkpoint"], saved["working_ref"]);
+            // Disabling the setting explicitly permits continuous work again.
+            c["allow_goal_completion"] = json!(false);
+            fs::write(&path, c.to_string()).unwrap();
+            run_cycles(root.path(), 1);
+            assert!(server.requests.lock().unwrap().len() > before);
+        }
+        let calls = server.requests.lock().unwrap();
+        let exposed = calls[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["function"]["name"] == "finish_project");
+        assert_eq!(exposed, enabled);
+    }
+}
+
+#[test]
+fn project_completion_setting_updates_between_calls_and_revokes_stale_calls() {
+    for initially_enabled in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("chuggin.json");
+        let live_path = path.clone();
+        let server = Server::custom(false, false, None, move |_, n| {
+            if n == 0 {
+                let mut c: Value = serde_json::from_slice(&fs::read(&live_path).unwrap()).unwrap();
+                c["allow_goal_completion"] = json!(!initially_enabled);
+                fs::write(&live_path, c.to_string()).unwrap();
+            }
+            if n < 2 {
+                (
+                    String::new(),
+                    json!([{"function":{"name":"finish_project","arguments":{"summary":"Complete","evidence":"Verified"}}}]),
+                )
+            } else {
+                ("Continue".into(), json!([]))
+            }
+        });
+        fixture(root.path(), &server.url, true);
+        let mut c: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        c["allow_goal_completion"] = json!(initially_enabled);
+        fs::write(&path, c.to_string()).unwrap();
+        run_cycles(root.path(), 1);
+        assert_eq!(
+            root.path().join("state/goal-completion.json").exists(),
+            !initially_enabled
+        );
+        let calls = server.requests.lock().unwrap();
+        assert!(
+            calls[1]["messages"]
+                .to_string()
+                .contains("Goal completion is not enabled")
+        );
+        assert_eq!(
+            calls[1]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["function"]["name"] == "finish_project"),
+            !initially_enabled
+        );
+    }
+}
+
+#[test]
+fn project_completion_waits_for_running_commands() {
+    let server = Server::custom(false, false, None, |_, n| {
+        if n == 0 {
+            (
+                String::new(),
+                json!([
+                    task_tool("Long command"),
+                    {"function":{"name":"run_command","arguments":{"argv":["sh","-c","sleep 3; echo saved > result.txt"],"timeout_seconds":30}}},
+                    {"function":{"name":"finish_project","arguments":{"summary":"Complete","evidence":"Verified"}}}
+                ]),
+            )
+        } else {
+            ("Checkpoint".into(), json!([]))
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut c: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    c["allow_goal_completion"] = json!(true);
+    fs::write(&path, c.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    assert!(!root.path().join("state/goal-completion.json").exists());
+    let s = state(root.path());
+    assert_eq!(
+        fs::read_to_string(Path::new(s["working_workspace"].as_str().unwrap()).join("result.txt"))
+            .unwrap(),
+        "saved\n"
+    );
+}

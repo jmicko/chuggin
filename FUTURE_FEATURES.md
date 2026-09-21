@@ -94,19 +94,17 @@ injection into the existing conversation, explicit evidence-bearing completion,
 reopen/cancel/replace history, and no extra acceptance gate. They are separate
 from task completion and never complete the overall project goal.
 
-Next, add Finish mode over the same execution engine. Disable forced next-work
-scheduling and tell the model to close remaining work toward the agreed goal.
-An explicit finish_project tool should produce a handoff (what works, how to use
-it, validation, known limitations), checkpoint, and pause. It must also permit
-reporting a blocker or asking for user input rather than claiming completion.
-The user can resume Loop at any time. Preserve existing conversation, settings,
-commands, repetition recovery, watchdog, and provider backoff. Completion remains
-a model claim; do not reinvent an acceptance/rejection pipeline.
+September 21 refinement: no separate Finish mode or urgency prompt. The user
+can enable "Allow goal completion" (default off). This exposes finish_project,
+whose description says to use it only when the overall goal is fully achieved
+and verified. Otherwise the loop continues unchanged. A call saves a checkpoint
+and completion report, then pauses durably. Explicit resume reopens work; there
+is no additional review veto. This is implemented in 0.10.0.
 
-Then add Chat mode: schedule work in response to user messages, allow multiple
+Next, add Chat mode: schedule work in response to user messages, allow multiple
 tool calls and commands within a turn, and wait after an answer or question.
 Support read-only questions about results as well as explicitly requested edits.
 Mode transitions should be persisted, take effect at safe boundaries, and be
 clearly visible. Keep the stable prompt prefix and use a short mode update in
 the conversation instead of separate agent implementations or long explanations.
-These modes are proposed next steps, not implemented in 0.9.0.
+Chat remains a proposed next step, not implemented in 0.10.0.

@@ -714,3 +714,7 @@ mod formatting_tests {
         assert_eq!(bare.reason, "accept is only text here");
     }
 }
+
+pub fn goal_completion_tool() -> Value {
+    json!({"type":"function","function":{"name":"finish_project","description":"Mark the overall project goal complete when it has been fully achieved and verified. Completing an individual task or nudge does not complete the project. This saves work and stops the loop.","parameters":{"type":"object","properties":{"summary":{"type":"string"},"evidence":{"type":"string"}},"required":["summary","evidence"]}}})
+}

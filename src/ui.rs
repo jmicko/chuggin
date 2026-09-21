@@ -1054,6 +1054,7 @@ fn setting_value(c: &runner::Config, field: usize) -> String {
         0 => c.model.clone(),
         1 => format!("{}", c.request_timeout_seconds as f64 / 60.0),
         2 => format!("{}", c.run_duration_seconds as f64 / 3600.0),
+        4 => if c.allow_goal_completion { "on" } else { "off" }.into(),
         _ => c.command_review_seconds.to_string(),
     }
 }
@@ -1068,6 +1069,7 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
         "Request timeout (minutes; 0 unlimited)",
         "Run duration (hours; 0 unlimited)",
         "Command first review (seconds)",
+        "Allow goal completion (on/off)",
     ]
     .iter()
     .enumerate()
@@ -1558,6 +1560,12 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
             {
                 d.finished_at = Some(Instant::now());
                 d.finished = Some(match result {
+                    Ok(())
+                        if config.state_dir.join("goal-completion.json").exists()
+                            && config.allow_goal_completion =>
+                    {
+                        "Model reports project complete".into()
+                    }
                     Ok(()) => "Run saved".into(),
                     Err(e) => format!("Stopped: {e}"),
                 });
@@ -1684,11 +1692,11 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                         }
                         match k.code {
                             KeyCode::Up => {
-                                d.settings_selected = (d.settings_selected + 3) % 4;
+                                d.settings_selected = (d.settings_selected + 4) % 5;
                                 continue;
                             }
                             KeyCode::Down => {
-                                d.settings_selected = (d.settings_selected + 1) % 4;
+                                d.settings_selected = (d.settings_selected + 1) % 5;
                                 continue;
                             }
                             KeyCode::Enter => {
@@ -1733,7 +1741,10 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                             );
                             d.nudge_error.clear();
                         }
-                        KeyCode::Char('r' | 'R') if d.finished.is_some() => return Ok(true),
+                        KeyCode::Char('r' | 'R') if d.finished.is_some() => {
+                            runner::reopen_goal(path)?;
+                            return Ok(true);
+                        }
                         KeyCode::Char('r' | 'R') => {
                             if stop.swap(false, Ordering::SeqCst) {
                                 events::log("Stop cancelled; continuing normally.".into());
@@ -1896,7 +1907,7 @@ mod tests {
         assert_eq!(e.value, "héllo\nworld");
     }
     fn config() -> runner::Config {
-        runner::Config {repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,request_timeout_seconds:1800,command_review_seconds:120}
+        runner::Config {repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
     }
     fn screen_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();

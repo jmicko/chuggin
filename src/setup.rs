@@ -687,6 +687,13 @@ pub fn save_live_setting(path: &Path, field: usize, input: &str) -> Result<()> {
             anyhow::ensure!((1..=86400).contains(&seconds), "Choose 1–86400 seconds");
             config["command_review_seconds"] = json!(seconds);
         }
+        4 => {
+            config["allow_goal_completion"] = json!(match input.trim().to_lowercase().as_str() {
+                "true" | "yes" | "on" => true,
+                "false" | "no" | "off" => false,
+                _ => anyhow::bail!("Enter on or off"),
+            });
+        }
         _ => anyhow::bail!("Unknown project setting"),
     }
     save(path, &config)

@@ -511,6 +511,23 @@ verification. The Goal tab shows requests, completion reports, and history; reop
 a nudge if more work is needed. State lives in `.chuggin/nudges.json` separately
 from worker state so concurrent UI and model updates cannot overwrite one another.
 
+## Allowing goal completion
+
+In the observation view, open **5 Settings**, select **Allow goal completion**,
+and set it to **on**. It defaults to off and persists for this project. The next
+model call receives a tool to mark the overall goal complete when fully achieved
+and verified. There is no urgency prompt, reduced budget, or new work stage.
+Without that tool call, the loop continues normally.
+
+Completion saves the working tree and the model's summary and evidence, then
+pauses with **Model reports project complete**. Configured check results are
+recorded alongside the claim; the claim itself is not independent verification.
+The saved completion prevents automatic continuation after restarting. Press
+**R** from the paused observation view to explicitly reopen work, or turn the
+setting off and resume to return to indefinite looping. Reports remain in the
+cycle artifacts. Turning the setting off also rejects outstanding completion
+calls; running commands must finish before the model can report completion.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).

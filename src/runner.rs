@@ -30,6 +30,8 @@ pub struct Config {
     pub retry_seconds: u64,
     #[serde(default)]
     pub run_duration_seconds: u64,
+    #[serde(default)]
+    pub allow_goal_completion: bool,
     #[serde(default = "default_request_timeout")]
     pub request_timeout_seconds: u64,
     #[serde(default = "default_command_review")]
@@ -909,9 +911,11 @@ fn sync_nudge(c: &Config, session: &mut Conversation) -> Result<()> {
 
 struct WorkResult {
     finish_requested: Option<u64>,
+    project_completion: Option<Value>,
     summary: String,
 }
 fn work(
+    config_path: &Path,
     c: &Config,
     s: &mut State,
     m: &Model,
@@ -925,6 +929,7 @@ fn work(
     let mut research = crate::web_tools::Research::default();
     let mut jobs = crate::command_jobs::Jobs::default();
     let mut finish_requested = None;
+    let mut project_completion = None;
     let mut summary = String::new();
     for step in 0..c.implementation_calls {
         anyhow::ensure!(!stop.load(Ordering::SeqCst), "Stopped by operator");
@@ -970,6 +975,15 @@ fn work(
             )?;
         }
         sync_nudge(c, session)?;
+        let allow_completion = load(config_path)?.allow_goal_completion;
+        session.tools = crate::model::tools();
+        if allow_completion {
+            session
+                .tools
+                .as_array_mut()
+                .unwrap()
+                .push(crate::model::goal_completion_tool());
+        }
         crate::events::send(crate::events::Event::Phase("Work".into()));
         let response = match m.chat(&session.messages, Some(session.tools.clone()), false) {
             Ok(response) => response,
@@ -1040,6 +1054,10 @@ fn work(
             };
             let previous_task = s.task_serial;
             let result: Result<String> = (|| {
+                anyhow::ensure!(
+                    project_completion.is_none(),
+                    "Goal completion already reported; remaining actions were not executed"
+                );
                 if jobs.running()
                     && matches!(
                         name,
@@ -1051,6 +1069,7 @@ fn work(
                             | "restore_checkpoint"
                             | "finish_task"
                             | "finish_nudge"
+                            | "finish_project"
                             | "set_task"
                     )
                 {
@@ -1070,6 +1089,26 @@ fn work(
                         emit(art, "task", s.current_task.as_ref().unwrap())?;
                         save(&c.state_dir.join("state.json"), s)?;
                         Ok(json!({"task_id":s.task_serial,"message":"Task recorded. Files and criteria are planning hints, not edit restrictions. Existing work is retained."}).to_string())
+                    }
+                    "finish_project" => {
+                        anyhow::ensure!(
+                            allow_completion && load(config_path)?.allow_goal_completion,
+                            "Goal completion is not enabled by the user"
+                        );
+                        let summary = args["summary"].as_str().context("Missing summary")?.trim();
+                        let evidence = args["evidence"]
+                            .as_str()
+                            .context("Missing evidence")?
+                            .trim();
+                        anyhow::ensure!(
+                            !summary.is_empty() && !evidence.is_empty(),
+                            "Provide a completion summary and verification evidence"
+                        );
+                        project_completion = Some(json!({"summary":summary,"evidence":evidence}));
+                        Ok(
+                            "Goal completion reported. Saving the working tree before pausing."
+                                .into(),
+                        )
                     }
                     "finish_nudge" => {
                         let id = args["nudge_id"].as_u64().context("Missing nudge_id")?;
@@ -1359,7 +1398,7 @@ fn work(
             session.messages.push(json!({"role":"user","content":"Action-loop recovery: the same tool actions returned identical results repeatedly. No new information was obtained. Use a different diagnostic or approach; if no task is active, select new work with set_task. Do not repeat the same completion or no-op edit. Existing files and results remain available."}));
             save_conversation(c, session)?;
         }
-        if finish_requested.is_some() {
+        if finish_requested.is_some() || project_completion.is_some() {
             break;
         }
     }
@@ -1371,8 +1410,20 @@ fn work(
     save_conversation(c, session)?;
     Ok(WorkResult {
         finish_requested,
+        project_completion,
         summary,
     })
+}
+
+pub fn reopen_goal(path: &Path) -> Result<()> {
+    let c = load(path)?;
+    let _lock = lock_project(&c)?;
+    let report = c.state_dir.join("goal-completion.json");
+    if report.exists() {
+        fs::remove_file(report)?;
+    }
+    // The full completion report remains in the cycle artifacts.
+    Ok(())
 }
 
 pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()> {
@@ -1380,6 +1431,15 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
     crate::setup::ensure_git_identity(&c.repo)?;
     let _lock = lock_project(&c)?;
     let mut state = prepare_state(&c)?;
+    if c.allow_goal_completion && c.state_dir.join("goal-completion.json").exists() {
+        crate::events::log(
+            "Model reports project complete. Explicitly resume to reopen work.".into(),
+        );
+        return Ok(());
+    }
+    if !c.allow_goal_completion && c.state_dir.join("goal-completion.json").exists() {
+        fs::remove_file(c.state_dir.join("goal-completion.json"))?;
+    }
     let mut session = load_conversation(&c, &state)?;
     let started = Instant::now();
     let time_up = || {
@@ -1437,7 +1497,15 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
             "Cycle {}: continue working → check → checkpoint",
             state.cycle
         ));
-        let result = work(&c, &mut state, &model, &mut session, &art, &stage_stop);
+        let result = work(
+            path,
+            &c,
+            &mut state,
+            &model,
+            &mut session,
+            &art,
+            &stage_stop,
+        );
         let provider_stopped = result
             .as_ref()
             .err()
@@ -1575,6 +1643,24 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
             state.recent.remove(0);
         }
         save(&c.state_dir.join("state.json"), &state)?;
+        if let Some(mut report) = result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.project_completion.clone())
+            && load(path)?.allow_goal_completion
+        {
+            report["checkpoint"] = json!(state.working_ref);
+            report["cycle"] = json!(state.cycle);
+            report["checks_passed"] = json!(passed);
+            report["check_error"] = json!(check_error);
+            report["goal"] = json!(c.goal);
+            emit(&art, "goal-completion", &report)?;
+            save(&c.state_dir.join("goal-completion.json"), &report)?;
+            crate::events::log(
+                "Model reports project complete. Work saved; no further cycles scheduled.".into(),
+            );
+            break;
+        }
         if provider_stopped {
             crate::events::send(crate::events::Event::Phase(format!(
                 "Paused · {}",
