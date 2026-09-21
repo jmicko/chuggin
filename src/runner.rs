@@ -1224,7 +1224,15 @@ fn work(
             })();
             let value = match result {
                 Ok(value) => {
-                    let value = if name == "read_progress_note"
+                    let value = if matches!(
+                        name,
+                        "run_command"
+                            | "run_checks"
+                            | "compiler_diagnostics"
+                            | "command_status"
+                            | "command_input"
+                            | "stop_command"
+                    ) || name == "read_progress_note"
                         || (name == "read_file" && args.get("byte_offset").is_some())
                     {
                         value

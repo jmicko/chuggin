@@ -2919,7 +2919,7 @@ fn command_session_yields_to_model_and_can_be_polled_without_relaunching() {
             started = true;
             return (
                 String::new(),
-                json!([task_tool("Inspect long-running command"),{"function":{"name":"run_command","arguments":{"argv":["sh","-c","echo once >> launches.txt; sleep 2; echo DONE"],"timeout_seconds":30}}}]),
+                json!([task_tool("Inspect long-running command"),{"function":{"name":"run_command","arguments":{"argv":["sh","-c","echo once >> launches.txt; head -c 6000 /dev/zero | tr '\\000' '\\134'; sleep 2; echo DONE"],"timeout_seconds":30}}}]),
             );
         }
         let messages = body["messages"].as_array().unwrap();
