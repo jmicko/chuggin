@@ -46,6 +46,17 @@ pub fn diagnose(
     input: Value,
     art: &Path,
     id: u64,
+    inspect: impl FnMut(&str, &Value) -> Result<String>,
+) -> Result<Diagnosis> {
+    assess(model, input, art, id, PROMPT, inspect)
+}
+
+pub fn assess(
+    model: &Model,
+    input: Value,
+    art: &Path,
+    id: u64,
+    prompt: &str,
     mut inspect: impl FnMut(&str, &Value) -> Result<String>,
 ) -> Result<Diagnosis> {
     let mut tools: Vec<Value> = crate::model::tools()
@@ -57,7 +68,7 @@ pub fn diagnose(
         .collect();
     tools.push(json!({"type":"function","function":{"name":"report_diagnosis","description":"Report an evidence-based assessment and concrete next action. This does not mark a task complete.","parameters":{"type":"object","properties":{"verdict":{"type":"string","enum":["productive","stalled","uncertain"]},"reason":{"type":"string"},"next_action":{"type":"string"},"expected_new_evidence":{"type":"string"}},"required":["verdict","reason","next_action","expected_new_evidence"]}}}));
     let mut messages = vec![
-        json!({"role":"system","content":PROMPT}),
+        json!({"role":"system","content":prompt}),
         json!({"role":"user","content":input.to_string()}),
     ];
     fs::write(
@@ -67,12 +78,16 @@ pub fn diagnose(
     // Bounded assessor effort; the main project loop remains unlimited.
     for step in 0..6 {
         let available = if step == 5 {
-            messages.push(json!({"role":"user","content":"Inspection is finished. Use report_diagnosis now, based on the evidence available. Judge the recent repeated actions, not historical project progress. If evidence is insufficient, report uncertain with a concrete next investigation. Do not request further inspections."}));
+            messages.push(json!({"role":"user","content":"Inspection is finished. Use report_diagnosis now, based on the evidence available. Judge the observed command activity using your assessment instructions. If evidence is insufficient, report uncertain with a concrete next investigation. Do not request further inspections."}));
             json!([tools.last().context("Missing report tool")?])
         } else {
             json!(tools)
         };
-        let response = model.diagnostic_chat(&messages, available)?;
+        let response = if prompt == PROMPT {
+            model.diagnostic_chat(&messages, available)?
+        } else {
+            model.watchdog_chat(&messages, available)?
+        };
         if let Some(used) = model.take_completed_messages() {
             messages = used;
         }

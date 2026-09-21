@@ -31,6 +31,12 @@ pub enum Event {
         path: PathBuf,
     },
     CheckDone(bool),
+    CommandStatus {
+        id: String,
+        elapsed: u64,
+        next_review: u64,
+        running: bool,
+    },
     ValidationDone {
         passed: bool,
         checkpoint: Option<String>,

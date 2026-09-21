@@ -342,7 +342,7 @@ pub fn wizard() -> Result<PathBuf> {
             _ => crate::ui::notice("Enter a valid command with balanced quotes.".to_string()),
         }
     };
-    let timeout = number("Check timeout (seconds)", 120, 1, 86400)?;
+    let timeout = number("First command review (seconds)", 120, 1, 86400)?;
     // Do not accidentally initialize or commit an ancestor repository.
     let top = project::git(&root, &["rev-parse", "--show-toplevel"]).ok();
     if let Some(top) = top {
@@ -436,7 +436,7 @@ pub fn wizard() -> Result<PathBuf> {
     save(
         &config,
         &json!({"repo":".","goal":draft.goal,"state_dir":".chuggin",
-        "checks":[{"argv":check,"timeout_seconds":timeout}]}),
+        "command_review_seconds":timeout,"checks":[{"argv":check,"timeout_seconds":timeout}]}),
     )?;
     // Check merged project/global settings before starting.
     runner::load(&config)?;
@@ -681,6 +681,11 @@ pub fn save_live_setting(path: &Path, field: usize, input: &str) -> Result<()> {
             } else {
                 "run_duration_seconds"
             }] = json!(seconds.round() as u64);
+        }
+        3 => {
+            let seconds: u64 = input.trim().parse().context("Enter whole seconds")?;
+            anyhow::ensure!((1..=86400).contains(&seconds), "Choose 1–86400 seconds");
+            config["command_review_seconds"] = json!(seconds);
         }
         _ => anyhow::bail!("Unknown project setting"),
     }

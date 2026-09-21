@@ -32,6 +32,11 @@ pub struct Config {
     pub run_duration_seconds: u64,
     #[serde(default = "default_request_timeout")]
     pub request_timeout_seconds: u64,
+    #[serde(default = "default_command_review")]
+    pub command_review_seconds: u64,
+}
+pub fn default_command_review() -> u64 {
+    120
 }
 pub fn default_request_timeout() -> u64 {
     1800
@@ -68,7 +73,7 @@ struct Outcome {
     artifact_dir: PathBuf,
 }
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-struct Task {
+pub(crate) struct Task {
     title: String,
     #[serde(default)]
     objective: String,
@@ -242,6 +247,10 @@ pub fn load(path: &Path) -> Result<Config> {
         "implementation_calls must be 1..100"
     );
     anyhow::ensure!(c.retry_seconds >= 1, "retry_seconds must be positive");
+    anyhow::ensure!(
+        (1..=86400).contains(&c.command_review_seconds),
+        "Command review interval must be 1–86400 seconds"
+    );
     for check in &c.checks {
         anyhow::ensure!(
             !check.argv.is_empty() && check.timeout_seconds > 0,
@@ -280,34 +289,6 @@ pub fn status(path: &Path) -> Result<()> {
         crate::events::log("No run started.".to_string());
     }
     Ok(())
-}
-fn checks(
-    c: &Config,
-    workspace: &Path,
-    art: &Path,
-    label: &str,
-    stop: &AtomicBool,
-) -> Result<Vec<CheckResult>> {
-    let mut results: Vec<CheckResult> = c
-        .checks
-        .iter()
-        .enumerate()
-        .map(|(i, x)| project::check(workspace, x, &art.join(format!("{label}-{i}.log")), stop))
-        .collect::<Result<_>>()?;
-    for result in &mut results {
-        if workspace.join("Cargo.toml").exists()
-            && result.output.contains("running 0 tests")
-            && !result.output.lines().any(|line| {
-                line.strip_prefix("running ")
-                    .and_then(|s| s.split_whitespace().next())
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .is_some_and(|n| n > 0)
-            })
-        {
-            result.output.push_str("\nChuggin: ZERO tests executed. New .rs files are not compiled automatically. Wire modules from src/lib.rs (pub mod ...) or src/main.rs (mod ...), then run checks again. A green empty suite does not verify new source files.\n");
-        }
-    }
-    Ok(results)
 }
 fn emit(art: &Path, stage: &str, value: &impl Serialize) -> Result<()> {
     if matches!(stage, "task" | "outcome")
@@ -770,7 +751,7 @@ fn file_target(root: &Path, path: &str) -> Result<PathBuf> {
     );
     project::safe_path(root, path)
 }
-fn inspect_tool(
+pub(crate) fn inspect_tool(
     root: &Path,
     name: &str,
     args: &Value,
@@ -922,11 +903,19 @@ fn work(
     session.messages.push(json!({"role":"user","content":json!({"cycle":s.cycle,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"working_checkpoint":s.working_ref,"instruction":if s.current_task.is_some() {"Continue the active task from existing files and the latest check feedback. Investigate and repair unresolved failures. All work is retained."} else {"There is no active task. Previous completions are already saved. Inspect what is needed toward the main goal and use set_task for the next useful task, then work on it. Research and foundational work count; do not report an old task complete again."}}).to_string()}));
     save_conversation(c, session)?;
     let mut research = crate::web_tools::Research::default();
+    let mut jobs = crate::command_jobs::Jobs::default();
     let mut finish_requested = None;
     let mut summary = String::new();
     for step in 0..c.implementation_calls {
         anyhow::ensure!(!stop.load(Ordering::SeqCst), "Stopped by operator");
-        recover_commands(c, s, m, session, art)?;
+        for update in jobs.monitor(c, s.current_task.as_ref(), m, stop)? {
+            session.messages.push(
+                json!({"role":"user","content":json!({"command_update":update}).to_string()}),
+            );
+        }
+        if !jobs.running() {
+            recover_commands(c, s, m, session, art)?;
+        }
         if std::mem::take(&mut session.command_watch.notice_pending) {
             session
                 .messages
@@ -1023,139 +1012,215 @@ fn work(
             )));
             let root = s.working_workspace.clone();
             let command = matches!(name, "run_command" | "run_checks" | "compiler_diagnostics");
-            let before_command = if command {
+            let before_command = if command && !jobs.running() {
                 working_tree(&root).ok()
             } else {
                 None
             };
             let previous_task = s.task_serial;
-            let result: Result<String> = (|| match name {
-                "set_task" => {
-                    let task: Task = serde_json::from_value(args.clone())?;
-                    anyhow::ensure!(!task.title.trim().is_empty(), "Task needs a title");
-                    if s.current_task.as_ref() != Some(&task) {
-                        s.task_serial += 1;
-                        s.current_task = Some(task);
-                    }
-                    finish_requested = None;
-                    emit(art, "task", s.current_task.as_ref().unwrap())?;
-                    save(&c.state_dir.join("state.json"), s)?;
-                    Ok(json!({"task_id":s.task_serial,"message":"Task recorded. Files and criteria are planning hints, not edit restrictions. Existing work is retained."}).to_string())
-                }
-                "finish_task" => {
-                    if s.current_task.is_none() {
-                        return Ok(json!({"completion_recorded":false,"last_completed_task":s.completed_tasks.last(),"message":"No task is active. Previous completions are already saved. Use set_task to select the next useful work toward the main goal; this call does not end the work interval."}).to_string());
-                    }
-                    if let Some(id) = args.get("task_id") {
-                        anyhow::ensure!(
-                            id.as_u64() == Some(s.task_serial),
-                            "Task id is not current. Inspect the current task before reporting completion."
-                        );
-                    }
-                    summary = args["summary"]
-                        .as_str()
-                        .context("Missing summary")?
-                        .to_owned();
-                    finish_requested = Some(s.task_serial);
-                    Ok("Completion intent recorded. The harness will check and save this checkpoint, retaining any unresolved failures for continued repair.".into())
-                }
-                "save_progress_note" => {
-                    let note = args["note"].as_str().context("Missing note")?;
-                    let note = if args["append"] == true {
-                        format!("{}\n{}", session.note.model_note, note)
-                    } else {
-                        note.to_owned()
-                    };
-                    session.note.set_note(&note)?;
-                    session.note.task_id = s.current_task.as_ref().map(|_| s.task_serial);
-                    Ok("Complete progress note saved. Use read_progress_note to retrieve it; context handoffs carry an excerpt. Verify notes against current files and checks.".into())
-                }
-                "read_progress_note" => {
-                    let offset = match args.get("offset") {
-                        Some(v) => {
-                            usize::try_from(v.as_u64().context("offset must be nonnegative")?)?
-                        }
-                        None => 0,
-                    };
-                    Ok(session.note.page(offset)?.to_string())
-                }
-                "edit_file" => {
-                    let path = args["path"].as_str().context("Missing path")?;
-                    file_target(&root, path)?;
-                    project::edit(
-                        &root,
-                        path,
-                        args["old_text"].as_str().context("Missing old_text")?,
-                        args["new_text"].as_str().context("Missing new_text")?,
+            let result: Result<String> = (|| {
+                if jobs.running()
+                    && matches!(
+                        name,
+                        "run_command"
+                            | "run_checks"
+                            | "compiler_diagnostics"
+                            | "edit_file"
+                            | "write_file"
+                            | "restore_checkpoint"
+                            | "finish_task"
+                            | "set_task"
                     )
-                }
-                "write_file" => {
-                    let path = args["path"].as_str().context("Missing path")?;
-                    file_target(&root, path)?;
-                    let changed = project::write(
-                        &root,
-                        path,
-                        args["content"].as_str().context("Missing content")?,
-                    )?;
-                    Ok(json!({"path":path,"changed":changed,"message":if changed {"File written"} else {"No bytes changed; the file already has this content."}}).to_string())
-                }
-                "run_checks" => {
-                    crate::events::send(crate::events::Event::Phase("Check".into()));
-                    let results = checks(c, &root, art, &format!("tool-{step}-{index}"), stop);
-                    crate::events::send(crate::events::Event::ValidationDone {
-                        passed: results
-                            .as_ref()
-                            .is_ok_and(|r| !r.is_empty() && r.iter().all(|check| check.passed)),
-                        checkpoint: None,
-                    });
-                    Ok(serde_json::to_string(&results?)?)
-                }
-                "run_command" => {
-                    Ok(
-                        crate::dev_tools::run(&root, art, &format!("{step}-{index}"), args, stop)?
-                            .to_string(),
-                    )
-                }
-                "read_command_log" => Ok(crate::dev_tools::read_log(art, args)?.to_string()),
-                "compiler_diagnostics" => Ok(crate::dev_tools::diagnostics(
-                    &root,
-                    art,
-                    &format!("{step}-{index}"),
-                    stop,
-                )?
-                .to_string()),
-                "restore_checkpoint" => {
-                    let reference = args["commit"].as_str().context("Missing commit")?;
-                    let reason = args["reason"]
-                        .as_str()
-                        .context("Explain why this checkpoint should be restored")?;
-                    anyhow::ensure!(
-                        !reason.trim().is_empty()
-                            && reference.len() >= 7
-                            && reference.len() <= 64
-                            && reference.bytes().all(|b| b.is_ascii_hexdigit()),
-                        "Provide a commit hash and a reason"
+                {
+                    anyhow::bail!(
+                        "A command is still running. Inspect it with command_status, read relevant files, or stop it with an evidence-based reason before editing, launching more work, or completing the task."
                     );
-                    project::git(&root, &["merge-base", "--is-ancestor", reference, "HEAD"])?;
-                    checkpoint(c, s, "chuggin: save work before requested restoration")?;
-                    emit(
-                        art,
-                        &format!("restore-{step}-{index}"),
-                        &json!({"from":s.working_ref,"to":reference,"reason":reason}),
-                    )?;
-                    let mut command = vec![
-                        "restore",
-                        "--source",
-                        reference,
-                        "--staged",
-                        "--worktree",
-                        "--",
-                    ];
-                    command.extend_from_slice(PROJECT_PATHS);
-                    project::git(&root, &command)?;
-                    Ok("Restored the requested checkpoint. Prior work is saved in Git. Inspect the files and run checks again.".into())
                 }
-                _ => inspect_tool(&root, name, args, &mut research),
+                match name {
+                    "set_task" => {
+                        let task: Task = serde_json::from_value(args.clone())?;
+                        anyhow::ensure!(!task.title.trim().is_empty(), "Task needs a title");
+                        if s.current_task.as_ref() != Some(&task) {
+                            s.task_serial += 1;
+                            s.current_task = Some(task);
+                        }
+                        finish_requested = None;
+                        emit(art, "task", s.current_task.as_ref().unwrap())?;
+                        save(&c.state_dir.join("state.json"), s)?;
+                        Ok(json!({"task_id":s.task_serial,"message":"Task recorded. Files and criteria are planning hints, not edit restrictions. Existing work is retained."}).to_string())
+                    }
+                    "finish_task" => {
+                        if s.current_task.is_none() {
+                            return Ok(json!({"completion_recorded":false,"last_completed_task":s.completed_tasks.last(),"message":"No task is active. Previous completions are already saved. Use set_task to select the next useful work toward the main goal; this call does not end the work interval."}).to_string());
+                        }
+                        if let Some(id) = args.get("task_id") {
+                            anyhow::ensure!(
+                                id.as_u64() == Some(s.task_serial),
+                                "Task id is not current. Inspect the current task before reporting completion."
+                            );
+                        }
+                        summary = args["summary"]
+                            .as_str()
+                            .context("Missing summary")?
+                            .to_owned();
+                        finish_requested = Some(s.task_serial);
+                        Ok("Completion intent recorded. The harness will check and save this checkpoint, retaining any unresolved failures for continued repair.".into())
+                    }
+                    "save_progress_note" => {
+                        let note = args["note"].as_str().context("Missing note")?;
+                        let note = if args["append"] == true {
+                            format!("{}\n{}", session.note.model_note, note)
+                        } else {
+                            note.to_owned()
+                        };
+                        session.note.set_note(&note)?;
+                        session.note.task_id = s.current_task.as_ref().map(|_| s.task_serial);
+                        Ok("Complete progress note saved. Use read_progress_note to retrieve it; context handoffs carry an excerpt. Verify notes against current files and checks.".into())
+                    }
+                    "read_progress_note" => {
+                        let offset = match args.get("offset") {
+                            Some(v) => {
+                                usize::try_from(v.as_u64().context("offset must be nonnegative")?)?
+                            }
+                            None => 0,
+                        };
+                        Ok(session.note.page(offset)?.to_string())
+                    }
+                    "edit_file" => {
+                        let path = args["path"].as_str().context("Missing path")?;
+                        file_target(&root, path)?;
+                        project::edit(
+                            &root,
+                            path,
+                            args["old_text"].as_str().context("Missing old_text")?,
+                            args["new_text"].as_str().context("Missing new_text")?,
+                        )
+                    }
+                    "write_file" => {
+                        let path = args["path"].as_str().context("Missing path")?;
+                        file_target(&root, path)?;
+                        let changed = project::write(
+                            &root,
+                            path,
+                            args["content"].as_str().context("Missing content")?,
+                        )?;
+                        Ok(json!({"path":path,"changed":changed,"message":if changed {"File written"} else {"No bytes changed; the file already has this content."}}).to_string())
+                    }
+                    "run_checks" | "run_command" | "compiler_diagnostics" => {
+                        let mut checks = if name == "run_checks" {
+                            c.checks.clone()
+                        } else if name == "compiler_diagnostics" {
+                            vec![Check {
+                                argv: vec![
+                                    "cargo".into(),
+                                    "check".into(),
+                                    "--all-targets".into(),
+                                    "--message-format=json".into(),
+                                ],
+                                timeout_seconds: 120,
+                            }]
+                        } else {
+                            let raw = if let Some(text) = args["argv"].as_str() {
+                                serde_json::from_str(text)?
+                            } else {
+                                args["argv"].clone()
+                            };
+                            let argv: Vec<String> = serde_json::from_value(raw)?;
+                            anyhow::ensure!(
+                                !argv.is_empty()
+                                    && argv.len() <= 128
+                                    && argv.iter().all(|v| !v.contains('\0'))
+                                    && argv.iter().map(String::len).sum::<usize>() <= 16000,
+                                "Invalid command argv"
+                            );
+                            let seconds = match args.get("timeout_seconds") {
+                                Some(v) => {
+                                    v.as_u64().context("timeout_seconds must be positive")?
+                                }
+                                None => 120,
+                            };
+                            anyhow::ensure!(
+                                (1..=86400).contains(&seconds),
+                                "timeout_seconds must be 1–86400"
+                            );
+                            vec![Check {
+                                argv,
+                                timeout_seconds: seconds,
+                            }]
+                        };
+                        for check in &mut checks {
+                            check.timeout_seconds = check
+                                .timeout_seconds
+                                .min(m.command_review_seconds(c.command_review_seconds));
+                        }
+                        let job = crate::command_jobs::Job::new(
+                            &root,
+                            art,
+                            &format!("{step}-{index}"),
+                            checks,
+                            name == "run_checks",
+                            name == "compiler_diagnostics",
+                        )?;
+                        let mut output = jobs.start(job, stop)?;
+                        output["arguments_normalized"] = json!(args["argv"].is_string());
+                        Ok(output.to_string())
+                    }
+                    "command_status" | "command_input" | "stop_command" => {
+                        let job =
+                            jobs.get(args["command_id"].as_str().context("Missing command_id")?)?;
+                        if name == "stop_command" {
+                            let reason = args["reason"]
+                                .as_str()
+                                .filter(|s| !s.trim().is_empty())
+                                .context("Explain why the command should stop")?;
+                            job.terminate(reason)?;
+                        } else if name == "command_input" {
+                            let written = job.input(args)?;
+                            let mut output = job.poll(0, stop)?;
+                            output["input_bytes_written"] = json!(written);
+                            output["input_instruction"] = json!(
+                                "If fewer bytes were written than supplied, retry only the remaining bytes; stdin closes only after all supplied bytes are written."
+                            );
+                            return Ok(output.to_string());
+                        }
+                        Ok(job
+                            .poll(args["wait_ms"].as_u64().unwrap_or(1000).min(1000), stop)?
+                            .to_string())
+                    }
+                    "read_command_log" => Ok(crate::dev_tools::read_log(art, args)?.to_string()),
+                    "restore_checkpoint" => {
+                        let reference = args["commit"].as_str().context("Missing commit")?;
+                        let reason = args["reason"]
+                            .as_str()
+                            .context("Explain why this checkpoint should be restored")?;
+                        anyhow::ensure!(
+                            !reason.trim().is_empty()
+                                && reference.len() >= 7
+                                && reference.len() <= 64
+                                && reference.bytes().all(|b| b.is_ascii_hexdigit()),
+                            "Provide a commit hash and a reason"
+                        );
+                        project::git(&root, &["merge-base", "--is-ancestor", reference, "HEAD"])?;
+                        checkpoint(c, s, "chuggin: save work before requested restoration")?;
+                        emit(
+                            art,
+                            &format!("restore-{step}-{index}"),
+                            &json!({"from":s.working_ref,"to":reference,"reason":reason}),
+                        )?;
+                        let mut command = vec![
+                            "restore",
+                            "--source",
+                            reference,
+                            "--staged",
+                            "--worktree",
+                            "--",
+                        ];
+                        command.extend_from_slice(PROJECT_PATHS);
+                        project::git(&root, &command)?;
+                        Ok("Restored the requested checkpoint. Prior work is saved in Git. Inspect the files and run checks again.".into())
+                    }
+                    _ => inspect_tool(&root, name, args, &mut research),
+                }
             })();
             let value = match result {
                 Ok(value) => {
@@ -1175,7 +1240,9 @@ fn work(
                 }
                 Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
             };
-            if command {
+            if command && value["result"]["running"] == true {
+                session.command_watch.reset_streak();
+            } else if command {
                 let after_command = working_tree(&root).ok();
                 let observed_args = if name == "run_checks" {
                     json!({"checks":c.checks})
@@ -1243,6 +1310,12 @@ fn work(
             break;
         }
     }
+    for update in jobs.drain(c, s.current_task.as_ref(), m, stop)? {
+        session.messages.push(
+            json!({"role":"user","content":json!({"command_final_result":update}).to_string()}),
+        );
+    }
+    save_conversation(c, session)?;
     Ok(WorkResult {
         finish_requested,
         summary,
@@ -1324,13 +1397,29 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
         }
         crate::events::send(crate::events::Event::Phase("Check".into()));
         let before_check = working_tree(&state.working_workspace)?;
-        let validation = checks(
-            &c,
-            &state.working_workspace,
-            &art,
-            "verification",
-            &stage_stop,
-        );
+        let validation = (|| -> Result<Vec<CheckResult>> {
+            if c.checks.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut job = crate::command_jobs::Job::new(
+                &state.working_workspace,
+                &art,
+                "verification",
+                c.checks
+                    .iter()
+                    .cloned()
+                    .map(|mut check| {
+                        check.timeout_seconds = check
+                            .timeout_seconds
+                            .min(model.command_review_seconds(c.command_review_seconds));
+                        check
+                    })
+                    .collect(),
+                true,
+                false,
+            )?;
+            job.wait(&c, state.current_task.as_ref(), &model, &stage_stop)
+        })();
         let after_check = working_tree(&state.working_workspace)?;
         let check_error = validation.as_ref().err().map(|e| format!("{e:#}"));
         let results = validation.unwrap_or_default();

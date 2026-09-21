@@ -1,5 +1,16 @@
 static ACTIVE_CHECK: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+pub fn register_check(pid: i32) {
+    ACTIVE_CHECK.store(pid, std::sync::atomic::Ordering::SeqCst);
+}
+pub fn unregister_check(pid: i32) {
+    let _ = ACTIVE_CHECK.compare_exchange(
+        pid,
+        0,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
 pub fn kill_active_check() {
     let pid = ACTIVE_CHECK.load(std::sync::atomic::Ordering::SeqCst);
     #[cfg(unix)]
@@ -14,10 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
-    thread,
-    time::{Duration, Instant},
+    process::Command,
 };
 
 pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
@@ -151,7 +159,19 @@ pub struct CheckResult {
     pub timed_out: bool,
     pub output: String,
 }
-pub fn check(root: &Path, c: &Check, log: &Path, stop: &AtomicBool) -> Result<CheckResult> {
+#[cfg(test)]
+pub fn check(
+    root: &Path,
+    c: &Check,
+    log: &Path,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<CheckResult> {
+    use std::{
+        process::Stdio,
+        sync::atomic::Ordering,
+        thread,
+        time::{Duration, Instant},
+    };
     anyhow::ensure!(!c.argv.is_empty(), "Check argv must not be empty");
     let file = fs::File::create(log)?;
     crate::events::send(crate::events::Event::Check {

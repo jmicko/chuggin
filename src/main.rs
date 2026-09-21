@@ -1,5 +1,7 @@
 mod action_watch;
 mod code_index;
+mod command_jobs;
+mod command_session;
 mod command_watch;
 mod dev_tools;
 mod events;

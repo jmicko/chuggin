@@ -268,18 +268,55 @@ survives cycles and restarts. Healthy runs do not pay for a diagnostic on every 
 
 The working agent can use **run_command** with an executable and argument array,
 for example `["cargo", "test", "unicode"]` or `["cargo", "fmt"]`. Commands run
-in the persistent workspace, with no implicit shell and no interactive stdin.
+in the persistent workspace, with no implicit shell.
 If the model supplies a valid JSON-encoded argument array, Chuggin decodes it and
 reports `arguments_normalized: true`. Arbitrary command strings are not interpreted.
-The default timeout is 120 seconds; a call can select 1–600 seconds. Chuggin
-returns the exit code, timeout status, a bounded output tail, and a log ID.
+Starting with **0.8.0**, commands return within about one second. If unfinished,
+they return `running: true` and a `command_id`. **command_status** inspects or waits
+briefly for that same process; **command_input** sends stdin text (including an
+explicit newline when needed) or closes stdin; **stop_command** terminates the
+process group with a recorded reason. Input reports how many bytes were accepted,
+so callers can retry only the remainder if a pipe is full. These are pipe-backed
+sessions, not full PTYs. Completed responses include the exit status, bounded
+output tail, and full log ID. The agent can inspect files while a command runs;
+new commands, project edits, restoration and task completion wait until it finishes.
+This prevents duplicate builds and checks racing with edits.
+
+A fresh, read-only **watchdog** inspects long-running processes. The default first
+review is after 120 seconds, configurable in observation Settings as **Command
+first review (seconds)**. It applies to newly started commands. For compatibility,
+existing check/tool `timeout_seconds` values now request an earlier first review
+(the smaller of that value and `command_review_seconds`), not an automatic kill.
+The watchdog sees purpose, current task, recent output, elapsed time, time since
+output, and Linux process-tree counters where available. It can inspect source
+and full logs, but cannot edit or run additional commands. Quiet output, high CPU,
+and runtime alone are not grounds for termination.
+
+A productive or uncertain verdict lets the existing process continue, with another
+review in five minutes. A stalled verdict terminates it and returns the reason and
+suggested repair to the working agent. If the watchdog is unavailable or cannot
+produce a valid report, the process keeps running and review is retried later.
+Watchdog requests have a two-minute per-request deadline and no provider retry
+loop; at most six requests are made per review. A command that finishes during
+inspection keeps its actual exit result. Reviews run sequentially between working
+model calls or while waiting for a command; they do not interrupt an in-flight
+model request or require parallel Ollama inference.
+
+Both model-requested commands and final checkpoint checks use this mechanism.
+Unfinished commands are awaited before checkpoint verification; running checks
+never count as passing. Sessions belong to the current cycle and are not reattached
+on restart. Errors or normal shutdown clean up owned processes; force stop kills
+the active process group. Files and command logs are retained. Session metadata
+is saved beside logs as `*.session.json`; `watchdog-*/decision.json` and diagnostic
+artifacts record each assessment. The observation sidebar shows command elapsed
+time and time until its next review.
 **read_command_log** retrieves the full log in chunks, including logs from earlier
 cycles. Use the complete returned ID, such as `cycle-000003/command-2-0.log`, so
 continued conversations retrieve the original evidence even after command numbers
 repeat. Legacy IDs without a cycle prefix refer only to the current cycle.
 Commands and checks share
-the live output view and process-group cleanup on completion, timeout, or force stop.
-Application runs are bounded foreground runs, not persistent interactive sessions.
+the live output view and process-group cleanup on completion or explicit termination.
+Long-running applications can be inspected during a cycle, but are not detached services.
 
 **compiler_diagnostics** is a Rust helper that requires a Cargo manifest. It runs
 Cargo check for all targets and returns grouped errors/warnings, source locations,
@@ -339,7 +376,7 @@ Reaching the step budget proceeds to checks and a saved checkpoint.
 It does not discard unfinished edits or pause the project. Model requests default
 to a 30-minute total timeout; set it to 0 for no request deadline. Connection
 establishment remains bounded to ten seconds.
-Checks have their own individual timeouts. A timeout or connection failure retries
+Command reviews are separate from model-request timeouts. A timeout or connection failure retries
 the same model request once, retaining completed edits and validation instead of
 restarting earlier stages. If the retry fails, the existing files are still
 retained for continued work.

@@ -1,22 +1,29 @@
 //! Project execution and bounded access to its evidence across cycles.
-use crate::project::{self, Check};
+use crate::project;
+#[cfg(test)]
+use crate::project::Check;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::BTreeMap,
     fs,
     io::{Read, Seek, SeekFrom},
     path::Path,
-    sync::atomic::AtomicBool,
 };
 
 pub fn schemas() -> Vec<Value> {
     vec![
-        json!({"type":"function","function":{"name":"run_command","description":"Run an executable with argv in the private task workspace. Examples: [\"cargo\",\"test\",\"test_name\"], [\"cargo\",\"fmt\"]. No implicit shell; pipes/redirection are literal arguments. Commands finish or time out; background children are terminated. Returns exit_code, output tail and log_id. Honor task scope. Do not commit, reset Git, modify Chuggin state or operate outside this workspace. Configured final checks still run independently.","parameters":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":600},"reason":{"type":"string","description":"Optional purpose: what new evidence this run should obtain, especially for repeated trials or polling."}},"required":["argv"]}}}),
+        json!({"type":"function","function":{"name":"command_status","description":"Inspect or wait briefly for an existing command; returns output tail, elapsed time, running status and final result. Do not start duplicate commands. Polls are not new tests.","parameters":{"type":"object","properties":{"command_id":{"type":"string"},"wait_ms":{"type":"integer","minimum":0,"maximum":1000}},"required":["command_id"]}}}),
+        json!({"type":"function","function":{"name":"command_input","description":"Send text to an existing command stdin, optionally closing stdin. No implicit newline; include it when needed.","parameters":{"type":"object","properties":{"command_id":{"type":"string"},"text":{"type":"string"},"close_stdin":{"type":"boolean"}},"required":["command_id"]}}}),
+        json!({"type":"function","function":{"name":"stop_command","description":"Terminate a command and its descendants when evidence establishes it should stop. Provide an explanation; preserve files for repair.","parameters":{"type":"object","properties":{"command_id":{"type":"string"},"reason":{"type":"string"}},"required":["command_id","reason"]}}}),
+        json!({"type":"function","function":{"name":"run_command","description":"Run an executable with argv in the private task workspace. Examples: [\"cargo\",\"test\",\"test_name\"], [\"cargo\",\"fmt\"]. No implicit shell; pipes/redirection are literal arguments. Returns promptly with a command_id and running status if unfinished. Use command_status, command_input or stop_command. timeout_seconds is an initial watchdog review interval, NOT an automatic kill deadline. Background children are cleaned up when the command finishes. Returns exit_code, output tail and log_id. Honor task scope. Do not commit, reset Git, modify Chuggin state or operate outside this workspace. Configured final checks still run independently.","parameters":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":86400},"reason":{"type":"string","description":"Optional purpose: what new evidence this run should obtain, especially for repeated trials or polling."}},"required":["argv"]}}}),
         json!({"type":"function","function":{"name":"compiler_diagnostics","description":"Run cargo check --all-targets and group Rust errors/warnings with source locations, snippets and compiler suggestions. Use after compiler failure rather than guessing APIs. This does not run tests or replace run_checks. Full raw output is available through log_id.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"read_command_log","description":"Read an earlier command/diagnostics log, including prior cycles, in bounded byte chunks. Use the complete log_id and next_offset returned by tools; do not repeat the same offset.","parameters":{"type":"object","properties":{"log_id":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["log_id"]}}}),
     ]
 }
+#[cfg(test)]
 pub fn run(root: &Path, art: &Path, id: &str, args: &Value, stop: &AtomicBool) -> Result<Value> {
     // Some models encode the array twice. Decode only valid JSON, never shell text.
     let normalized = args["argv"].is_string();
@@ -64,6 +71,7 @@ pub fn run(root: &Path, art: &Path, id: &str, args: &Value, stop: &AtomicBool) -
         json!({"exit_code":result.exit_code,"passed":result.passed,"timed_out":result.timed_out,"output_tail":output_tail(&result.output,7000),"log_id":log_id,"log_bytes":bytes,"arguments_normalized":normalized,"instruction":"Use read_command_log for full output. A successful command does not replace configured final checks."}),
     )
 }
+#[cfg(test)]
 fn output_tail(text: &str, limit: usize) -> &str {
     let mut start = text.len().saturating_sub(limit);
     while !text.is_char_boundary(start) {
@@ -75,7 +83,8 @@ fn cycle_name(name: &str) -> bool {
     name.strip_prefix("cycle-")
         .is_some_and(|digits| digits.len() >= 6 && digits.bytes().all(|b| b.is_ascii_digit()))
 }
-fn qualified_log_id(art: &Path, filename: &str) -> String {
+#[cfg(test)]
+pub(crate) fn qualified_log_id(art: &Path, filename: &str) -> String {
     match art.file_name().and_then(|name| name.to_str()) {
         Some(cycle) if cycle_name(cycle) => format!("{cycle}/{filename}"),
         _ => filename.to_owned(),
@@ -134,6 +143,7 @@ pub fn read_log(art: &Path, args: &Value) -> Result<Value> {
         json!({"log_id":id,"offset":offset,"total_bytes":total,"text":String::from_utf8_lossy(&bytes),"next_offset":if next<total{Some(next)}else{None}}),
     )
 }
+#[cfg(test)]
 pub fn diagnostics(root: &Path, art: &Path, id: &str, stop: &AtomicBool) -> Result<Value> {
     anyhow::ensure!(
         root.join("Cargo.toml").is_file(),
@@ -174,7 +184,7 @@ pub fn diagnostics(root: &Path, art: &Path, id: &str, stop: &AtomicBool) -> Resu
     }
     Ok(summary)
 }
-fn summarize(root: &Path, raw: &str) -> Value {
+pub(crate) fn summarize(root: &Path, raw: &str) -> Value {
     let mut grouped: BTreeMap<String, Value> = BTreeMap::new();
     let mut total = 0;
     for line in raw.lines() {

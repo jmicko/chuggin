@@ -633,6 +633,7 @@ struct Dashboard {
     tail: Option<Tail>,
     partial_model: String,
     partial_check: String,
+    command_status: Option<(String, u64, u64, Instant)>,
     history: VecDeque<String>,
     last_check: Option<bool>,
     last_passing_checkpoint: Option<String>,
@@ -674,6 +675,7 @@ impl Dashboard {
             tail: None,
             partial_model: String::new(),
             partial_check: String::new(),
+            command_status: None,
             history: VecDeque::new(),
             last_check: None,
             last_passing_checkpoint: None,
@@ -818,7 +820,16 @@ impl Dashboard {
                     .map(|file| Tail { file, offset: 0 });
                 self.push(Kind::Check, format!("$ {command}"));
             }
+            Event::CommandStatus {
+                id,
+                elapsed,
+                next_review,
+                running,
+            } => {
+                self.command_status = running.then(|| (id, elapsed, next_review, Instant::now()));
+            }
             Event::CheckDone(ok) => {
+                self.command_status = None;
                 self.poll_tail();
                 self.tail = None;
                 let s = std::mem::take(&mut self.partial_check);
@@ -922,7 +933,8 @@ fn setting_value(c: &runner::Config, field: usize) -> String {
     match field {
         0 => c.model.clone(),
         1 => format!("{}", c.request_timeout_seconds as f64 / 60.0),
-        _ => format!("{}", c.run_duration_seconds as f64 / 3600.0),
+        2 => format!("{}", c.run_duration_seconds as f64 / 3600.0),
+        _ => c.command_review_seconds.to_string(),
     }
 }
 fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
@@ -935,6 +947,7 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
         "Model (exact installed name)",
         "Request timeout (minutes; 0 unlimited)",
         "Run duration (hours; 0 unlimited)",
+        "Command first review (seconds)",
     ]
     .iter()
     .enumerate()
@@ -974,6 +987,7 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
         Line::from(format!("Current/last request model: {}", d.active_model)),
         Line::from("Timer changes apply now, measured from this run's start."),
         Line::from("An expired timer finishes the cycle; it never cancels a call."),
+        Line::from("Command review changes apply when the next command starts."),
         Line::from(d.settings_error.clone()).fg(GOLD),
     ]);
     lines
@@ -1179,7 +1193,15 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             } else if d.request_active {
                 "● Receiving response".to_owned()
             } else {
-                "○ Between requests".to_owned()
+                if let Some((id, elapsed, review, at)) = &d.command_status {
+                    format!(
+                        "Cmd {id}: {}s · review {}s",
+                        elapsed + at.elapsed().as_secs(),
+                        review.saturating_sub(at.elapsed().as_secs())
+                    )
+                } else {
+                    "○ Between requests".to_owned()
+                }
             })
             .fg(if d.request_active { GREEN } else { MUTED }),
             Line::from(format!("{:.1} tok/s · last reply", d.speed)),
@@ -1444,11 +1466,11 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                         }
                         match k.code {
                             KeyCode::Up => {
-                                d.settings_selected = (d.settings_selected + 2) % 3;
+                                d.settings_selected = (d.settings_selected + 3) % 4;
                                 continue;
                             }
                             KeyCode::Down => {
-                                d.settings_selected = (d.settings_selected + 1) % 3;
+                                d.settings_selected = (d.settings_selected + 1) % 4;
                                 continue;
                             }
                             KeyCode::Enter => {
@@ -1629,7 +1651,7 @@ mod tests {
         assert_eq!(e.value, "héllo\nworld");
     }
     fn config() -> runner::Config {
-        runner::Config {repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,request_timeout_seconds:1800}
+        runner::Config {repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,request_timeout_seconds:1800,command_review_seconds:120}
     }
     fn screen_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();

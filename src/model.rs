@@ -31,6 +31,7 @@ pub struct Model {
     context: u32,
     output: u32,
     output_cap: Cell<Option<u32>>,
+    watchdog_call: Cell<bool>,
     stop: Arc<AtomicBool>,
     trace: RefCell<Option<PathBuf>>,
     sequence: Cell<u32>,
@@ -57,6 +58,7 @@ impl Model {
             context,
             output,
             output_cap: Cell::new(None),
+            watchdog_call: Cell::new(false),
             stop,
             trace: RefCell::new(None),
             sequence: Cell::new(0),
@@ -72,6 +74,13 @@ impl Model {
     }
     pub fn take_completed_messages(&self) -> Option<Vec<Value>> {
         self.completed_messages.borrow_mut().take()
+    }
+    pub fn command_review_seconds(&self, fallback: u64) -> u64 {
+        self.settings_path
+            .as_ref()
+            .and_then(|p| crate::runner::load(p).ok())
+            .map(|c| c.command_review_seconds)
+            .unwrap_or(fallback)
     }
     pub fn context_pressure(&self) -> bool {
         self.context_pressure.get()
@@ -162,6 +171,19 @@ impl Model {
         let previous = self.output_cap.replace(Some(2048));
         let result = self.chat(messages, Some(tools), false);
         self.output_cap.set(previous);
+        result
+    }
+    pub fn watchdog_chat(&self, messages: &[Value], tools: Value) -> Result<Value> {
+        let previous = self.output_cap.replace(Some(2048));
+        let mode = self.watchdog_call.replace(true);
+        *self.completed_messages.borrow_mut() = None;
+        // Observers must not disappear into an indefinite provider quota retry.
+        let result = self.chat_format_once(messages, Some(tools), None);
+        self.output_cap.set(previous);
+        self.watchdog_call.set(mode);
+        if result.is_err() {
+            crate::events::send(crate::events::Event::RequestFinished);
+        }
         result
     }
     fn chat_format(
@@ -293,6 +315,11 @@ impl Model {
             .as_ref()
             .map(|c| c.request_timeout_seconds)
             .unwrap_or(1800);
+        let timeout = if self.watchdog_call.get() {
+            if timeout == 0 { 120 } else { timeout.min(120) }
+        } else {
+            timeout
+        };
         *self.request_target.borrow_mut() = (name.to_owned(), url.clone());
         crate::events::send(crate::events::Event::RequestModel(name.to_owned()));
         crate::events::send(crate::events::Event::Request);
@@ -522,7 +549,7 @@ pub fn tools() -> Value {
      {"type":"function","function":{"name":"list_files","description":"List project paths.","parameters":{"type":"object","properties":{}}}},
      {"type":"function","function":{"name":"search","description":"Find literal text in project files; returns paths and line numbers.","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}},
      {"type":"function","function":{"name":"write_file","description":"Create or replace a project file. Read existing files first. Use project-relative paths; preserve operator settings and Git metadata.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
-     {"type":"function","function":{"name":"run_checks","description":"Execute the operator-configured validation commands and return results.","parameters":{"type":"object","properties":{}}}}
+     {"type":"function","function":{"name":"run_checks","description":"Start the operator-configured validation commands sequentially. If unfinished, returns running=true and command_id; use command_status to inspect or wait. A running check is not a passing check. Long-running checks are reviewed by a watchdog rather than automatically killed.","parameters":{"type":"object","properties":{}}}}
     ]);
     tools
         .as_array_mut()

@@ -2035,7 +2035,7 @@ mod terminal_ui {
         ui.send(b"\r");
         ui.wait("Validation command");
         ui.send(b"git rev-parse HEAD\r");
-        ui.wait("Check timeout (seconds)");
+        ui.wait("First command review (seconds)");
         ui.send(b"\r");
         ui.wait("Resume project");
         ui.send(b"q");
@@ -2804,4 +2804,197 @@ fn unavailable_diagnostic_is_bounded_and_does_not_stop_project_work() {
             .join("state/cycle-000001/command-diagnostic-1-error.json")
             .exists()
     );
+}
+
+#[test]
+fn watchdog_stops_confirmed_hang_and_main_agent_repairs_without_losing_work() {
+    let mut work = 0;
+    let mut observations = 0;
+    let server = Server::custom(false, false, None, move |body, _| {
+        if body["messages"][0]["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("command watchdog")
+        {
+            observations += 1;
+            if observations == 1 {
+                return (
+                    String::new(),
+                    json!([{"function":{"name":"write_file","arguments":{"path":"forbidden.txt","content":"no"}}},{"function":{"name":"read_file","arguments":{"path":"value.txt"}}}]),
+                );
+            }
+            assert!(
+                body["messages"]
+                    .to_string()
+                    .contains("no action was executed")
+            );
+            return (
+                String::new(),
+                json!([{"function":{"name":"report_diagnosis","arguments":{"verdict":"stalled","reason":"Fixture command is an intentional endless wait with no useful work; source still says OLD.","next_action":"Stop it and write FIXED to value.txt.","expected_new_evidence":"Validation exits successfully after repair"}}}]),
+            );
+        }
+        work += 1;
+        if work == 1 {
+            return (
+                String::new(),
+                json!([task_tool("Recover long command"),{"function":{"name":"run_command","arguments":{"argv":["sh","-c","printf WAITING; while :; do sleep 1; done"],"timeout_seconds":1}}}]),
+            );
+        }
+        assert!(body["messages"].to_string().contains("Watchdog:"));
+        (
+            String::new(),
+            json!([{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"FIXED"}}},{"function":{"name":"finish_task","arguments":{"summary":"Repaired after watchdog stopped hung command"}}}]),
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    let s = state(root.path());
+    let workspace = Path::new(s["working_workspace"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(workspace.join("value.txt")).unwrap(),
+        "FIXED"
+    );
+    assert!(!workspace.join("forbidden.txt").exists());
+    assert_eq!(s["completed_tasks"].as_array().unwrap().len(), 1);
+    let art = root.path().join("state/cycle-000001");
+    assert!(
+        fs::read_dir(art)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("watchdog-"))
+    );
+}
+
+#[test]
+fn watchdog_allows_long_checkpoint_check_and_cannot_mark_unfinished_check_passed() {
+    let mut work = 0;
+    let server = Server::custom(false, false, None, move |body, _| {
+        if body["messages"][0]["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("command watchdog")
+        {
+            assert!(body["messages"].to_string().contains("running"));
+            return (
+                String::new(),
+                json!([{"function":{"name":"report_diagnosis","arguments":{"verdict":"productive","reason":"Command deliberately waits briefly to simulate a long computation.","next_action":"Allow the existing process to finish.","expected_new_evidence":"A zero exit status and final output"}}}]),
+            );
+        }
+        work += 1;
+        assert_eq!(work, 1);
+        (
+            String::new(),
+            json!([task_tool("Long verification"),{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"FIXED"}}},{"function":{"name":"finish_task","arguments":{"summary":"Ready for actual verification"}}}]),
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut c: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    c["checks"] = json!([{"argv":["sh","-c","sleep 2; echo FINISHED; test \"$(cat value.txt)\" = FIXED"],"timeout_seconds":1}]);
+    fs::write(path, c.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    let s = state(root.path());
+    assert_eq!(s["completed_tasks"].as_array().unwrap().len(), 1);
+    let verification: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000001/verification.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(verification.as_array().unwrap().len(), 1);
+    assert_eq!(verification[0]["passed"], true);
+    assert!(
+        verification[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("FINISHED")
+    );
+    assert!(server.requests.lock().unwrap().len() > 1);
+}
+
+#[test]
+fn command_session_yields_to_model_and_can_be_polled_without_relaunching() {
+    let mut started = false;
+    let server = Server::custom(false, false, None, move |body, _| {
+        if !started {
+            started = true;
+            return (
+                String::new(),
+                json!([task_tool("Inspect long-running command"),{"function":{"name":"run_command","arguments":{"argv":["sh","-c","echo once >> launches.txt; sleep 2; echo DONE"],"timeout_seconds":30}}}]),
+            );
+        }
+        let messages = body["messages"].as_array().unwrap();
+        let result = messages
+            .iter()
+            .rev()
+            .find_map(|m| {
+                if matches!(
+                    m["tool_name"].as_str(),
+                    Some("run_command" | "command_status")
+                ) {
+                    serde_json::from_str::<Value>(m["content"].as_str().unwrap()).ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        if result["result"]["running"] == true {
+            return (
+                String::new(),
+                json!([{"function":{"name":"read_file","arguments":{"path":"launches.txt"}}},{"function":{"name":"command_status","arguments":{"command_id":result["result"]["command_id"],"wait_ms":1000}}}]),
+            );
+        }
+        assert_eq!(result["result"]["passed"], true);
+        ("Observed completion".into(), json!([]))
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    let s = state(root.path());
+    assert_eq!(
+        fs::read_to_string(
+            Path::new(s["working_workspace"].as_str().unwrap()).join("launches.txt")
+        )
+        .unwrap(),
+        "once\n"
+    );
+    assert!(server.requests.lock().unwrap().len() >= 3);
+}
+
+#[test]
+fn unavailable_watchdog_keeps_command_alive_and_final_checks_collect_all_results() {
+    let mut work = 0;
+    let server = Server::custom(false, false, None, move |body, _| {
+        if body["messages"][0]["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("command watchdog")
+        {
+            return ("__HTTP_LIMIT__".into(), json!([]));
+        }
+        work += 1;
+        assert_eq!(work, 1);
+        ("Checkpoint unfinished work".into(), json!([]))
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut c: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    c["checks"] = json!([{"argv":["sh","-c","sleep 2; echo LONG_CHECK_FINISHED"],"timeout_seconds":1},{"argv":["sh","-c","echo SECOND_CHECK_FAILED; exit 1"],"timeout_seconds":1}]);
+    fs::write(path, c.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    let v: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000001/verification.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 2);
+    assert_eq!(v[0]["passed"], true);
+    assert_eq!(v[1]["passed"], false);
+    assert!(
+        v[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("LONG_CHECK_FINISHED")
+    );
+    assert_eq!(state(root.path())["last_checks_passed_ref"], Value::Null);
+    assert!(!root.path().join("state/provider-wait.json").exists());
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
 }
