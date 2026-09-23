@@ -1038,7 +1038,9 @@ fn work(
         if calls.is_empty() {
             break;
         }
+        let mut completed_commands = Vec::new();
         for (index, call) in calls.iter().enumerate() {
+            completed_commands.extend(jobs.refresh_finished(stop)?);
             let name = call["function"]["name"].as_str().unwrap_or("");
             let args = &call["function"]["arguments"];
             crate::events::send(crate::events::Event::Tool(format!(
@@ -1392,6 +1394,11 @@ fn work(
                 crate::events::log(reason);
             }
             save_conversation(c, session)?;
+        }
+        for update in completed_commands {
+            session.messages.push(
+                json!({"role":"user","content":json!({"command_update":update}).to_string()}),
+            );
         }
         // Append feedback only after every tool reply, preserving tool protocol order.
         if !session.action_watch.pending_refresh && session.action_watch.take_notice() {

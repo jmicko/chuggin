@@ -3186,3 +3186,54 @@ fn project_completion_waits_for_running_commands() {
         "saved\n"
     );
 }
+
+#[test]
+fn command_finished_during_inference_does_not_block_the_next_edit() {
+    let server = Server::custom(false, false, None, |_, n| match n {
+        0 => (
+            String::new(),
+            json!([
+                task_tool("Refresh command status"),
+                {"function":{"name":"run_command","arguments":{"argv":["sh","-c","sleep 2; echo done"],"timeout_seconds":30}}}
+            ]),
+        ),
+        1 => {
+            thread::sleep(Duration::from_secs(2));
+            (
+                String::new(),
+                json!([{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"Edited without a wasted retry"}}}]),
+            )
+        }
+        _ => ("Checkpoint".into(), json!([])),
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    let result: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000001/tool-1-0.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["ok"], true);
+    let calls = server.requests.lock().unwrap();
+    let messages = calls[2]["messages"].as_array().unwrap();
+    let edit_reply = messages.iter().rposition(|m| m["role"] == "tool").unwrap();
+    let completion = messages
+        .iter()
+        .rposition(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("command_update")
+        })
+        .unwrap();
+    assert!(
+        completion > edit_reply,
+        "Command updates must follow the entire tool reply batch"
+    );
+    assert!(
+        messages[completion]["content"]
+            .as_str()
+            .unwrap()
+            .contains("\"running\":false")
+    );
+}

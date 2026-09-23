@@ -230,6 +230,20 @@ pub struct Jobs {
     jobs: Vec<Job>,
 }
 impl Jobs {
+    /// Refresh OS process status after inference, before enforcing command guards.
+    /// No watchdog inference here: tool replies must remain in protocol order.
+    pub fn refresh_finished(&mut self, stop: &AtomicBool) -> Result<Vec<Value>> {
+        let mut updates = Vec::new();
+        for job in &mut self.jobs {
+            if job.running() {
+                let snapshot = job.poll(0, stop)?;
+                if !job.running() {
+                    updates.push(snapshot);
+                }
+            }
+        }
+        Ok(updates)
+    }
     pub fn running(&self) -> bool {
         self.jobs.iter().any(Job::running)
     }

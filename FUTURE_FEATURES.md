@@ -108,3 +108,69 @@ Mode transitions should be persisted, take effect at safe boundaries, and be
 clearly visible. Keep the stable prompt prefix and use a short mode update in
 the conversation instead of separate agent implementations or long explanations.
 Chat remains a proposed next step, not implemented in 0.10.0.
+
+## Multiple providers and helper agents — September 23 plan
+
+This extends the earlier sequential-helper proposal: allow concurrent helpers on
+separate inference resources, with a conservative one-request default per local
+server. Actual Ollama concurrency depends on server configuration and memory.
+
+Build in this order:
+1. Provider profiles and scheduler: existing Ollama adapter plus a direct Groq
+   adapter using its OpenAI-compatible chat-completions protocol. Normalize stream
+   deltas, tool-call argument fragments, usage, finish reasons and provider errors.
+   Preserve existing model behavior and restart-compatible conversation storage.
+2. Named profiles in a Providers TUI: add Ollama / Groq / compatible endpoint;
+   enter URL or masked key; test connection; list available models; choose allowed
+   main/helper uses. A model selection is provider + model, not a bare model name.
+   Keep shared secrets in restricted home configuration, never project logs or
+   request artifacts. Changing model/provider affects subsequent calls only.
+3. User-controlled helper pool: checkboxes per profile/model, resource concurrency,
+   optional fallback priority. Main model may request a helper task and allowed
+   profile; it cannot authorize new providers, raise limits or opt into paid usage.
+   Do not silently move a local task to a cloud endpoint on failure.
+4. Durable spawn_agent / agent_status / cancel_agent tools. Fresh task-specific
+   context, parent goal/nudge constraints, selected evidence; no whole-transcript
+   cloning. Start with inspection/research and patch proposals. Arbitrary commands
+   and edits require isolated snapshots (including uncommitted parent work), not
+   a merely "read-only" prompt. Parent integrates patches serially and resolves
+   conflicts. No recursive spawning initially; no compulsory roles or review veto.
+5. Observation Agents view: task, provider/model, queued/running/waiting/completed,
+   elapsed time, usage/estimated spend, findings, cancel control. Persist jobs and
+   delivered results so restart cannot replay edits or charge duplicate helper jobs.
+
+Budget and backoff design:
+- Helpers disabled on a newly added profile until the user opts in. Paid profiles
+  require an explicit budget; local profiles still have concurrency/task limits.
+- Account for ALL provider requests (parent/helpers/watchdog/retries). Shared,
+  transactionally reserved allowances across projects/processes, not per-agent
+  counters. Reserve conservative input + maximum output before dispatch; reconcile
+  reported usage afterward. Unknown outcome retains its reservation until resolved.
+- Use per-helper token/work budgets plus per-provider daily/monthly estimated
+  spending limits and global concurrency. Persist them across restart. Token and
+  request caps supplement monetary estimates; estimates are not a billing guarantee.
+- Enforce user boundaries in the scheduler. When a budget runs out, suspend that
+  provider's queued work and retain partial findings; parent can continue locally.
+  Never silently recharge, raise caps, or use an unapproved paid fallback.
+- Honor Retry-After and reset/remaining headers at provider/account level; 429
+  should pause the shared queue, not make every helper retry independently. Use
+  jitter with bounded exponential backoff when no reset is supplied. Detect a
+  request intrinsically larger than the token limit instead of retrying forever.
+- Separate authentication/configuration errors from transient outages. Keep work
+  resumable while clearly showing "needs configuration".
+- Groq account limits must be verified from its console/response headers. Public
+  free limits can be much smaller than model context windows. Use small helper
+  prompts and bounded retrieval. An API key alone does not certify zero billing.
+- Groq spend tracking currently documents a 10–15 minute delay, so provider-side
+  spend limits complement rather than replace local request reservations.
+
+Test with mocked streaming, tool fragments, 429/reset headers, exhausted budgets,
+concurrent reservations and restart recovery before a bounded live Groq probe.
+Do not log credentials. Live testing requires the user's key configured privately;
+no live Groq request was made during the September 23 audit.
+
+Sources checked September 23:
+- https://console.groq.com/docs/rate-limits
+- https://console.groq.com/docs/spend-limits
+- https://console.groq.com/docs/api-reference
+- https://docs.ollama.com/faq
