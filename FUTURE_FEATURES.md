@@ -174,3 +174,12 @@ Sources checked September 23:
 - https://console.groq.com/docs/spend-limits
 - https://console.groq.com/docs/api-reference
 - https://docs.ollama.com/faq
+
+## September 23 planning follow-up
+
+The detailed, current decision record is
+[Connections, provider scheduling, and helper agents](docs/PROVIDERS_AND_AGENTS.md).
+It incorporates the user's requested global connections/default model,
+project-specific routes and limits, integrated Settings workflow, a bounded Groq
+compatibility probe, and pinned public Codex source findings. It supersedes earlier
+proposals where they differ. The new design is planned, not yet implemented.
