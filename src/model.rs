@@ -39,6 +39,7 @@ pub struct Model {
     completed_messages: RefCell<Option<Vec<Value>>>,
     context_pressure: Cell<bool>,
     run_controls: Option<(Arc<AtomicBool>, Instant)>,
+    pub(crate) controls: Arc<crate::run_control::RunControl>,
     request_target: RefCell<(String, String)>,
 }
 impl Model {
@@ -66,6 +67,7 @@ impl Model {
             completed_messages: RefCell::new(None),
             context_pressure: Cell::new(false),
             run_controls: None,
+            controls: Arc::new(crate::run_control::RunControl::default()),
             request_target: RefCell::new((
                 name.into(),
                 format!("{}/api/chat", url.trim_end_matches('/')),
@@ -91,6 +93,10 @@ impl Model {
     pub fn use_run_controls(&mut self, stop: Arc<AtomicBool>, started: Instant) {
         self.run_controls = Some((stop, started));
     }
+    pub fn pause_point(&self) {
+        self.controls
+            .wait_until_resumed(|| self.stop.load(Ordering::SeqCst));
+    }
     fn provider_target(&self) -> Result<(String, String, Option<PathBuf>)> {
         if let Some(path) = &self.settings_path {
             let c = crate::runner::load(path)?;
@@ -104,6 +110,12 @@ impl Model {
         }
     }
     fn wait_for_provider(&self, record: &Value) -> Result<()> {
+        self.controls.provider_wait_started();
+        let result = self.wait_for_provider_inner(record);
+        self.controls.provider_wait_finished();
+        result
+    }
+    fn wait_for_provider_inner(&self, record: &Value) -> Result<()> {
         let until = record["until"].as_u64().unwrap_or(0);
         let mut last_seconds = u64::MAX;
         loop {
@@ -126,7 +138,7 @@ impl Model {
                         .context("Missing run settings")?,
                 )?;
                 if c.run_duration_seconds > 0
-                    && started.elapsed().as_secs() >= c.run_duration_seconds
+                    && self.controls.active_elapsed(*started).as_secs() >= c.run_duration_seconds
                 {
                     return Err(crate::provider::Stopped(
                         "Run timer reached while waiting for provider; saving work".into(),
@@ -135,9 +147,25 @@ impl Model {
                 }
             }
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-            if current.0 != record["model"] || current.1 != record["url"] || now >= until {
+            if self.controls.pause_requested() {
+                crate::events::send(crate::events::Event::ProviderWait {
+                    reason: record["reason"]
+                        .as_str()
+                        .unwrap_or("Provider unavailable")
+                        .into(),
+                    seconds: until.saturating_sub(now),
+                });
+                self.pause_point();
+                continue;
+            }
+            let manual = self.controls.take_retry();
+            if manual || current.0 != record["model"] || current.1 != record["url"] || now >= until
+            {
                 if let Some(path) = current.2 {
                     let _ = std::fs::remove_file(path);
+                }
+                if manual {
+                    crate::events::log("Manual retry: trying the provider now.".into());
                 }
                 return Ok(());
             }
@@ -297,6 +325,7 @@ impl Model {
         tools: Option<Value>,
         format: Option<Value>,
     ) -> Result<Value> {
+        self.pause_point();
         // Snapshot settings once; edits never alter an in-flight request.
         let live = self
             .settings_path

@@ -596,6 +596,7 @@ pub(crate) fn outcome_label(disposition: &str) -> &str {
     }
 }
 struct Dashboard {
+    controls: Arc<crate::run_control::RunControl>,
     entries: VecDeque<Entry>,
     phase: String,
     task: String,
@@ -630,6 +631,8 @@ struct Dashboard {
     help: bool,
     finished: Option<String>,
     finished_at: Option<Instant>,
+    finished_active_elapsed: Option<Duration>,
+    finished_phase_elapsed: Option<Duration>,
     expanded_commands: bool,
     last_output: Instant,
     partial_model: String,
@@ -643,6 +646,7 @@ struct Dashboard {
 impl Dashboard {
     fn new(config: &runner::Config) -> Self {
         let mut d = Self {
+            controls: Arc::default(),
             entries: VecDeque::new(),
             phase: "Ready".into(),
             task: "Waiting for the next task".into(),
@@ -677,6 +681,8 @@ impl Dashboard {
             help: false,
             finished: None,
             finished_at: None,
+            finished_active_elapsed: None,
+            finished_phase_elapsed: None,
             expanded_commands: false,
             last_output: Instant::now(),
             partial_model: String::new(),
@@ -826,10 +832,15 @@ impl Dashboard {
         }
     }
     fn quiet_activity(&self) -> Option<String> {
-        if self.finished.is_some() || self.last_output.elapsed() < Duration::from_millis(1500) {
+        if self.finished.is_some()
+            || self.controls.is_paused()
+            || self.last_output.elapsed() < Duration::from_millis(1500)
+        {
             return None;
         }
-        let message = if self.provider_wait.is_some() {
+        let message = if self.controls.pause_requested() {
+            "Finishing current operation to pause"
+        } else if self.provider_wait.is_some() {
             "Waiting for provider"
         } else if self.request_active {
             "Waiting for response"
@@ -847,6 +858,31 @@ impl Dashboard {
             "{} {message}",
             activity_bar(self.started.elapsed().as_millis() as u64)
         ))
+    }
+    fn active_elapsed(&self) -> Duration {
+        self.finished_active_elapsed.unwrap_or_else(|| {
+            if let Some(end) = self.finished_at {
+                // The live session records its active duration when the worker finishes.
+                // Keep a wall-time fallback for historical/test dashboards.
+                end.saturating_duration_since(self.started)
+            } else {
+                self.controls.active_elapsed(self.started)
+            }
+        })
+    }
+    fn phase_elapsed(&self) -> Duration {
+        self.finished_phase_elapsed.unwrap_or_else(|| {
+            if let Some(end) = self.finished_at {
+                end.saturating_duration_since(self.phase_started)
+            } else {
+                self.controls.active_elapsed(self.phase_started)
+            }
+        })
+    }
+    fn freeze_elapsed(&mut self) {
+        self.finished_active_elapsed = Some(self.controls.active_elapsed(self.started));
+        self.finished_phase_elapsed = Some(self.controls.active_elapsed(self.phase_started));
+        self.finished_at = Some(Instant::now());
     }
     fn apply(&mut self, event: Event) {
         self.last_activity = Instant::now();
@@ -1176,6 +1212,8 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
 fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stopping: bool) {
     base(f);
     let a = f.area().inner(Margin::new(1, 0));
+    let paused = d.finished.is_none() && d.controls.is_paused();
+    let pausing = d.finished.is_none() && d.controls.pause_requested() && !paused;
     if d.nudge_edit.is_none() && d.finished.is_some() && (a.height < 20 || a.width < 44) {
         f.render_widget(
             p(format!(
@@ -1189,7 +1227,14 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         return;
     }
     if a.height < 14 || a.width < 44 {
-        f.render_widget(p("CHUGGIN\n\nResize to at least 46 × 14 to view the dashboard.\nThe agent continues working.\n\nCtrl+C: finish cycle; again: force stop").fg(ACCENT),a);
+        let state = if paused {
+            "PAUSED IN CYCLE · P resume"
+        } else if pausing {
+            "PAUSING · P cancel pause"
+        } else {
+            "Working · P pause after current operation"
+        };
+        f.render_widget(p(format!("CHUGGIN\n\nResize to at least 46 × 14 to view the dashboard.\n{state}\nT retry provider now\nCtrl+C: finish cycle; again: force stop")).fg(ACCENT),a);
         return;
     }
     let r = Layout::vertical([
@@ -1198,13 +1243,25 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         Constraint::Length(if d.nudges.active.is_some() { 5 } else { 3 }),
         Constraint::Min(4),
         Constraint::Length(2),
-        Constraint::Length(if d.finished.is_some() { 6 } else { 1 }),
+        Constraint::Length(if d.finished.is_some() {
+            6
+        } else if paused {
+            4
+        } else if pausing || d.provider_wait.is_some() {
+            2
+        } else {
+            1
+        }),
     ])
     .split(a);
     let state = if d.finished.is_some() {
         "PAUSED"
     } else if stopping {
         "DRAINING"
+    } else if paused {
+        "PAUSED IN CYCLE"
+    } else if pausing {
+        "PAUSING"
     } else {
         "LIVE"
     };
@@ -1213,7 +1270,11 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         Span::styled(" CHUGGIN ", Style::default().fg(BG).bg(ACCENT).bold()),
         Span::styled(
             format!("  {state}"),
-            Style::default().fg(if stopping { GOLD } else { CYAN }),
+            Style::default().fg(if stopping || paused || pausing {
+                GOLD
+            } else {
+                CYAN
+            }),
         ),
         Span::styled(
             format!(
@@ -1242,17 +1303,17 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         steps.push(Span::styled(
             s.to_string(),
             Style::default()
-                .fg(if d.finished.is_none() && d.phase == *s {
+                .fg(if d.finished.is_none() && !paused && d.phase == *s {
                     BG
                 } else {
                     MUTED
                 })
-                .bg(if d.finished.is_none() && d.phase == *s {
+                .bg(if d.finished.is_none() && !paused && d.phase == *s {
                     CYAN
                 } else {
                     BG
                 })
-                .add_modifier(if d.finished.is_none() && d.phase == *s {
+                .add_modifier(if d.finished.is_none() && !paused && d.phase == *s {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
@@ -1267,12 +1328,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             } else {
                 &d.phase
             },
-            duration(
-                d.finished_at
-                    .unwrap_or_else(Instant::now)
-                    .saturating_duration_since(d.phase_started)
-                    .as_secs()
-            )
+            duration(d.phase_elapsed().as_secs())
         ))),
         r[1],
     );
@@ -1396,6 +1452,8 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             Line::from(d.active_model.clone()),
             Line::from(if d.finished.is_some() {
                 "○ Idle · no work running".to_owned()
+            } else if paused {
+                "Ⅱ Paused in current cycle".to_owned()
             } else if let Some(seconds) = d.provider_wait {
                 format!("◷ Provider retry in {seconds}s")
             } else if d.request_active {
@@ -1440,12 +1498,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             Line::from(format!("Checkpoints saved: {}", d.checkpoints)),
             Line::from(format!(
                 "Elapsed {}",
-                duration(
-                    d.finished_at
-                        .unwrap_or_else(Instant::now)
-                        .saturating_duration_since(d.started)
-                        .as_secs()
-                )
+                duration(d.active_elapsed().as_secs())
             )),
             Line::from(format!(
                 "Last activity {}s ago",
@@ -1514,21 +1567,31 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     }
     let footer = if let Some(s) = &d.finished {
         format!("{s} · R resume · Enter / q returns home")
-    } else if c.run_duration_seconds > 0 && d.started.elapsed().as_secs() >= c.run_duration_seconds
-    {
+    } else if paused {
+        if d.provider_wait.is_some() {
+            "P resume current cycle · T retry on resume · Ctrl+C finish cycle".into()
+        } else {
+            "P resume current cycle · Ctrl+C finish cycle".into()
+        }
+    } else if pausing {
+        "Pause requested · P cancel pause\nFinishing current response/tool before pausing".into()
+    } else if c.run_duration_seconds > 0 && d.active_elapsed().as_secs() >= c.run_duration_seconds {
         "Time limit reached · Finishing this cycle, then saving".into()
     } else if stopping {
         "Finishing this cycle · R resume · Ctrl+C again force-stops".into()
+    } else if d.provider_wait.is_some() {
+        "Waiting for provider · T retry now · P pause\nCtrl+C finish cycle · N nudge · ? help"
+            .into()
     } else if c.run_duration_seconds > 0 {
         format!(
-            "Time left {} · Ctrl+C finish cycle · N nudge · ? help",
+            "Time left {} · P pause · Ctrl+C finish cycle · N nudge · ? help",
             duration(
                 c.run_duration_seconds
-                    .saturating_sub(d.started.elapsed().as_secs())
+                    .saturating_sub(d.active_elapsed().as_secs())
             )
         )
     } else {
-        "↑↓ / wheel scroll · PgUp/PgDn · F follow · 1–5 views · E output · / search · ? help · Ctrl+C finish cycle".into()
+        "P pause · Ctrl+C finish cycle · N nudge · 1–5 views · ? help".into()
     };
     if let Some(reason) = &d.finished {
         f.render_widget(
@@ -1547,9 +1610,30 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             ),
             r[5],
         );
+    } else if paused {
+        let timer = if c.run_duration_seconds > 0 {
+            format!(
+                "Timer held · {} left",
+                duration(
+                    c.run_duration_seconds
+                        .saturating_sub(d.active_elapsed().as_secs())
+                )
+            )
+        } else {
+            "Timer held · Started commands may still finish".into()
+        };
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from("CYCLE PAUSED").bold(),
+                Line::from(timer),
+                Line::from(footer),
+            ])
+            .style(Style::default().fg(GOLD).bg(Color::Rgb(42, 34, 20))),
+            r[5],
+        );
     } else {
         f.render_widget(
-            Paragraph::new(footer).fg(if stopping { GOLD } else { MUTED }),
+            Paragraph::new(footer).fg(if stopping || pausing { GOLD } else { MUTED }),
             r[5],
         );
     }
@@ -1564,14 +1648,9 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         f.render_widget(p(format!("Temporary priority within the project goal.\nApplies on the next model call; paused work stays paused.\n\n{draft}▏\n\n{}\n\nEnter save · Esc close · Ctrl+U clear\nCtrl+D cancel active · Ctrl+R reopen latest\nCompletion reports and history: Goal tab", d.nudge_error)).block(panel("Nudge")), area);
     }
     if d.help {
-        let area = Rect::new(
-            a.x + a.width / 8,
-            a.y + a.height / 6,
-            a.width * 3 / 4,
-            a.height * 2 / 3,
-        );
+        let area = a.inner(Margin::new(2, 1));
         f.render_widget(Clear, area);
-        f.render_widget(p("Observe without interrupting work\n\n↑ / ↓ or mouse wheel    Scroll a few lines\nPgUp / PgDn             Scroll a page\nHome / End              Oldest / latest output\nF                       Resume live following\nE                       Expand / collapse command output\nN                       Add / manage a temporary nudge\n1–5 or Tab              Live, model, checks, goal, settings\n/                       Search the current view\nEsc                     Clear search / close help\nCtrl+C or Q             Finish this cycle, then stop\nR                       Cancel stop / resume saved run\nCtrl+C again            Force stop immediately\n\nScrollback is bounded; complete logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.\nContext and token speed update after each model response.").block(panel("Keyboard guide · ? / Esc closes")),area);
+        f.render_widget(p("P              Pause / continue current cycle\nT              Retry provider now; queue while paused\nCtrl+C / Q     Finish cycle, then stop\nCtrl+C again   Force stop immediately\nR              Cancel stop / resume saved run\nN              Add / manage a temporary nudge\n1–5 / Tab      Live, model, checks, goal, settings\n↑↓ / wheel     Scroll a few lines\nPgUp / PgDn    Scroll a page\nHome / End     Oldest / latest output\nF              Follow live output\nE              Expand / collapse command output\n/              Search current view\nEsc            Clear search / close help\n\nPause waits for the current operation; the run timer holds.\nStarted commands may finish. Full logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.").block(panel("Keyboard guide · ? / Esc closes")),area);
     }
 }
 
@@ -1589,10 +1668,13 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let owned_path = path.to_owned();
     let worker_stop = stop.clone();
+    let worker_controls = d.controls.clone();
     stop.store(false, Ordering::SeqCst);
     running.store(true, Ordering::SeqCst);
     let worker = std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(|| runner::run(&owned_path, None, worker_stop));
+        let result = std::panic::catch_unwind(|| {
+            runner::run_controlled(&owned_path, None, worker_stop, worker_controls)
+        });
         let result = match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(format!("{e:#}")),
@@ -1617,7 +1699,7 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
             if d.finished.is_none()
                 && let Ok(result) = done_rx.try_recv()
             {
-                d.finished_at = Some(Instant::now());
+                d.freeze_elapsed();
                 d.finished = Some(match result {
                     Ok(())
                         if config.state_dir.join("goal-completion.json").exists()
@@ -1661,6 +1743,7 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                             crate::project::kill_active_check();
                             std::process::exit(130);
                         }
+                        d.controls.resume();
                         continue;
                     }
                     if let Some(draft) = d.nudge_edit.as_mut() {
@@ -1789,6 +1872,31 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                         continue;
                     }
                     match k.code {
+                        KeyCode::Char('p' | 'P') if d.finished.is_none() => {
+                            if !stop.load(Ordering::SeqCst) {
+                                let was_paused = d.controls.is_paused();
+                                let pausing = d.controls.toggle_pause();
+                                events::log(if pausing {
+                                    "Pause requested; finishing the current operation.".into()
+                                } else if was_paused {
+                                    "Resumed current cycle.".into()
+                                } else {
+                                    "Pause cancelled; continuing the current cycle.".into()
+                                });
+                            }
+                        }
+                        KeyCode::Char('t' | 'T')
+                            if d.finished.is_none() && d.provider_wait.is_some() =>
+                        {
+                            if d.controls.retry_now() {
+                                events::log(if d.controls.pause_requested() {
+                                    "Retry queued; provider wait will be skipped when you resume."
+                                        .into()
+                                } else {
+                                    "Retry requested; checking the provider now.".into()
+                                });
+                            }
+                        }
                         KeyCode::Char('n' | 'N') => {
                             d.nudge_id = d.nudges.active.as_ref().map(|n| n.id);
                             d.nudge_edit = Some(
@@ -1812,6 +1920,7 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                         KeyCode::Enter | KeyCode::Char('q') if d.finished.is_some() => break,
                         KeyCode::Char('q') => {
                             stop.store(true, Ordering::SeqCst);
+                            d.controls.resume();
                         }
                         KeyCode::Char('?') => d.help = true,
                         KeyCode::Char('e' | 'E') if matches!(d.tab, 0 | 2) => {
@@ -1853,6 +1962,7 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
         let _ = worker.join();
     } else if result.is_err() {
         stop.store(true, Ordering::SeqCst);
+        d.controls.resume();
     }
     result
 }
@@ -2104,11 +2214,124 @@ mod tests {
         t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
         assert!(screen_text(&t).contains("Waiting for provider"));
         assert!(screen_text(&t).contains("601s"));
+        assert!(screen_text(&t).contains("T retry now"));
         assert!(!d.request_active);
         d.apply(Event::Request);
         assert!(d.request_active);
         assert!(d.provider_wait.is_none());
         assert_eq!(d.phase, "Work");
+    }
+    #[test]
+    fn pending_pause_keeps_response_visible_until_the_runner_reaches_a_safe_point() {
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::Request);
+        d.controls.toggle_pause();
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
+        let text = screen_text(&t);
+        assert!(text.contains("PAUSING"));
+        assert!(text.contains("Receiving response"));
+        assert!(text.contains("P cancel pause"));
+        assert!(!text.contains("CYCLE PAUSED"));
+        let mut standard = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        standard
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        assert!(screen_text(&standard).contains("P cancel pause"));
+        d.controls.resume();
+        t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
+        assert!(!screen_text(&t).contains("PAUSING"));
+    }
+    #[test]
+    fn held_cycle_has_resume_and_queued_retry_controls_without_a_running_animation() {
+        let mut c = config();
+        c.run_duration_seconds = 3600;
+        let mut d = Dashboard::new(&c);
+        d.started = Instant::now() - Duration::from_secs(65);
+        d.last_output = Instant::now() - Duration::from_secs(3);
+        d.apply(Event::ProviderWait {
+            reason: "Server unavailable".into(),
+            seconds: 600,
+        });
+        d.controls.toggle_pause();
+        let controls = d.controls.clone();
+        let worker = std::thread::spawn(move || controls.wait_until_resumed(|| false));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !d.controls.is_paused() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let held = d.controls.is_paused();
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
+        let text = screen_text(&t);
+        let elapsed = d.active_elapsed();
+        std::thread::sleep(Duration::from_millis(5));
+        let still_elapsed = d.active_elapsed();
+        let quiet = d.quiet_activity();
+        let mut standard = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        standard
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        let standard_text = screen_text(&standard);
+        let mut small = Terminal::new(TestBackend::new(42, 12)).unwrap();
+        small
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        let small_text = screen_text(&small);
+        d.controls.resume();
+        worker.join().unwrap();
+        d.freeze_elapsed();
+        let phase_elapsed = d.phase_elapsed();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(held);
+        assert!(text.contains("PAUSED IN CYCLE"));
+        assert!(text.contains("CYCLE PAUSED"));
+        assert!(text.contains("P resume current cycle"));
+        assert!(text.contains("T retry on resume"));
+        assert!(text.contains("Timer held"));
+        assert!(text.contains("Elapsed 00:01:05"));
+        assert_eq!(elapsed, still_elapsed);
+        assert!(quiet.is_none());
+        assert!(small_text.contains("PAUSED IN CYCLE"));
+        assert!(!small_text.contains("Working"));
+        assert!(standard_text.contains("P resume current cycle"));
+        assert!(standard_text.contains("T retry on resume"));
+        assert!(standard_text.contains("Ctrl+C finish cycle"));
+        assert_eq!(d.phase_elapsed(), phase_elapsed);
+        assert!(
+            d.finished_at
+                .unwrap()
+                .saturating_duration_since(d.phase_started)
+                .saturating_sub(phase_elapsed)
+                >= Duration::from_millis(5)
+        );
+        assert!(d.finished.is_none());
+    }
+    #[test]
+    fn observation_controls_and_help_fit_a_standard_terminal() {
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
+        let text = screen_text(&t);
+        assert!(text.contains("P pause"));
+        assert!(text.contains("? help"));
+        d.apply(Event::ProviderWait {
+            reason: "Server unavailable".into(),
+            seconds: 60,
+        });
+        t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
+        let text = screen_text(&t);
+        assert!(text.contains("T retry now · P pause"));
+        d.help = true;
+        t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
+        let text = screen_text(&t);
+        assert!(text.contains("Pause / continue current cycle"));
+        assert!(text.contains("Retry provider now; queue while paused"));
+        assert!(text.contains("Force stop immediately"));
+        assert!(text.contains("Clear search / close help"));
+        assert!(text.contains("Started commands may finish"));
     }
     #[test]
     fn scrollback_stays_put_and_search_filters_actual_output() {

@@ -26,6 +26,7 @@ pub struct Job {
     checks: bool,
     collected: bool,
     diagnostic: bool,
+    controls: Option<std::sync::Arc<crate::run_control::RunControl>>,
 }
 impl Job {
     pub fn new(
@@ -47,6 +48,7 @@ impl Job {
             checks: batch,
             collected: false,
             diagnostic,
+            controls: None,
         };
         job.advance()?;
         Ok(job)
@@ -69,6 +71,9 @@ impl Job {
         self.current.as_ref().is_some_and(Session::running) || !self.pending.is_empty()
     }
     pub fn poll(&mut self, wait: u64, stop: &AtomicBool) -> Result<Value> {
+        if let Some(controls) = &self.controls {
+            controls.wait_until_resumed(|| stop.load(std::sync::atomic::Ordering::SeqCst));
+        }
         if let Some(s) = &mut self.current {
             s.poll(wait, stop)?;
         }
@@ -93,6 +98,9 @@ impl Job {
                 }
                 self.current = Some(s);
             } else {
+                if let Some(controls) = &self.controls {
+                    controls.wait_until_resumed(|| stop.load(std::sync::atomic::Ordering::SeqCst));
+                }
                 self.advance()?;
             }
         }
@@ -216,6 +224,7 @@ impl Job {
         m: &Model,
         stop: &AtomicBool,
     ) -> Result<Vec<CheckResult>> {
+        self.controls = Some(m.controls.clone());
         while self.running() {
             self.poll(1000, stop)?;
             self.review(c, task, m, stop)?;
@@ -228,8 +237,15 @@ impl Job {
 #[derive(Default)]
 pub struct Jobs {
     jobs: Vec<Job>,
+    controls: Option<std::sync::Arc<crate::run_control::RunControl>>,
 }
 impl Jobs {
+    pub fn with_controls(controls: std::sync::Arc<crate::run_control::RunControl>) -> Self {
+        Self {
+            jobs: Vec::new(),
+            controls: Some(controls),
+        }
+    }
     /// Refresh OS process status after inference, before enforcing command guards.
     /// No watchdog inference here: tool replies must remain in protocol order.
     pub fn refresh_finished(&mut self, stop: &AtomicBool) -> Result<Vec<Value>> {
@@ -247,7 +263,8 @@ impl Jobs {
     pub fn running(&self) -> bool {
         self.jobs.iter().any(Job::running)
     }
-    pub fn start(&mut self, job: Job, stop: &AtomicBool) -> Result<Value> {
+    pub fn start(&mut self, mut job: Job, stop: &AtomicBool) -> Result<Value> {
+        job.controls = self.controls.clone();
         self.jobs.push(job);
         self.jobs.last_mut().unwrap().poll(1000, stop)
     }
@@ -298,6 +315,64 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paused_command_batch_keeps_its_process_and_defers_the_next_check() {
+        use std::{
+            sync::Arc,
+            thread,
+            time::{Duration, Instant},
+        };
+        let fixture = tempfile::tempdir().unwrap();
+        let controls = Arc::new(crate::run_control::RunControl::default());
+        let checks = [
+            "echo first >> completed; touch first-done",
+            "echo second >> completed",
+        ]
+        .map(|script| Check {
+            argv: vec!["sh".into(), "-c".into(), script.into()],
+            timeout_seconds: 30,
+        });
+        let mut job = Job::new(
+            fixture.path(),
+            fixture.path(),
+            "pause-test",
+            checks.into(),
+            true,
+            false,
+        )
+        .unwrap();
+        job.controls = Some(controls.clone());
+        controls.toggle_pause();
+        let worker = thread::spawn(move || {
+            let stop = AtomicBool::new(false);
+            while job.running() {
+                job.poll(100, &stop).unwrap();
+            }
+            job.results
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && (!controls.is_paused() || !fixture.path().join("first-done").exists())
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let paused = controls.is_paused();
+        let before_resume =
+            fs::read_to_string(fixture.path().join("completed")).unwrap_or_default();
+        controls.resume();
+        let results = worker.join().unwrap();
+        assert!(paused);
+        assert_eq!(
+            before_resume, "first\n",
+            "Existing command can finish, but next check must wait"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.path().join("completed")).unwrap(),
+            "first\nsecond\n"
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.passed));
+    }
     #[test]
     #[ignore = "Uses the selected Ollama model only when explicitly requested"]
     fn live_watchdog_recognizes_self_replenishing_change_loop() {

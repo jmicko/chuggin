@@ -13,6 +13,7 @@ mod project;
 mod prompts;
 mod provider;
 mod repetition;
+mod run_control;
 mod runner;
 mod setup;
 mod stall_diagnostic;

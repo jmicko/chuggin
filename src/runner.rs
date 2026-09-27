@@ -927,11 +927,12 @@ fn work(
     session.messages.push(json!({"role":"user","content":json!({"cycle":s.cycle,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"working_checkpoint":s.working_ref,"instruction":if s.current_task.is_some() {"Continue the active task from existing files and the latest check feedback. Investigate and repair unresolved failures. All work is retained."} else {"There is no active task. Previous completions are already saved. Inspect what is needed toward the main goal and use set_task for the next useful task, then work on it. Research and foundational work count; do not report an old task complete again."}}).to_string()}));
     save_conversation(c, session)?;
     let mut research = crate::web_tools::Research::default();
-    let mut jobs = crate::command_jobs::Jobs::default();
+    let mut jobs = crate::command_jobs::Jobs::with_controls(m.controls.clone());
     let mut finish_requested = None;
     let mut project_completion = None;
     let mut summary = String::new();
     for step in 0..c.implementation_calls {
+        m.pause_point();
         anyhow::ensure!(!stop.load(Ordering::SeqCst), "Stopped by operator");
         for update in jobs.monitor(c, s.current_task.as_ref(), m, stop)? {
             session.messages.push(
@@ -1035,11 +1036,13 @@ fn work(
         }
         session.messages.push(response);
         save_conversation(c, session)?;
+        m.pause_point();
         if calls.is_empty() {
             break;
         }
         let mut completed_commands = Vec::new();
         for (index, call) in calls.iter().enumerate() {
+            m.pause_point();
             completed_commands.extend(jobs.refresh_finished(stop)?);
             let name = call["function"]["name"].as_str().unwrap_or("");
             let args = &call["function"]["arguments"];
@@ -1409,6 +1412,7 @@ fn work(
             break;
         }
     }
+    m.pause_point();
     for update in jobs.drain(c, s.current_task.as_ref(), m, stop)? {
         session.messages.push(
             json!({"role":"user","content":json!({"command_final_result":update}).to_string()}),
@@ -1434,6 +1438,20 @@ pub fn reopen_goal(path: &Path) -> Result<()> {
 }
 
 pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()> {
+    run_controlled(
+        path,
+        count,
+        stop,
+        Arc::new(crate::run_control::RunControl::default()),
+    )
+}
+pub fn run_controlled(
+    path: &Path,
+    count: Option<u64>,
+    stop: Arc<AtomicBool>,
+    controls: Arc<crate::run_control::RunControl>,
+) -> Result<()> {
+    controls.bind_stop(stop.clone());
     let c = load(path)?;
     crate::setup::ensure_git_identity(&c.repo)?;
     let _lock = lock_project(&c)?;
@@ -1455,7 +1473,7 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .and_then(|v| v["run_duration_seconds"].as_u64())
             .unwrap_or(c.run_duration_seconds);
-        limit > 0 && started.elapsed().as_secs() >= limit
+        limit > 0 && controls.active_elapsed(started).as_secs() >= limit
     };
     // Soft stops finish the current batch and checkpoint. Force-stop remains the
     // main process's signal handler; pending tools are reconciled on resume.
@@ -1467,10 +1485,15 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
         c.output_tokens,
         stage_stop.clone(),
     )?;
+    model.controls = controls.clone();
     model.use_project_settings(path);
     model.use_run_controls(stop.clone(), started);
     let mut completed = 0;
     while !stop.load(Ordering::SeqCst) && !time_up() && count.is_none_or(|n| completed < n) {
+        model.pause_point();
+        if stop.load(Ordering::SeqCst) || time_up() {
+            break;
+        }
         state.cycle += 1;
         while c
             .state_dir
@@ -1523,6 +1546,7 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
                 "Work request failed: {error}. Saving existing work."
             ));
         }
+        model.pause_point();
         crate::events::send(crate::events::Event::Phase("Check".into()));
         let before_check = working_tree(&state.working_workspace)?;
         let validation = (|| -> Result<Vec<CheckResult>> {
@@ -1554,6 +1578,7 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
         emit(&art, "verification", &results)?;
         let checked_same_files = before_check == after_check;
         let passed = !results.is_empty() && results.iter().all(|r| r.passed) && checked_same_files;
+        model.pause_point();
         crate::events::send(crate::events::Event::Phase("Review".into()));
         let task_title = state
             .current_task
@@ -1680,6 +1705,7 @@ pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()>
         }
         crate::events::send(crate::events::Event::Phase("Between cycles".into()));
         for _ in 0..c.retry_seconds {
+            model.pause_point();
             if stop.load(Ordering::SeqCst) || time_up() {
                 break;
             }

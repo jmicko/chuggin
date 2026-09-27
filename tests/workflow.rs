@@ -140,6 +140,7 @@ impl Server {
                             content.as_str(),
                             "__FAIL_REQUEST__"
                                 | "__HTTP_LIMIT__"
+                                | "__HTTP_LONG_LIMIT__"
                                 | "__CREDIT_LIMIT__"
                                 | "__CREDIT_RETRY__"
                         ) {
@@ -154,6 +155,7 @@ impl Server {
                 let status = match data.as_str() {
                     "__FAIL_REQUEST__" => "400 Bad Request",
                     "__HTTP_LIMIT__" => "429 Too Many Requests\nRetry-After: 1",
+                    "__HTTP_LONG_LIMIT__" => "429 Too Many Requests\nRetry-After: 300",
                     "__CREDIT_LIMIT__" => "402 Payment Required",
                     "__CREDIT_RETRY__" => "402 Payment Required\nRetry-After: 1",
                     _ => "200 OK",
@@ -1714,6 +1716,21 @@ mod terminal_ui {
                 thread::sleep(Duration::from_millis(30));
             }
         }
+        fn wait_until(&mut self, description: &str, ready: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                self.read();
+                if ready() {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Waiting for {description}:\n{}",
+                    self.parser.screen().contents()
+                );
+                thread::sleep(Duration::from_millis(30));
+            }
+        }
         fn send(&mut self, keys: &[u8]) {
             self.master.write_all(keys).unwrap();
         }
@@ -1858,6 +1875,186 @@ mod terminal_ui {
                 .unwrap();
         assert_eq!(resumed["cycle"], 3);
         ui.send(b"\r");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+    }
+    #[test]
+    fn pause_finishes_the_response_then_resumes_its_tools_in_the_same_cycle() {
+        let release_response = Arc::new(AtomicBool::new(false));
+        let release = release_response.clone();
+        let server = Server::custom(false, false, None, move |_, n| {
+            if n == 0 {
+                // The UI must accept P while inference is in flight. A bounded gate
+                // makes the response/pause ordering deterministic without slow sleeps.
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !release.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                (
+                    "The edit is ready.".into(),
+                    json!([
+                        task_tool("Pause in the middle of a cycle"),
+                        {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"APPLIED_ONCE"}}}
+                    ]),
+                )
+            } else {
+                thread::sleep(Duration::from_millis(800));
+                ("Ready to checkpoint.".into(), json!([]))
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"\r");
+        ui.wait_until("first model request", || {
+            server.requests.lock().unwrap().len() == 1
+        });
+        ui.send(b"p");
+        ui.wait("Pause requested");
+        release_response.store(true, Ordering::SeqCst);
+        ui.wait("CYCLE PAUSED");
+
+        let paused = state(root.path());
+        assert_eq!(paused["cycle"], 1);
+        let workspace = Path::new(paused["working_workspace"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(workspace.join("value.txt")).unwrap(),
+            "USER_EDIT"
+        );
+        assert!(!root.path().join("state/cycle-000001/outcome.json").exists());
+        let conversation: Value =
+            serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
+                .unwrap();
+        assert!(
+            conversation["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "assistant" && message["content"] == "The edit is ready."
+                }),
+            "The complete response must be retained before pausing"
+        );
+        thread::sleep(Duration::from_millis(500));
+        ui.read();
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(workspace.join("value.txt")).unwrap(),
+            "USER_EDIT"
+        );
+
+        ui.send(b"p");
+        ui.wait_until("continuation request in the same cycle", || {
+            server.requests.lock().unwrap().len() == 2
+        });
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        let saved = state(root.path());
+        assert_eq!(saved["cycle"], 1);
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            fs::read_to_string(workspace.join("value.txt")).unwrap(),
+            "APPLIED_ONCE"
+        );
+        let conversation: Value =
+            serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            conversation["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool" && message["tool_name"] == "write_file")
+                .count(),
+            1,
+            "Resume must not replay completed edits"
+        );
+        ui.send(b"q");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+    }
+
+    #[test]
+    fn retry_now_bypasses_saved_cooldown_once_and_waits_for_resume_when_paused() {
+        let server = Server::custom(true, false, None, |_, n| {
+            if n == 0 {
+                ("__HTTP_LONG_LIMIT__".into(), json!([]))
+            } else {
+                ("Provider recovered.".into(), json!([]))
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let wait_path = root.path().join("state/provider-wait.json");
+        fs::create_dir_all(wait_path.parent().unwrap()).unwrap();
+        let until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 300;
+        fs::write(
+            &wait_path,
+            json!({
+                "reason":"Saved provider cooldown", "model":"fake",
+                "url":format!("{}/api/chat", server.url),
+                "attempt":7, "until":until, "delay_seconds":300
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"\r");
+        ui.wait("Waiting for provider");
+        assert!(server.requests.lock().unwrap().is_empty());
+
+        ui.send(b"t");
+        ui.wait_until("one immediate retry and its new cooldown", || {
+            fs::read(&wait_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|record| record["attempt"] == 8)
+        });
+        ui.wait("Waiting for provider");
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        thread::sleep(Duration::from_millis(600));
+        ui.read();
+        assert_eq!(
+            server.requests.lock().unwrap().len(),
+            1,
+            "A failed manual retry must return to backoff, not hammer the provider"
+        );
+
+        ui.send(b"p");
+        ui.wait("CYCLE PAUSED");
+        ui.send(b"t");
+        ui.wait("Retry queued");
+        thread::sleep(Duration::from_millis(500));
+        ui.read();
+        assert_eq!(
+            server.requests.lock().unwrap().len(),
+            1,
+            "Retry now must not send requests while paused"
+        );
+        ui.send(b"p");
+        ui.wait_until("queued retry after resuming", || {
+            server.requests.lock().unwrap().len() == 2
+        });
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        let calls = server.requests.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0], calls[1],
+            "Retry must preserve the exact conversation"
+        );
+        drop(calls);
+        assert_eq!(state(root.path())["cycle"], 1);
+        assert!(!wait_path.exists());
+        ui.send(b"q");
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();

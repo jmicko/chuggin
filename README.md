@@ -54,6 +54,9 @@ tool actions, check output, recovery messages, and recent outcomes.
 - **Home:** oldest retained output. **End / F:** follow live output again.
 - **/** searches the current output view; **Esc** clears the filter.
 - **?** opens the keyboard guide.
+- **P:** pause inside the current cycle, then press P again to continue where it left off.
+  An active model response or tool operation finishes before the pause takes effect.
+- **T:** retry a waiting provider now. While paused, queues the retry for resume.
 - **Ctrl+C / Q:** finish the current cycle. **Ctrl+C again:** force stop.
 - **R:** cancel a pending stop or resume directly after the run finishes.
   When the run finishes, Enter returns to the splash screen.
@@ -89,6 +92,15 @@ request, or press R on the finished screen to continue from saved progress.
 Second Ctrl-C stops immediately. Subsequent runs resume the persistent working project.
 During setup, a single Ctrl-C exits.
 
+For shorter interruptions, press **P** in the observation view. **PAUSING** means
+the current model response or tool operation is finishing; **PAUSED IN CYCLE**
+means no further model requests or tools will start until you press P again.
+This preserves the current cycle, conversation, and pending tool calls without
+starting a new session. Already-started commands may still finish; pausing does
+not suspend operating-system processes. The run timer stops while the cycle is
+held. Pressing P again while a pause is pending cancels it. Ctrl+C or Q releases
+the pause and requests the usual stop after the cycle.
+
 Choose **Run duration** from the home menu to set a project-specific duration
 in hours (fractional hours work; 0 means unlimited). The observation view shows
 the time remaining. When the limit is reached, Chuggin finishes the current cycle,
@@ -107,9 +119,10 @@ to cancel. Changes persist only in this project’s `chuggin.json`.
 Model and request-timeout changes are snapshotted at the next model call, including
 a retry; the active call finishes with its original settings. The panel shows the
 current/last request model separately from the next selected model. Timer edits
-apply immediately against elapsed time since this run started. Shortening the
-duration below elapsed time requests a stop after the current cycle; extending
-it allows additional time. Resuming a stopped run starts a new timer.
+apply immediately against active elapsed time since this run started, excluding
+time held by P. Shortening the duration below elapsed time requests a stop after
+the current cycle; extending it allows additional time. Resuming a stopped run
+starts a new timer.
 
 ## One conversation, continuous refinement
 
@@ -429,10 +442,15 @@ still receives the bounded-frequency retry policy; a reset time cannot be inferr
 reliably from every provider's prose.
 
 Pending waits persist in `.chuggin/provider-wait.json`, so restarting does not bypass
-the cooldown. Changing the selected model/server releases its old wait. A soft stop
+the cooldown. Once you have fixed the connection or account issue, press **T** in
+the observation view to skip the current wait and try now, including a wait restored
+after restarting. This requests one retry; another provider failure returns to the
+normal backoff policy. T does not unpause a held cycle; the retry waits for P to resume.
+Changing the selected model/server releases its old wait. A soft stop
 or the run timer ends a provider wait promptly, then runs checks and saves work;
-time waiting counts toward the run duration. Each provider failure and chosen
-retry delay is recorded in the cycle's `provider-error-NNN.json` files.
+time waiting counts toward the run duration unless you explicitly pause with P.
+Each provider failure and chosen retry delay is recorded in the cycle's
+`provider-error-NNN.json` files.
 
 `.chuggin/state.json` records `working_ref`, `working_branch`, `working_workspace`,
 `last_checks_passed_ref`, the current task and ID, the latest 32 completed tasks,
