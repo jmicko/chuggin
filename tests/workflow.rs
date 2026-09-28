@@ -3953,3 +3953,87 @@ fn interrupted_normal_commit_repairs_its_index_without_replaying_the_commit() {
     assert!(!repo.join(".git/index.lock").exists());
     assert!(!repo.join(".git/chuggin-promotion").exists());
 }
+
+#[test]
+fn migration_handoff_only_for_changed_agent_files_and_only_one_completed_cycle() {
+    for merged in [false, true] {
+        let server = Server::custom(false, false, None, |_, _| {
+            ("Continue work.".into(), json!([]))
+        });
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let repo = root.path().join("repo");
+        git(&repo, &["restore", "value.txt"]);
+        let dir = root.path().join("state");
+        fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("working");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "handoff-test",
+                legacy.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        fs::write(legacy.join("value.txt"), "1").unwrap();
+        if merged {
+            fs::write(repo.join("research-note.md"), "Human research to retain").unwrap();
+        }
+        fs::write(dir.join("state.json"), json!({"schema_version":3,"run_id":"handoff-test","goal":"Improve value incrementally","repo":repo,"cycle":7,"working_ref":git(&repo,&["rev-parse","HEAD"]),"working_branch":"handoff-test","working_workspace":legacy}).to_string()).unwrap();
+        migrate_fixture(root.path());
+        let report: Value =
+            serde_json::from_slice(&fs::read(dir.join("migration-handoff.json")).unwrap()).unwrap();
+        assert_eq!(
+            report["changes"].as_array().unwrap().len(),
+            usize::from(merged)
+        );
+        if merged {
+            assert_eq!(report["changes"][0]["path"], "research-note.md");
+            assert_eq!(report["changes"][0]["change"], "Added during migration");
+        }
+        run_cycles(root.path(), 0);
+        assert!(server.requests.lock().unwrap().is_empty());
+        run_cycles(root.path(), 1);
+        let notes = |request: &Value| -> Vec<Value> {
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| {
+                    m["content"]
+                        .as_str()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                })
+                .filter(|v| v["kind"] == "migration_handoff")
+                .collect()
+        };
+        let calls = server.requests.lock().unwrap();
+        let first = notes(&calls[0]);
+        assert_eq!(first.len(), usize::from(merged));
+        if merged {
+            assert_eq!(first[0]["changes"][0]["path"], "research-note.md");
+            assert!(
+                first[0]["instruction"]
+                    .as_str()
+                    .unwrap()
+                    .contains("first post-upgrade cycle only")
+            );
+        }
+        let previous = calls.len();
+        drop(calls);
+        let conversation: Value =
+            serde_json::from_slice(&fs::read(dir.join("conversation.json")).unwrap()).unwrap();
+        assert!(conversation["migration_handoff"].is_null());
+        assert_eq!(conversation["migration_handoff_seen"], report["id"]);
+        run_cycles(root.path(), 2);
+        for call in &server.requests.lock().unwrap()[previous..] {
+            assert!(
+                notes(call).is_empty(),
+                "Later cycles and cold starts must not repeat upgrade review instructions"
+            );
+        }
+    }
+}

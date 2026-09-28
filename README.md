@@ -517,7 +517,18 @@ For maintenance/automation, `chuggin migrate`
 prints the preview and `chuggin migrate --apply` applies it; unattended runs never
 silently migrate. Interrupted application is journaled and can resume; intervening
 file or staging changes stop automatic recovery rather than being overwritten.
-Version 0.12 uses state schema 4; older binaries cannot resume that state.
+Version 0.12 uses state schema 4; older binaries cannot resume that state. Once
+migration succeeds, later launches resume directly; this is a one-time move per
+project, not a step repeated on every launch or version update.
+
+Migration also records its actual changes relative to the agent's previous files
+in `.chuggin/migration-handoff.json`. If those files changed, the first work
+interval receives a one-time note listing affected files, including original
+versions kept in place of Chuggin's work, additions, removals, and merges. The note
+asks for focused inspection and appropriate checks, followed by ordinary work.
+It survives an interrupted interval and conversation recovery, then retires at
+the next completed cycle boundary. Concrete unresolved findings remain ordinary
+follow-up work. Keeping the agent's files unchanged adds no extra review request.
 
 Each cycle-NNNNNN directory records the evidence for that interval:
 

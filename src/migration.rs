@@ -172,7 +172,7 @@ pub fn describe(plan: &Plan) -> Result<String> {
         &["diff", "--shortstat", &plan.original_snapshot],
     )?;
     Ok(format!(
-        "{}\n\nYou are upgrading a project from an older Chuggin version. Older versions kept Chuggin's work in a separate folder while your normal folder stayed behind. This update brings that work into your normal folder so you can open and run it there.\n\nYour project: {}\n\n{}\n\n{}\n\nYour original files, Chuggin's work, and Git history are backed up. Your file choices are collected in a temporary copy for review. Your project stays unchanged until you confirm the move.\n\nStart review over: use this if you edited files in either folder since this review began, or want to redo your choices. It compares the latest files again and asks you to choose versions again.\n",
+        "{}\n\nYou are upgrading a project from an older Chuggin version. Older versions kept Chuggin's work in a separate folder while your normal folder stayed behind. This update brings that work into your normal folder so you can open and run it there. This is a one-time move for this project; later runs resume directly.\n\nYour project: {}\n\n{}\n\n{}\n\nYour original files, Chuggin's work, and Git history are backed up. Your file choices are collected in a temporary copy for review. Your project stays unchanged until you confirm the move.\n\nStart review over: use this if you edited files in either folder since this review began, or want to redo your choices. It compares the latest files again and asks you to choose versions again.\n",
         if conflicts.is_empty() {
             "Ready to update your project folder".into()
         } else {
@@ -647,6 +647,54 @@ pub fn complete(state: &Path, mut plan: Plan) -> Result<()> {
     plan.phase = "complete".into();
     persist(&state.join("migration.json"), &plan)
 }
+#[derive(Serialize, Deserialize)]
+pub struct Handoff {
+    pub id: String,
+    pub previous_workspace: PathBuf,
+    pub previous_snapshot: String,
+    pub migrated_tree: String,
+    pub changes: Vec<FileChange>,
+}
+#[derive(Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub change: String,
+}
+/// Compare the result with the files the agent actually had, not the stale root.
+pub fn save_handoff(state: &Path, plan: &Plan) -> Result<()> {
+    let old = entries(&plan.root, &plan.source_tree)?;
+    let original = entries(&plan.root, &plan.original_tree)?;
+    let after = entries(&plan.root, &plan.target_tree)?;
+    let mut changes = Vec::new();
+    for path in workspace::changed_paths(&plan.root, state, &plan.source_tree, &plan.target_tree)? {
+        let key = path.as_bytes();
+        let change = if !after.contains_key(key) {
+            "Removed during migration"
+        } else if !old.contains_key(key) {
+            "Added during migration"
+        } else if after.get(key) == original.get(key) {
+            "Original-folder version kept instead of the previous Chuggin version"
+        } else {
+            "Merged or edited during migration"
+        };
+        changes.push(FileChange {
+            path,
+            change: change.into(),
+        });
+    }
+    let report = Handoff {
+        id: format!("{}:{}", plan.source_snapshot, plan.target_tree),
+        previous_workspace: plan.source.clone(),
+        previous_snapshot: plan.source_snapshot.clone(),
+        migrated_tree: plan.target_tree.clone(),
+        changes,
+    };
+    let path = state.join("migration-handoff.json");
+    let temp = path.with_extension("tmp");
+    fs::write(&temp, serde_json::to_vec_pretty(&report)?)?;
+    fs::rename(temp, path)?;
+    Ok(())
+}
 pub fn restore_files(root: &Path, state: &Path, target: &str) -> Result<()> {
     anyhow::ensure!(
         !workspace::staged(root, state)?,
@@ -760,10 +808,24 @@ mod tests {
             } else {
                 fs::write(source.join(file), "agent version\n").unwrap();
             }
-            let plan = prepare(&root, &source, &state).unwrap();
+            let mut plan = prepare(&root, &source, &state).unwrap();
             assert_eq!(conflict_files(&plan).unwrap(), [file]);
             choose_file(&plan, file, developing).unwrap();
             assert!(conflict_files(&plan).unwrap().is_empty());
+            plan.target_tree = workspace::tree(&plan.prepared, None).unwrap();
+            save_handoff(&state, &plan).unwrap();
+            let report: Handoff =
+                serde_json::from_slice(&fs::read(state.join("migration-handoff.json")).unwrap())
+                    .unwrap();
+            assert_eq!(report.changes.len(), usize::from(!developing));
+            if !developing {
+                assert_eq!(report.changes[0].path, file);
+                assert!(
+                    report.changes[0]
+                        .change
+                        .contains("Original-folder version kept")
+                );
+            }
             assert_eq!(
                 fs::read_to_string(root.join(file)).unwrap(),
                 "human version\n"
