@@ -502,7 +502,10 @@ choice for you to approve, or asks for closer review when neither whole file is
 a safe choice. Provider errors return to the menu; no file choice is applied.
 Once conflicts are resolved, **Move files and resume** applies the result.
 Combining parts manually is also possible in the displayed preview folder.
-You can refresh a stale preview while retaining the previous prepared result.
+**Start review over (if files changed)** re-reads both folders and starts a fresh
+file comparison. Use it after editing either folder during the review, or to redo
+your file choices. Previous choices remain backed up but are not reused.
+Restarting the review leaves project files and development history unchanged.
 Existing commits keep their IDs, authors, dates, and messages. Both input
 snapshots, staging backups, the old workspace, conversation, and diagnostic history
 remain available. A running or paused worker must stop before migration.

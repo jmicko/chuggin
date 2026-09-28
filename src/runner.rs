@@ -2175,7 +2175,7 @@ pub fn migration_ui(path: &Path) -> Result<bool> {
             &[
                 primary.into(),
                 "View all file changes".into(),
-                "Rebuild preview from current files".into(),
+                "Start review over (if files changed)".into(),
                 "Back — leave my project unchanged".into(),
             ],
         )?;
@@ -2218,7 +2218,7 @@ pub fn migration_ui(path: &Path) -> Result<bool> {
                     Err(error) => crate::ui::show(
                         "Project move needs attention",
                         &format!(
-                            "The move could not finish. Your backups are retained.\n\n{error:#}\n\nIf you changed either folder after creating the preview, rebuild it from current files. If the move already began, continue it after resolving the reported issue."
+                            "The move could not finish. Your backups are retained.\n\n{error:#}\n\nIf you changed files in either folder during this review, choose Start review over to compare the latest files. If the move already began, continue it after resolving the reported issue."
                         ),
                     )?,
                 }
@@ -2237,9 +2237,15 @@ pub fn migration_ui(path: &Path) -> Result<bool> {
             }
             Some(2) => {
                 if migration_choice(
-                    "Rebuild preview?",
-                    "Use this if files changed after the preview was created. Any choices you made in this preview will be archived, and you will review the new result again. Your actual project files stay unchanged.",
-                    &["Back".into(), "Rebuild preview".into()],
+                    "Start this file review over?",
+                    "Chuggin will read both folders again and prepare a fresh comparison of their current files.
+
+Use this if you edited either folder since this review began, or want to redo your file choices. Otherwise, choose Back and continue reviewing the conflicting files.
+
+You will choose file versions again. Your previous review and choices are kept in a backup, but are not reused in the new review.
+
+Your project files and development history stay unchanged. This only restarts the migration review.",
+                    &["Back".into(), "Start review over".into()],
                 )? == Some(1)
                 {
                     {

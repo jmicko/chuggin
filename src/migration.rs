@@ -172,7 +172,7 @@ pub fn describe(plan: &Plan) -> Result<String> {
         &["diff", "--shortstat", &plan.original_snapshot],
     )?;
     Ok(format!(
-        "{}\n\nYou are upgrading a project from an older Chuggin version. Older versions kept Chuggin's work in a separate folder while your normal folder stayed behind. This update brings that work into your normal folder so you can open and run it there.\n\nYour project: {}\n\n{}\n\n{}\n\nYour original files, Chuggin's work, and Git history are backed up. Reviewing or choosing a file version only changes a preview copy. Your project stays unchanged until you confirm the move.\n",
+        "{}\n\nYou are upgrading a project from an older Chuggin version. Older versions kept Chuggin's work in a separate folder while your normal folder stayed behind. This update brings that work into your normal folder so you can open and run it there.\n\nYour project: {}\n\n{}\n\n{}\n\nYour original files, Chuggin's work, and Git history are backed up. Your file choices are collected in a temporary copy for review. Your project stays unchanged until you confirm the move.\n\nStart review over: use this if you edited files in either folder since this review began, or want to redo your choices. It compares the latest files again and asks you to choose versions again.\n",
         if conflicts.is_empty() {
             "Ready to update your project folder".into()
         } else {
@@ -508,12 +508,12 @@ pub fn apply(state: &Path, clear_staging: bool) -> Result<Plan> {
             workspace::head(root) == plan.original_head
                 && workspace::tree(root, Some(state))? == plan.original_tree
                 && index_tree(root)? == plan.original_index,
-            "Original checkout changed since preview. Preserve your prepared result and refresh the migration preview."
+            "Files in your project folder changed during this review. Choose Start review over to compare the latest files; your previous review is kept in a backup."
         );
         anyhow::ensure!(
             workspace::head(&plan.source) == plan.source_head
                 && workspace::tree(&plan.source, Some(state))? == plan.source_tree,
-            "Developing workspace changed since preview. Stop its runner and refresh the migration preview."
+            "Files in Chuggin's old working folder changed during this review. Stop its runner, then choose Start review over to compare the latest files."
         );
         plan.target_tree = workspace::tree(&plan.prepared, None)?;
         plan.target_head = if project::git(
