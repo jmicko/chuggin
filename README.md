@@ -492,14 +492,25 @@ your project’s tracked ignore rules.
 **Upgrading an existing project:** choose Resume to prepare a migration preview.
 The old developing workspace and the visible folder are reconciled in a separate
 preparation directory. Nothing is copied over the visible folder until you apply
-that preview. Conflicts must be resolved and staged in the displayed prepared
-folder. You can refresh a stale preview while retaining the previous prepared
-result. Existing commits keep their IDs, authors, dates, and messages. Both input
+that preview. If both folders changed a file, choose **Review conflicting files**
+to compare versions and select the whole file from Chuggin or your original folder. Both
+originals remain backed up; choices only change the preview. The screen explains
+why upgrading from the older separate-folder workflow needs this review and
+recommends keeping Chuggin’s latest work. **Ask AI to recommend a version** uses
+your configured project model for a bounded, read-only review. It explains its
+choice for you to approve, or asks for closer review when neither whole file is
+a safe choice. Provider errors return to the menu; no file choice is applied.
+Once conflicts are resolved, **Move files and resume** applies the result.
+Combining parts manually is also possible in the displayed preview folder.
+You can refresh a stale preview while retaining the previous prepared result.
+Existing commits keep their IDs, authors, dates, and messages. Both input
 snapshots, staging backups, the old workspace, conversation, and diagnostic history
 remain available. A running or paused worker must stop before migration.
 
-The migration normally preserves staging. An explicit alternative clears old
-staging after retaining its backup. For maintenance/automation, `chuggin migrate`
+If the original folder has changes selected for a future Git commit, the menu
+explains that selection separately. You can clear the old selection while keeping
+the updated files, or explicitly preserve it. Its backup remains available.
+For maintenance/automation, `chuggin migrate`
 prints the preview and `chuggin migrate --apply` applies it; unattended runs never
 silently migrate. Interrupted application is journaled and can resume; intervening
 file or staging changes stop automatic recovery rather than being overwritten.

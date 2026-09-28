@@ -2030,36 +2030,228 @@ pub fn migration_apply(path: &Path, clear_staging: bool) -> Result<()> {
     ));
     Ok(())
 }
+fn migration_choice(title: &str, details: &str, items: &[String]) -> Result<Option<usize>> {
+    crate::ui::clear_notes();
+    crate::ui::notice(details.into());
+    crate::menu::select(title, items, 0)
+}
+fn review_migration_file(path: &Path, file: &str) -> Result<()> {
+    let c = load(path)?;
+    loop {
+        let plan = crate::migration::load(&c.state_dir)?;
+        let details = format!(
+            "Review: {file}\n\nThis conflict appeared while upgrading from an older Chuggin version, which kept its work separate from your normal project folder. Both copies have edits that could not be combined automatically.\n\nRecommended: keep Chuggin's version to retain its latest progress. Choose your original version only if you need separate edits from that folder. You can also ask your project's model to review both copies.\nYour project version: the file from the folder you normally open.\n\nChoosing a version uses that ENTIRE file, not just the conflicting lines. The other version remains in the backup. No files in your project change yet.\n\nTo combine parts yourself, edit the preview file and mark it resolved with Git:\n{}",
+            plan.prepared.join(file).display()
+        );
+        match migration_choice(
+            "Choose a file version",
+            &details,
+            &[
+                "Keep Chuggin's version (recommended)".into(),
+                "Ask AI to recommend a version".into(),
+                "Compare both versions".into(),
+                "Keep version from my project folder".into(),
+                "Back — leave this file unresolved".into(),
+            ],
+        )? {
+            Some(2) => crate::ui::show(
+                "Compare file versions",
+                &format!(
+                    "{file}\n\nLines starting with - are from your project folder.\nLines starting with + are from Chuggin's version.\n\n{}",
+                    crate::migration::compare_file(&plan, file)?
+                ),
+            )?,
+            Some(choice @ (0 | 3)) => {
+                let _lock = lock_project(&c)?;
+                crate::migration::choose_file(&plan, file, choice == 0)?;
+                return Ok(());
+            }
+            Some(1) => {
+                let review_plan = crate::migration::load(&c.state_dir)?;
+                let review_file = file.to_owned();
+                let goal = c.goal.clone();
+                let mut model = Model::new(
+                    &c.ollama_url,
+                    &c.model,
+                    c.context_tokens,
+                    2048,
+                    Arc::new(AtomicBool::new(false)),
+                )?;
+                model.use_project_settings(path);
+                let _lock = lock_project(&c)?;
+                let output = c.state_dir.join("migration").join(format!(
+                    "ai-review-{}",
+                    SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+                ));
+                let label = format!("{} is reviewing both versions", c.model);
+                let result = crate::ui::busy(&label, move || {
+                    crate::migration::recommend(&model, &review_plan, &review_file, &goal, &output)
+                });
+                match result {
+                    Ok(advice) => {
+                        use crate::migration::Recommendation;
+                        let choice = match advice.choice {
+                            Recommendation::Chuggin => {
+                                Some((true, "Use AI recommendation — keep Chuggin's version"))
+                            }
+                            Recommendation::Original => {
+                                Some((false, "Use AI recommendation — keep my original version"))
+                            }
+                            Recommendation::CombineManually => None,
+                        };
+                        let details = format!(
+                            "AI review of {file}\n\n{}\n\nThis is a recommendation, not a verification. No file choices have been applied. Both originals remain backed up.",
+                            advice.reason
+                        );
+                        if let Some((developing, action)) = choice {
+                            if migration_choice(
+                                "AI recommendation",
+                                &details,
+                                &[action.into(), "Back — choose myself".into()],
+                            )? == Some(0)
+                            {
+                                crate::migration::choose_file(&plan, file, developing)?;
+                                return Ok(());
+                            }
+                        } else {
+                            crate::ui::show(
+                                "AI recommends a closer review",
+                                &format!(
+                                    "{details}\n\nThe AI could not safely choose one whole file. You can compare the versions and choose yourself, or combine them in the preview folder."
+                                ),
+                            )?;
+                        }
+                    }
+                    Err(error) => crate::ui::show(
+                        "AI review unavailable",
+                        &format!(
+                            "{error:#}\n\nYour files and choices are unchanged. You can choose a version yourself or retry the review."
+                        ),
+                    )?,
+                }
+            }
+            _ => return Ok(()),
+        }
+    }
+}
 pub fn migration_ui(path: &Path) -> Result<bool> {
     if !needs_migration(path)? {
         return Ok(true);
     }
-    let preview = migration_preview(path)?;
-    crate::ui::show("Visible project migration", &preview)?;
-    let choice = crate::menu::select(
-        "Apply prepared project",
-        &[
-            "Apply and preserve staging".into(),
-            "Apply and clear old staging (backup retained)".into(),
-            "Back — inspect or resolve prepared files first".into(),
-            "Refresh preview (archive the prepared result)".into(),
-        ],
-        0,
-    )?;
-    match choice {
-        Some(0) => migration_apply(path, false)?,
-        Some(1) => migration_apply(path, true)?,
-        Some(3) => {
-            let c = load(path)?;
+    migration_preview(path)?;
+    let c = load(path)?;
+    loop {
+        let plan = crate::migration::load(&c.state_dir)?;
+        let conflicts = crate::migration::conflict_files(&plan)?;
+        if plan.phase != "prepared" {
+            if migration_choice(
+                "Continue project update",
+                "A previous move was interrupted. Continue to finish it using the saved recovery information. Your file choices have already been recorded.",
+                &["Continue interrupted move".into(), "Back".into()],
+            )? != Some(0)
             {
-                let _lock = lock_project(&c)?;
-                crate::migration::refresh(&c.state_dir)?;
+                return Ok(false);
             }
-            return migration_ui(path);
+            match migration_apply(path, false) {
+                Ok(()) => return Ok(true),
+                Err(error) => crate::ui::show(
+                    "Project move needs attention",
+                    &format!(
+                        "Your recovery information is retained. Resolve this issue, then continue the move:\n\n{error:#}"
+                    ),
+                )?,
+            }
+            continue;
         }
-        _ => return Ok(false),
-    };
-    Ok(true)
+        let details = crate::migration::describe(&plan)?;
+        let primary = if conflicts.is_empty() {
+            "Move files and resume"
+        } else {
+            "Review conflicting files"
+        };
+        let choice = migration_choice(
+            "Update project folder",
+            &details,
+            &[
+                primary.into(),
+                "View all file changes".into(),
+                "Rebuild preview from current files".into(),
+                "Back — leave my project unchanged".into(),
+            ],
+        )?;
+        match choice {
+            Some(0) if !conflicts.is_empty() => {
+                let file = if conflicts.len() == 1 {
+                    Some(conflicts[0].clone())
+                } else {
+                    migration_choice(
+                        "Files needing review",
+                        "Choose a file to compare its two versions. Both originals are backed up.",
+                        &conflicts,
+                    )?
+                    .map(|i| conflicts[i].clone())
+                };
+                if let Some(file) = file {
+                    review_migration_file(path, &file)?;
+                }
+            }
+            Some(0) => {
+                let clear = if crate::workspace::staged(&c.repo, &c.state_dir)? {
+                    match migration_choice(
+                        "Keep an old commit selection?",
+                        "Your original folder has changes selected for a future Git commit. That selection is separate from the files themselves.\n\nUsually, you can clear this old selection and continue with the updated files. This does NOT delete file changes or undo your file choices. The old selection is backed up.\n\nKeep it only if you deliberately prepared a commit and still want that exact selection. It may conflict with newer work.",
+                        &[
+                            "Continue with updated files — clear old selection".into(),
+                            "Keep my old commit selection (advanced)".into(),
+                            "Back".into(),
+                        ],
+                    )? {
+                        Some(0) => true,
+                        Some(1) => false,
+                        _ => continue,
+                    }
+                } else {
+                    false
+                };
+                match migration_apply(path, clear) {
+                    Ok(()) => return Ok(true),
+                    Err(error) => crate::ui::show(
+                        "Project move needs attention",
+                        &format!(
+                            "The move could not finish. Your backups are retained.\n\n{error:#}\n\nIf you changed either folder after creating the preview, rebuild it from current files. If the move already began, continue it after resolving the reported issue."
+                        ),
+                    )?,
+                }
+            }
+            Some(1) => {
+                let changes =
+                    project::git(&plan.prepared, &["diff", "--stat", &plan.original_snapshot])?;
+                crate::ui::show(
+                    "File changes",
+                    &format!(
+                        "These changes will appear in your project folder.\n\n{changes}\n\nPreview folder: {}\nOriginal Chuggin folder: {}",
+                        plan.prepared.display(),
+                        plan.source.display()
+                    ),
+                )?;
+            }
+            Some(2) => {
+                if migration_choice(
+                    "Rebuild preview?",
+                    "Use this if files changed after the preview was created. Any choices you made in this preview will be archived, and you will review the new result again. Your actual project files stay unchanged.",
+                    &["Back".into(), "Rebuild preview".into()],
+                )? == Some(1)
+                {
+                    {
+                        let _lock = lock_project(&c)?;
+                        crate::migration::refresh(&c.state_dir)?;
+                    }
+                    migration_preview(path)?;
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
 }
 pub fn recovery_ui(path: &Path) -> Result<()> {
     let c = load(path)?;

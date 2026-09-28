@@ -2163,59 +2163,151 @@ mod terminal_ui {
     }
     #[test]
     fn migration_menu_previews_before_applying_and_resumes_in_the_visible_folder() {
-        let server = Server::custom(true, false, None, |_, _| {
-            ("Inspect the migrated project.".into(), json!([]))
-        });
-        let root = tempfile::tempdir().unwrap();
-        fixture(root.path(), &server.url, true);
-        let repo = root.path().join("repo");
-        git(&repo, &["restore", "value.txt"]);
-        let dir = root.path().join("state");
-        fs::create_dir_all(&dir).unwrap();
-        let legacy = dir.join("working");
-        git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "legacy-menu",
-                legacy.to_str().unwrap(),
-                "HEAD",
-            ],
-        );
-        fs::write(legacy.join("value.txt"), "VISIBLE DEVELOPMENT").unwrap();
-        fs::write(dir.join("state.json"),json!({"schema_version":3,"run_id":"menu-migration","goal":"Improve value incrementally","repo":repo,"cycle":7,"working_ref":git(&repo,&["rev-parse","HEAD"]),"working_branch":"legacy-menu","working_workspace":legacy}).to_string()).unwrap();
-        let mut ui = TerminalProcess::start(root.path());
-        ui.wait("Resume project");
-        ui.send(b"\r");
-        ui.wait("Visible project migration");
-        assert_eq!(fs::read_to_string(repo.join("value.txt")).unwrap(), "0");
-        assert!(server.requests.lock().unwrap().is_empty());
-        ui.send(b"\r");
-        ui.wait("Apply and preserve staging");
-        ui.send(b"\r");
-        ui.wait_until("model sees migrated files", || {
-            !server.requests.lock().unwrap().is_empty()
-        });
-        ui.send(b"\x03");
-        ui.wait("Run saved");
-        assert_eq!(
-            fs::read_to_string(repo.join("value.txt")).unwrap(),
-            "VISIBLE DEVELOPMENT"
-        );
-        assert_eq!(
-            state(root.path())["working_workspace"],
-            repo.to_str().unwrap()
-        );
-        ui.send(b"4");
-        ui.wait("WORKING FOLDER");
-        ui.wait("Normal commit:");
-        ui.wait("Recovery save:");
-        ui.send(b"q");
-        ui.wait("Resume project");
-        ui.send(b"q");
-        ui.restored();
+        for mode in 0..3 {
+            let conflict = mode != 0;
+            let server = Server::custom(true, false, None, move |body, _| {
+                if body["messages"][0]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("Help a user upgrade")
+                {
+                    if mode == 2 {
+                        return ("__HTTP_LIMIT__".into(), json!([]));
+                    }
+                    let read = body["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m["tool_name"] == "read_version");
+                    return if read {
+                        (
+                            String::new(),
+                            json!([{"function":{"name":"recommend_version","arguments":{"choice":"chuggin","reason":"Keep the developing version; the original is retained in the backup."}}}]),
+                        )
+                    } else {
+                        (
+                            String::new(),
+                            json!([{"function":{"name":"read_version","arguments":{"version":"original"}}},{"function":{"name":"read_version","arguments":{"version":"chuggin"}}}]),
+                        )
+                    };
+                }
+                ("Inspect the migrated project.".into(), json!([]))
+            });
+            let root = tempfile::tempdir().unwrap();
+            fixture(root.path(), &server.url, true);
+            let repo = root.path().join("repo");
+            git(&repo, &["restore", "value.txt"]);
+            let dir = root.path().join("state");
+            fs::create_dir_all(&dir).unwrap();
+            let legacy = dir.join("working");
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "legacy-menu",
+                    legacy.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            fs::write(legacy.join("value.txt"), "VISIBLE DEVELOPMENT").unwrap();
+            fs::write(dir.join("state.json"),json!({"schema_version":3,"run_id":"menu-migration","goal":"Improve value incrementally","repo":repo,"cycle":7,"working_ref":git(&repo,&["rev-parse","HEAD"]),"working_branch":"legacy-menu","working_workspace":legacy}).to_string()).unwrap();
+            if conflict {
+                fs::write(repo.join("value.txt"), "MY ORIGINAL EDIT").unwrap();
+                git(&repo, &["add", "value.txt"]);
+            }
+            let mut ui = TerminalProcess::start(root.path());
+            ui.wait("Resume project");
+            ui.send(b"\r");
+            ui.wait("Update project folder");
+            assert_eq!(
+                fs::read_to_string(repo.join("value.txt")).unwrap(),
+                if conflict { "MY ORIGINAL EDIT" } else { "0" }
+            );
+            assert!(server.requests.lock().unwrap().is_empty());
+            if conflict {
+                ui.wait("1 file needs review before continuing");
+                assert!(
+                    !ui.parser
+                        .screen()
+                        .contents()
+                        .contains("Move files and resume")
+                );
+                ui.send(b"\r");
+                ui.wait("Choose a file version");
+                ui.wait("Keep Chuggin's version (recommended)");
+                ui.send(b"\x1b[B\x1b[B\r");
+                ui.wait("Compare file versions");
+                ui.wait("MY ORIGINAL EDIT");
+                ui.wait("VISIBLE DEVELOPMENT");
+                ui.send(b"\r");
+                ui.wait("Choose a file version");
+                ui.send(b"\x1b[B\r");
+                if mode == 2 {
+                    ui.wait("AI review unavailable");
+                    assert_eq!(
+                        server.requests.lock().unwrap().len(),
+                        1,
+                        "Review must return a provider failure without indefinite retries"
+                    );
+                    ui.send(b"\r");
+                    ui.wait("Choose a file version");
+                } else {
+                    ui.wait("AI recommendation");
+                    ui.wait("Use AI recommendation");
+                }
+                assert_eq!(
+                    fs::read_to_string(repo.join("value.txt")).unwrap(),
+                    "MY ORIGINAL EDIT"
+                );
+                assert_eq!(state(root.path())["schema_version"], 3);
+                ui.send(b"\r");
+                ui.wait("Move files and resume");
+                assert_eq!(
+                    fs::read_to_string(repo.join("value.txt")).unwrap(),
+                    "MY ORIGINAL EDIT"
+                );
+                // Back is a real cancellation; choosing a preview never changes the project.
+                ui.send(b"\x1b");
+                ui.wait("Resume project");
+                assert_eq!(state(root.path())["schema_version"], 3);
+                ui.send(b"\r");
+                ui.wait("Move files and resume");
+            }
+            ui.send(b"\r");
+            if conflict {
+                ui.wait("Keep an old commit selection?");
+                ui.wait("does NOT delete");
+                ui.send(b"\r");
+            }
+            ui.wait_until("model sees migrated files", || {
+                server.requests.lock().unwrap().len()
+                    > match mode {
+                        0 => 0,
+                        1 => 2,
+                        _ => 1,
+                    }
+            });
+            ui.send(b"\x03");
+            ui.wait("Run saved");
+            assert_eq!(
+                fs::read_to_string(repo.join("value.txt")).unwrap(),
+                "VISIBLE DEVELOPMENT"
+            );
+            assert_eq!(
+                state(root.path())["working_workspace"],
+                repo.to_str().unwrap()
+            );
+            ui.send(b"4");
+            ui.wait("WORKING FOLDER");
+            ui.wait("Normal commit:");
+            ui.wait("Recovery save:");
+            ui.send(b"q");
+            ui.wait("Resume project");
+            ui.send(b"q");
+            ui.restored();
+        }
     }
 
     #[test]
