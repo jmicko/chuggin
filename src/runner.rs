@@ -2092,10 +2092,10 @@ fn review_migration_file(path: &Path, file: &str) -> Result<()> {
                         use crate::migration::Recommendation;
                         let choice = match advice.choice {
                             Recommendation::Chuggin => {
-                                Some((true, "Use AI recommendation — keep Chuggin's version"))
+                                Some((true, "Keep Chuggin's version (AI recommended)"))
                             }
                             Recommendation::Original => {
-                                Some((false, "Use AI recommendation — keep my original version"))
+                                Some((false, "Keep my original version (AI recommended)"))
                             }
                             Recommendation::CombineManually => None,
                         };
@@ -2147,7 +2147,10 @@ pub fn migration_ui(path: &Path) -> Result<bool> {
             if migration_choice(
                 "Continue project update",
                 "A previous move was interrupted. Continue to finish it using the saved recovery information. Your file choices have already been recorded.",
-                &["Continue interrupted move".into(), "Back".into()],
+                &[
+                    "Continue interrupted move (recommended)".into(),
+                    "Back".into(),
+                ],
             )? != Some(0)
             {
                 return Ok(false);
@@ -2165,9 +2168,9 @@ pub fn migration_ui(path: &Path) -> Result<bool> {
         }
         let details = crate::migration::describe(&plan)?;
         let primary = if conflicts.is_empty() {
-            "Move files and resume"
+            "Move files and resume (recommended)"
         } else {
-            "Review conflicting files"
+            "Review conflicting files (recommended)"
         };
         let choice = migration_choice(
             "Update project folder",
@@ -2201,7 +2204,7 @@ pub fn migration_ui(path: &Path) -> Result<bool> {
                         "Keep an old commit selection?",
                         "Your original folder has changes selected for a future Git commit. That selection is separate from the files themselves.\n\nUsually, you can clear this old selection and continue with the updated files. This does NOT delete file changes or undo your file choices. The old selection is backed up.\n\nKeep it only if you deliberately prepared a commit and still want that exact selection. It may conflict with newer work.",
                         &[
-                            "Continue with updated files — clear old selection".into(),
+                            "Use updated files; clear old selection (recommended)".into(),
                             "Keep my old commit selection (advanced)".into(),
                             "Back".into(),
                         ],

@@ -2255,7 +2255,7 @@ mod terminal_ui {
                     ui.wait("Choose a file version");
                 } else {
                     ui.wait("AI recommendation");
-                    ui.wait("Use AI recommendation");
+                    ui.wait("Keep Chuggin's version (AI recommended)");
                 }
                 assert_eq!(
                     fs::read_to_string(repo.join("value.txt")).unwrap(),
