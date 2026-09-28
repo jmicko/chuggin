@@ -199,6 +199,56 @@ fn task_tool(title: &str) -> Value {
 fn state(root: &Path) -> Value {
     serde_json::from_slice(&fs::read(root.join("state/state.json")).unwrap()).unwrap()
 }
+fn migrate_fixture(root: &Path) {
+    let out = command(root).arg("migrate").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: Value =
+        serde_json::from_slice(&fs::read(root.join("state/migration.json")).unwrap()).unwrap();
+    let prepared = Path::new(plan["prepared"].as_str().unwrap());
+    let conflicts = git(prepared, &["diff", "--name-only", "--diff-filter=U"]);
+    // These legacy fixtures specify the developing side as the resolution for
+    // overlapping files. Non-overlapping original edits are still merged.
+    for file in conflicts.lines() {
+        if !Command::new("git")
+            .arg("-C")
+            .arg(prepared)
+            .args([
+                "cat-file",
+                "-e",
+                &format!("{}:{}", plan["source_snapshot"].as_str().unwrap(), file),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+        {
+            git(prepared, &["rm", "-f", "--", file]);
+            continue;
+        }
+        git(
+            prepared,
+            &[
+                "restore",
+                "--source",
+                plan["source_snapshot"].as_str().unwrap(),
+                "--staged",
+                "--worktree",
+                "--",
+                file,
+            ],
+        );
+    }
+    let out = command(root).args(["migrate", "--apply"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
 fn run_cycles(root: &Path, cycles: u64) {
     let out = command(root)
         .args(["run", "--cycles", &cycles.to_string()])
@@ -291,7 +341,7 @@ fn missing_git_identity_blocks_before_model_requests() {
 }
 
 #[test]
-fn checkpoints_advance_in_one_workspace_and_keep_the_user_checkout_isolated() {
+fn recovery_saves_advance_with_visible_edits_without_unfinished_commits() {
     let server = Server::new(false, false);
     let root = tempfile::tempdir().unwrap();
     let config = fixture(root.path(), &server.url, true);
@@ -301,7 +351,7 @@ fn checkpoints_advance_in_one_workspace_and_keep_the_user_checkout_isolated() {
     let first = state(root.path());
     run_cycles(root.path(), 1);
     let second = state(root.path());
-    assert_eq!(second["schema_version"], 3);
+    assert_eq!(second["schema_version"], 4);
     assert_eq!(first["working_workspace"], second["working_workspace"]);
     assert_ne!(first["working_ref"], second["working_ref"]);
     assert_eq!(second["last_checks_passed_ref"], second["working_ref"]);
@@ -313,10 +363,7 @@ fn checkpoints_advance_in_one_workspace_and_keep_the_user_checkout_isolated() {
         "2"
     );
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), initial);
-    assert_eq!(
-        fs::read_to_string(repo.join("value.txt")).unwrap(),
-        "USER_EDIT"
-    );
+    assert_eq!(fs::read_to_string(repo.join("value.txt")).unwrap(), "2");
     assert_eq!(
         git(
             &repo,
@@ -474,9 +521,17 @@ fn unfinished_and_failed_attempts_preserve_deletions_renames_and_new_files() {
             fs::read_to_string(workspace.join("notes.txt")).unwrap(),
             "new notes"
         );
-        assert_eq!(git(workspace, &["status", "--porcelain"]), "");
+        assert!(!git(workspace, &["status", "--porcelain"]).is_empty());
         assert_eq!(
-            git(workspace, &["ls-tree", "-r", "--name-only", "HEAD"]),
+            git(
+                workspace,
+                &[
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    saved["working_ref"].as_str().unwrap()
+                ]
+            ),
             "notes.txt\nrenamed.txt"
         );
         assert!(
@@ -509,7 +564,13 @@ fn model_error_after_editing_still_checkpoints_completed_tool_changes() {
         "KEEP_AFTER_NETWORK_ERROR"
     );
     assert_eq!(
-        git(workspace, &["show", "HEAD:value.txt"]),
+        git(
+            workspace,
+            &[
+                "show",
+                &format!("{}:value.txt", saved["working_ref"].as_str().unwrap())
+            ]
+        ),
         "KEEP_AFTER_NETWORK_ERROR"
     );
     assert!(saved["current_task"].is_object());
@@ -609,9 +670,10 @@ fn legacy_migration_recovers_the_entire_interrupted_workspace_including_staged_c
     )
     .unwrap();
     fs::write(art.join("task.json"), json!({"title":"Continue interrupted reorganization","objective":"Retain unfinished work","acceptance":["Files reorganized"],"files":["value.txt","renamed.txt","staged.txt"],"out_of_scope":[]}).to_string()).unwrap();
+    migrate_fixture(root.path());
     run_cycles(root.path(), 1);
     let saved = state(root.path());
-    assert_eq!(saved["schema_version"], 3);
+    assert_eq!(saved["schema_version"], 4);
     assert_eq!(
         serde_json::from_slice::<Value>(&fs::read(state_dir.join("state-v1-backup.json")).unwrap())
             .unwrap(),
@@ -631,11 +693,8 @@ fn legacy_migration_recovers_the_entire_interrupted_workspace_including_staged_c
         fs::read_to_string(workspace.join("resumed.txt")).unwrap(),
         "resumed"
     );
-    assert_eq!(git(workspace, &["status", "--porcelain"]), "");
-    assert_eq!(
-        fs::read_to_string(repo.join("value.txt")).unwrap(),
-        "USER_EDIT"
-    );
+    assert!(!git(workspace, &["status", "--porcelain"]).is_empty());
+    assert!(!repo.join("value.txt").exists());
 }
 
 #[test]
@@ -698,11 +757,12 @@ fn legacy_migration_prefers_edited_work_over_a_newer_empty_attempt() {
         let edited_index = git(&edited, &["write-tree"]);
         let legacy = json!({"run_id":"legacy-empty-last","goal":"Improve value incrementally","repo":repo,"cycle":2,"accepted_ref":initial,"accepted_branch":"","accepted_workspace":baseline,"recent":[]});
         fs::write(state_dir.join("state.json"), legacy.to_string()).unwrap();
+        migrate_fixture(root.path());
         run_cycles(root.path(), 0);
         let saved = state(root.path());
         assert_eq!(
             saved["working_workspace"],
-            edited.to_str().unwrap(),
+            repo.to_str().unwrap(),
             "A newer empty workspace must not hide actual unfinished work"
         );
         assert_eq!(saved["current_task"]["title"], "Attempt 1");
@@ -726,7 +786,11 @@ fn legacy_migration_prefers_edited_work_over_a_newer_empty_attempt() {
         assert_eq!(git(&empty, &["status", "--porcelain"]), "");
         assert_eq!(
             fs::read_to_string(repo.join("value.txt")).unwrap(),
-            "USER_EDIT"
+            if only_untracked {
+                "USER_EDIT"
+            } else {
+                "STAGED_PROGRESS"
+            }
         );
         assert!(server.requests.lock().unwrap().is_empty());
     }
@@ -792,8 +856,8 @@ fn assert_imported_dirty_checkout(root: &Path, original: &(String, String, Strin
         "Preparing a workspace must not start a model cycle"
     );
     let workspace = Path::new(saved["working_workspace"].as_str().unwrap());
-    assert_ne!(workspace, repo);
-    assert!(workspace.starts_with(root.join("state")));
+    assert_eq!(workspace, repo);
+    assert!(!workspace.starts_with(root.join("state")));
     assert_eq!(
         fs::read_to_string(workspace.join("value.txt")).unwrap(),
         "USER_EDIT"
@@ -820,11 +884,17 @@ fn assert_imported_dirty_checkout(root: &Path, original: &(String, String, Strin
         fs::read(workspace.join("new.bin")).unwrap(),
         [0, 254, 252, 10]
     );
-    assert!(!workspace.join("ignored.txt").exists());
-    assert!(!workspace.join(".chuggin/runtime.txt").exists());
-    assert!(!workspace.join("chuggin.json").exists());
+    assert!(workspace.join("ignored.txt").exists());
+    assert!(workspace.join(".chuggin/runtime.txt").exists());
+    assert!(workspace.join("chuggin.json").exists());
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), original.0);
-    assert_eq!(git(&repo, &["status", "--porcelain"]), original.1);
+    let expected = original
+        .1
+        .lines()
+        .filter(|line| !line.ends_with(".chuggin/") && !line.ends_with("chuggin.json"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(git(&repo, &["status", "--porcelain"]), expected);
     assert_eq!(
         git(&repo, &["write-tree"]),
         original.2,
@@ -859,9 +929,10 @@ fn legacy_root_workspace_migrates_all_dirty_files_without_starting_a_cycle() {
     fs::create_dir_all(&state_dir).unwrap();
     let legacy = json!({"run_id":"legacy-root","goal":"Improve value incrementally","repo":root.path().join("repo"),"cycle":0,"accepted_ref":original.0,"accepted_branch":"","accepted_workspace":root.path().join("repo"),"recent":[]});
     fs::write(state_dir.join("state.json"), legacy.to_string()).unwrap();
+    migrate_fixture(root.path());
     run_cycles(root.path(), 0);
     assert_imported_dirty_checkout(root.path(), &original);
-    assert_eq!(state(root.path())["schema_version"], 3);
+    assert_eq!(state(root.path())["schema_version"], 4);
     assert_eq!(
         serde_json::from_slice::<Value>(&fs::read(state_dir.join("state-v1-backup.json")).unwrap())
             .unwrap(),
@@ -915,11 +986,15 @@ fn orphan_working_checkout_retains_its_actual_head_and_unfinished_files() {
     .unwrap();
     let orphan_status = git(&workspace, &["status", "--porcelain"]);
     let orphan_index = git(&workspace, &["write-tree"]);
+    migrate_fixture(root.path());
     run_cycles(root.path(), 0);
     let saved = state(root.path());
-    assert_eq!(saved["working_ref"], orphan_head);
-    assert_eq!(saved["working_workspace"], workspace.to_str().unwrap());
-    assert_eq!(saved["working_branch"], "codex/orphan-work");
+    assert_eq!(saved["branch_head"], orphan_head);
+    assert_eq!(saved["working_workspace"], repo.to_str().unwrap());
+    assert_eq!(
+        saved["working_branch"],
+        git(&repo, &["branch", "--show-current"])
+    );
     assert_eq!(saved["seed_from_repo"], false);
     assert_eq!(
         fs::read_to_string(workspace.join("value.txt")).unwrap(),
@@ -939,8 +1014,11 @@ fn orphan_working_checkout_retains_its_actual_head_and_unfinished_files() {
     );
     assert_eq!(git(&workspace, &["status", "--porcelain"]), orphan_status);
     assert_eq!(git(&workspace, &["write-tree"]), orphan_index);
-    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), original.0);
-    assert_eq!(git(&repo, &["status", "--porcelain"]), original.1);
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), orphan_head);
+    assert_eq!(
+        fs::read_to_string(repo.join("value.txt")).unwrap(),
+        "ORPHAN_UNFINISHED"
+    );
     assert!(server.requests.lock().unwrap().is_empty());
 }
 
@@ -967,6 +1045,7 @@ fn interrupted_initial_import_finishes_before_any_model_request() {
     // The initial import copied only part of one file before the process ended.
     fs::write(workspace.join("value.txt"), "PARTIAL_IMPORT").unwrap();
     fs::write(state_dir.join("state.json"), json!({"schema_version":2,"run_id":"interrupted-import","goal":"Improve value incrementally","repo":repo,"cycle":0,"working_ref":original.0,"working_branch":"codex/interrupted-import","working_workspace":workspace,"seed_from_repo":true,"recent":[]}).to_string()).unwrap();
+    migrate_fixture(root.path());
     run_cycles(root.path(), 0);
     assert_imported_dirty_checkout(root.path(), &original);
     assert_eq!(state(root.path())["seed_from_repo"], false);
@@ -1064,15 +1143,23 @@ fn dirty_persistent_workspace_survives_a_restart_without_resetting_to_checkpoint
         fs::read_to_string(workspace.join("uncommitted.txt")).unwrap(),
         "unfinished work from interrupted process"
     );
-    assert_eq!(git(workspace, &["status", "--porcelain"]), "");
+    assert!(!git(workspace, &["status", "--porcelain"]).is_empty());
     assert_eq!(
-        git(workspace, &["ls-tree", "-r", "--name-only", "HEAD"]),
+        git(
+            workspace,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                after["working_ref"].as_str().unwrap()
+            ]
+        ),
         "uncommitted.txt"
     );
 }
 
 #[test]
-fn explicit_checkpoint_restoration_preserves_the_abandoned_work_in_history() {
+fn legacy_model_restore_is_rejected_and_work_remains_recoverable() {
     let restore_ref = Arc::new(Mutex::new(String::new()));
     let target = restore_ref.clone();
     let mut edited = false;
@@ -1099,15 +1186,24 @@ fn explicit_checkpoint_restoration_preserves_the_abandoned_work_in_history() {
     let workspace = Path::new(saved["working_workspace"].as_str().unwrap());
     assert_eq!(
         fs::read_to_string(workspace.join("value.txt")).unwrap(),
-        "USEFUL_WORK"
-    );
-    assert_eq!(
-        git(workspace, &["show", "HEAD^:value.txt"]),
         "ABANDONED_APPROACH"
     );
-    let artifact = root.path().join("state/cycle-000002/restore-0-1.json");
-    let record: Value = serde_json::from_slice(&fs::read(artifact).unwrap()).unwrap();
-    assert!(record["reason"].as_str().unwrap().contains("incorrect"));
+    let record: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000002/tool-0-1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["ok"], false);
+    assert!(record["error"].as_str().unwrap().contains("user action"));
+    assert_eq!(
+        git(
+            workspace,
+            &[
+                "show",
+                &format!("{}:value.txt", restore_ref.lock().unwrap())
+            ]
+        ),
+        "USEFUL_WORK"
+    );
 }
 
 #[test]
@@ -1256,7 +1352,13 @@ fn conversation_preserves_long_tool_arguments_beyond_former_byte_limit() {
     assert_eq!(continuation["options"]["num_ctx"], 65536);
     let actual = git(
         Path::new(state["working_workspace"].as_str().unwrap()),
-        &["diff", "HEAD^", "HEAD", "--no-ext-diff", "--no-textconv"],
+        &[
+            "diff",
+            &format!("{}^", state["working_ref"].as_str().unwrap()),
+            state["working_ref"].as_str().unwrap(),
+            "--no-ext-diff",
+            "--no-textconv",
+        ],
     );
     assert!(actual.len() > 64000);
     assert!(actual.ends_with("+DIFF_END_MARKER"));
@@ -1346,7 +1448,7 @@ fn persistent_repetition_has_bounded_retries_and_records_failure() {
     assert_eq!(server.requests.lock().unwrap().len(), 9);
     let state: Value =
         serde_json::from_slice(&fs::read(root.path().join("state/state.json")).unwrap()).unwrap();
-    assert_eq!(state["recent"][0]["disposition"], "checkpoint");
+    assert_eq!(state["recent"][0]["disposition"], "unchanged");
     assert_eq!(
         fs::read_to_string(
             Path::new(state["working_workspace"].as_str().unwrap()).join("value.txt")
@@ -2060,6 +2162,63 @@ mod terminal_ui {
         ui.restored();
     }
     #[test]
+    fn migration_menu_previews_before_applying_and_resumes_in_the_visible_folder() {
+        let server = Server::custom(true, false, None, |_, _| {
+            ("Inspect the migrated project.".into(), json!([]))
+        });
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let repo = root.path().join("repo");
+        git(&repo, &["restore", "value.txt"]);
+        let dir = root.path().join("state");
+        fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("working");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "legacy-menu",
+                legacy.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        fs::write(legacy.join("value.txt"), "VISIBLE DEVELOPMENT").unwrap();
+        fs::write(dir.join("state.json"),json!({"schema_version":3,"run_id":"menu-migration","goal":"Improve value incrementally","repo":repo,"cycle":7,"working_ref":git(&repo,&["rev-parse","HEAD"]),"working_branch":"legacy-menu","working_workspace":legacy}).to_string()).unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"\r");
+        ui.wait("Visible project migration");
+        assert_eq!(fs::read_to_string(repo.join("value.txt")).unwrap(), "0");
+        assert!(server.requests.lock().unwrap().is_empty());
+        ui.send(b"\r");
+        ui.wait("Apply and preserve staging");
+        ui.send(b"\r");
+        ui.wait_until("model sees migrated files", || {
+            !server.requests.lock().unwrap().is_empty()
+        });
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        assert_eq!(
+            fs::read_to_string(repo.join("value.txt")).unwrap(),
+            "VISIBLE DEVELOPMENT"
+        );
+        assert_eq!(
+            state(root.path())["working_workspace"],
+            repo.to_str().unwrap()
+        );
+        ui.send(b"4");
+        ui.wait("WORKING FOLDER");
+        ui.wait("Normal commit:");
+        ui.wait("Recovery save:");
+        ui.send(b"q");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+    }
+
+    #[test]
     fn home_model_selection_updates_project_override_only() {
         let server = Server::new(false, false);
         let root = tempfile::tempdir().unwrap();
@@ -2335,7 +2494,7 @@ fn exercise_project_tools(failing: bool) {
     assert!(
         fs::read_to_string(repo.join("src/lib.rs"))
             .unwrap()
-            .contains("{ 1 }")
+            .contains("{ 2 }")
     );
     let artifact = root.path().join("state/cycle-000001");
     for name in [
@@ -2381,7 +2540,10 @@ fn provider_rate_limit_retries_identical_conversation_without_replaying_edits() 
     assert_eq!(
         git(
             Path::new(saved["working_workspace"].as_str().unwrap()),
-            &["show", "HEAD:value.txt"]
+            &[
+                "show",
+                &format!("{}:value.txt", saved["working_ref"].as_str().unwrap())
+            ]
         ),
         "KEPT"
     );
@@ -2420,7 +2582,10 @@ fn provider_credits_keep_waiting_until_operator_timer_and_checkpoint_edits() {
     assert_eq!(
         git(
             Path::new(saved["working_workspace"].as_str().unwrap()),
-            &["show", "HEAD:value.txt"]
+            &[
+                "show",
+                &format!("{}:value.txt", saved["working_ref"].as_str().unwrap())
+            ]
         ),
         "SAVED_BEFORE_QUOTA"
     );
@@ -2667,14 +2832,19 @@ fn task_completion_is_bound_to_current_task_in_multi_tool_replies() {
     fixture(root.path(), &server.url, true);
     run_cycles(root.path(), 1);
     let saved = state(root.path());
-    assert_eq!(server.requests.lock().unwrap().len(), 3);
-    assert_eq!(saved["completed_tasks"].as_array().unwrap().len(), 1);
-    assert_eq!(saved["completed_tasks"][0]["title"], "Replacement task");
-    let stale: Value = serde_json::from_slice(
-        &fs::read(root.path().join("state/cycle-000001/tool-1-0.json")).unwrap(),
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    assert_eq!(saved["completed_tasks"][0]["title"], "Old task");
+    let deferred: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000001/tool-0-2.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(stale["ok"], false);
+    assert_eq!(deferred["ok"], false);
+    assert!(
+        deferred["error"]
+            .as_str()
+            .unwrap()
+            .contains("awaiting validation")
+    );
 }
 
 #[test]
@@ -2729,15 +2899,45 @@ fn schema_two_upgrade_preserves_active_task_and_original_state() {
     let mut old = state(root.path());
     let before_ref = old["working_ref"].clone();
     let before_workspace = old["working_workspace"].clone();
+    let legacy_workspace = root.path().join("state/working");
+    git(
+        &root.path().join("repo"),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "legacy-test",
+            legacy_workspace.to_str().unwrap(),
+            old["working_ref"].as_str().unwrap(),
+        ],
+    );
+    old["working_workspace"] = json!(legacy_workspace);
+    old["working_branch"] = json!("legacy-test");
     old["schema_version"] = json!(2);
     old.as_object_mut().unwrap().remove("task_serial");
     old.as_object_mut().unwrap().remove("completed_tasks");
     let bytes = serde_json::to_vec(&old).unwrap();
     fs::write(root.path().join("state/state.json"), &bytes).unwrap();
+    migrate_fixture(root.path());
     run_cycles(root.path(), 1);
     let upgraded = state(root.path());
-    assert_eq!(upgraded["schema_version"], 3);
-    assert_eq!(upgraded["working_ref"], before_ref);
+    assert_eq!(upgraded["schema_version"], 4);
+    assert_eq!(
+        git(
+            &root.path().join("repo"),
+            &[
+                "rev-parse",
+                &format!("{}^{{tree}}", upgraded["working_ref"].as_str().unwrap())
+            ]
+        ),
+        git(
+            &root.path().join("repo"),
+            &[
+                "rev-parse",
+                &format!("{}^{{tree}}", before_ref.as_str().unwrap())
+            ]
+        )
+    );
     assert_eq!(upgraded["working_workspace"], before_workspace);
     assert_eq!(upgraded["completed_tasks"][0]["title"], "Existing research");
     assert_eq!(upgraded["completed_tasks"][0]["id"], 1);
@@ -3433,4 +3633,231 @@ fn command_finished_during_inference_does_not_block_the_next_edit() {
             .unwrap()
             .contains("\"running\":false")
     );
+}
+
+#[test]
+fn completed_tasks_commit_visible_files_and_human_staging_defers_only_the_commit() {
+    for staged in [false, true] {
+        let server = Server::custom(false, false, None, |_, _| {
+            (
+                String::new(),
+                json!([
+                    task_tool("Publish the research note"),
+                    {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"USEFUL RESULT"}}},
+                    {"function":{"name":"finish_task","arguments":{"summary":"Recorded and checked the research result."}}}
+                ]),
+            )
+        });
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let repo = root.path().join("repo");
+        if staged {
+            git(&repo, &["add", "value.txt"]);
+        }
+        let original = git(&repo, &["rev-parse", "HEAD"]);
+        let index = git(&repo, &["write-tree"]);
+        run_cycles(root.path(), 1);
+        let saved = state(root.path());
+        assert_eq!(saved["working_workspace"], repo.to_str().unwrap());
+        assert_eq!(saved["completed_tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(repo.join("value.txt")).unwrap(),
+            "USEFUL RESULT"
+        );
+        if staged {
+            assert_eq!(git(&repo, &["rev-parse", "HEAD"]), original);
+            assert_eq!(git(&repo, &["write-tree"]), index);
+            assert!(saved["commit_pending"].as_str().unwrap().contains("staged"));
+        } else {
+            assert_ne!(git(&repo, &["rev-parse", "HEAD"]), original);
+            assert_eq!(
+                git(&repo, &["log", "-1", "--format=%s"]),
+                "Publish the research note"
+            );
+            assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+        }
+        assert_eq!(
+            git(
+                &repo,
+                &[
+                    "show",
+                    &format!("{}:value.txt", saved["working_ref"].as_str().unwrap())
+                ]
+            ),
+            "USEFUL RESULT"
+        );
+    }
+}
+
+#[test]
+fn a_human_edit_during_inference_is_preserved_and_reported_for_rereading() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let edited = repo.clone();
+    let server = Server::custom(false, false, None, move |_, n| {
+        if n == 0 {
+            fs::write(edited.join("value.txt"), "HUMAN EDIT").unwrap();
+            (
+                String::new(),
+                json!([{ "function":{"name":"write_file","arguments":{"path":"value.txt","content":"STALE REPLACEMENT"}}}]),
+            )
+        } else {
+            (
+                "I will inspect the human edit before proposing changes.".into(),
+                json!([]),
+            )
+        }
+    });
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    assert_eq!(
+        fs::read_to_string(repo.join("value.txt")).unwrap(),
+        "HUMAN EDIT"
+    );
+    let result: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000001/tool-0-0.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["ok"], false);
+    assert!(result["error"].as_str().unwrap().contains("changed"));
+}
+
+#[test]
+fn migration_preview_preserves_inputs_and_can_resume_after_files_were_applied() {
+    let server = Server::new(false, false);
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    let repo = root.path().join("repo");
+    git(&repo, &["restore", "value.txt"]);
+    let dir = root.path().join("state");
+    fs::create_dir_all(&dir).unwrap();
+    let legacy = dir.join("working");
+    let initial = git(&repo, &["rev-parse", "HEAD"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "legacy",
+            legacy.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    fs::write(legacy.join("value.txt"), "DEVELOPING").unwrap();
+    fs::write(legacy.join("new.bin"), [0, 255, 128]).unwrap();
+    fs::write(repo.join("human-notes.txt"), "Keep my notes").unwrap();
+    git(&repo, &["add", "human-notes.txt"]);
+    let index = git(&repo, &["write-tree"]);
+    fs::write(dir.join("state.json"),json!({"schema_version":3,"run_id":"migration-resume","goal":"Improve value incrementally","repo":repo,"cycle":12,"working_ref":initial,"working_branch":"legacy","working_workspace":legacy}).to_string()).unwrap();
+    let before = git(&repo, &["status", "--porcelain"]);
+    let preview = command(root.path()).arg("migrate").output().unwrap();
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert_eq!(git(&repo, &["status", "--porcelain"]), before);
+    assert_eq!(git(&repo, &["write-tree"]), index);
+    assert_eq!(fs::read_to_string(repo.join("value.txt")).unwrap(), "0");
+    let run = command(root.path())
+        .args(["run", "--cycles", "1"])
+        .output()
+        .unwrap();
+    assert!(!run.status.success());
+    assert!(server.requests.lock().unwrap().is_empty());
+    let result = command(root.path())
+        .args(["migrate", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("value.txt")).unwrap(),
+        "DEVELOPING"
+    );
+    assert_eq!(fs::read(repo.join("new.bin")).unwrap(), [0, 255, 128]);
+    assert_eq!(git(&repo, &["show", ":human-notes.txt"]), "Keep my notes");
+    assert_eq!(
+        fs::read_to_string(legacy.join("value.txt")).unwrap(),
+        "DEVELOPING"
+    );
+    // Replay the journal boundary immediately before the final state/complete write.
+    let record = dir.join("migration.json");
+    let mut journal: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    journal["phase"] = json!("files-applied");
+    fs::write(&record, journal.to_string()).unwrap();
+    let result = command(root.path())
+        .args(["migrate", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(state(root.path())["schema_version"], 4);
+    assert_eq!(state(root.path())["cycle"], 12);
+    assert_eq!(git(&repo, &["write-tree"]), index);
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_normal_commit_repairs_its_index_without_replaying_the_commit() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::custom(false, false, None, |_, _| {
+        (
+            String::new(),
+            json!([
+                task_tool("Save the final note"),
+                {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"FINAL NOTE"}}},
+                {"function":{"name":"finish_task","arguments":{"summary":"Recorded the final note and verified it."}}}
+            ]),
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    let repo = root.path().join("repo");
+    let hook = repo.join(".git/hooks/post-commit");
+    fs::write(&hook, "#!/bin/sh\ntouch .git/hook-started\nsleep 30\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = command(root.path())
+        .args(["run", "--cycles", "1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !repo.join(".git/hook-started").exists()
+        && std::time::Instant::now() < deadline
+        && child.try_wait().unwrap().is_none()
+    {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let reached = repo.join(".git/hook-started").exists();
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    child.wait().unwrap();
+    assert!(reached, "Commit did not reach its post-commit hook");
+    let committed = git(&repo, &["rev-parse", "HEAD"]);
+    fs::remove_file(hook).unwrap();
+    run_cycles(root.path(), 0);
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), committed);
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+    assert_eq!(
+        fs::read_to_string(repo.join("value.txt")).unwrap(),
+        "FINAL NOTE"
+    );
+    assert!(!repo.join(".git/index.lock").exists());
+    assert!(!repo.join(".git/chuggin-promotion").exists());
 }

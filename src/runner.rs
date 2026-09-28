@@ -59,6 +59,9 @@ struct State {
     #[serde(alias = "accepted_workspace")]
     working_workspace: PathBuf,
     last_checks_passed_ref: Option<String>,
+    branch_head: String,
+    last_validated_tree: Option<String>,
+    commit_pending: Option<String>,
     current_task: Option<Task>,
     task_serial: u64,
     completed_tasks: Vec<CompletedTask>,
@@ -102,6 +105,8 @@ struct Conversation {
     context_pressure: bool,
     response_errors: u32,
     prompt_version: String,
+    observed_tree: String,
+    reread: std::collections::BTreeSet<String>,
     action_watch: crate::action_watch::ActionWatch,
     command_watch: crate::command_watch::CommandWatch,
     nudge_revision: Option<u64>,
@@ -228,6 +233,7 @@ pub fn load(path: &Path) -> Result<Config> {
     if c.repo.is_relative() {
         c.repo = parent.join(&c.repo);
     }
+    c.repo = fs::canonicalize(&c.repo).context("Project folder is unavailable")?;
     if c.state_dir.is_relative() {
         c.state_dir = parent.join(&c.state_dir);
     }
@@ -306,7 +312,7 @@ fn emit(art: &Path, stage: &str, value: &impl Serialize) -> Result<()> {
     save(&art.join(format!("{stage}.json")), value)
 }
 
-fn lock_project(c: &Config) -> Result<fs::File> {
+fn lock_project(c: &Config) -> Result<Vec<fs::File>> {
     fs::create_dir_all(&c.state_dir)?;
     let file = fs::OpenOptions::new()
         .write(true)
@@ -321,7 +327,20 @@ fn lock_project(c: &Config) -> Result<fs::File> {
             "Another Chuggin process is already running this project"
         );
     }
-    Ok(file)
+    let checkout_lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(crate::workspace::git_dir(&c.repo)?.join("chuggin-run.lock"))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        anyhow::ensure!(
+            unsafe { libc::flock(checkout_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            "Another Chuggin process owns this checkout"
+        );
+    }
+    Ok(vec![file, checkout_lock])
 }
 fn verify_workspace(c: &Config, workspace: &Path) -> Result<()> {
     anyhow::ensure!(
@@ -462,7 +481,7 @@ fn seed_working_files(c: &Config, workspace: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn prepare_state(c: &Config) -> Result<State> {
+fn prepare_legacy_state(c: &Config) -> Result<State> {
     let path = c.state_dir.join("state.json");
     if path.exists() {
         let bytes = fs::read(&path)?;
@@ -582,7 +601,7 @@ fn prepare_state(c: &Config) -> Result<State> {
             .context("Target needs an initial commit before creating its working branch")?;
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
-            .as_millis()
+            .as_nanos()
             .to_string();
         let (workspace, branch, seed) = create_workspace(c, &id, &head)?;
         let working_ref = project::git(&workspace, &["rev-parse", "HEAD"])?;
@@ -608,49 +627,67 @@ fn prepare_state(c: &Config) -> Result<State> {
 }
 
 const PROJECT_PATHS: &[&str] = &[".", ":(exclude).chuggin", ":(exclude)chuggin.json"];
-fn stage_project(workspace: &Path) -> Result<()> {
-    let mut args = vec!["add", "-A", "--"];
-    args.extend_from_slice(PROJECT_PATHS);
-    project::git(workspace, &args)?;
-    project::git(
-        workspace,
-        &["reset", "-q", "HEAD", "--", ".chuggin", "chuggin.json"],
-    )?;
-    Ok(())
-}
 fn checkpoint(c: &Config, s: &mut State, message: &str) -> Result<bool> {
-    stage_project(&s.working_workspace)?;
-    // A model may have staged a control file through a command; never checkpoint it.
-    project::git(
-        &s.working_workspace,
-        &["reset", "-q", "HEAD", "--", ".chuggin", "chuggin.json"],
-    )?;
-    let changed = !project::git(
-        &s.working_workspace,
-        &["diff", "--cached", "--name-only", "-z"],
-    )?
-    .is_empty();
-    if changed {
-        project::git(
-            &s.working_workspace,
-            &[
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                message,
-            ],
-        )?;
-    }
-    s.working_ref = project::git(&s.working_workspace, &["rev-parse", "HEAD"])?;
+    let (reference, changed) =
+        crate::workspace::autosave(&s.working_workspace, &c.state_dir, &s.run_id, message)?;
+    s.working_ref = reference;
+    s.branch_head = crate::workspace::head(&s.working_workspace);
     save(&c.state_dir.join("state.json"), s)?;
+    workspace_event(s);
     Ok(changed)
 }
-fn working_tree(workspace: &Path) -> Result<String> {
-    stage_project(workspace)?;
-    project::git(workspace, &["write-tree"])
+fn workspace_event(s: &State) {
+    crate::events::send(crate::events::Event::Workspace {
+        path: s.working_workspace.display().to_string(),
+        branch: s.working_branch.clone(),
+        head: s.branch_head.clone(),
+        recovery: s.working_ref.clone(),
+        pending: s.commit_pending.clone(),
+    });
+}
+fn working_tree(workspace: &Path, state: &Path) -> Result<String> {
+    crate::workspace::tree(workspace, Some(state))
+}
+fn prepare_state(c: &Config) -> Result<State> {
+    let path = c.state_dir.join("state.json");
+    let mut s = if path.exists() {
+        let s: State = serde_json::from_slice(&fs::read(&path)?)?;
+        anyhow::ensure!(
+            s.schema_version == 4,
+            "This project needs workspace migration. Open Chuggin and choose Resume for a preview, or run chuggin migrate."
+        );
+        anyhow::ensure!(
+            s.goal == c.goal && s.repo == fs::canonicalize(&c.repo)?,
+            "State belongs to a different goal or repository"
+        );
+        anyhow::ensure!(
+            fs::canonicalize(&s.working_workspace)? == fs::canonicalize(&c.repo)?,
+            "Visible workspace does not match project folder"
+        );
+        s
+    } else {
+        anyhow::ensure!(
+            !c.state_dir.join("working").exists(),
+            "An existing developing workspace needs migration. Open Chuggin for a preview."
+        );
+        State {
+            schema_version: 4,
+            run_id: SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_nanos()
+                .to_string(),
+            goal: c.goal.clone(),
+            repo: fs::canonicalize(&c.repo)?,
+            working_workspace: fs::canonicalize(&c.repo)?,
+            working_branch: crate::workspace::branch(&c.repo)?,
+            branch_head: crate::workspace::head(&c.repo),
+            ..State::default()
+        }
+    };
+    crate::workspace::check(&c.repo, &s.working_branch)?;
+    s.branch_head = crate::workspace::head(&c.repo);
+    checkpoint(c, &mut s, "chuggin: recovery before starting")?;
+    Ok(s)
 }
 fn save_conversation(c: &Config, session: &Conversation) -> Result<()> {
     save(&c.state_dir.join("conversation.json"), session)
@@ -819,7 +856,7 @@ fn recover_commands(
     if !session.command_watch.pending_diagnosis {
         return Ok(());
     }
-    let current = working_tree(&s.working_workspace).ok();
+    let current = working_tree(&s.working_workspace, &c.state_dir).ok();
     let observed = session
         .command_watch
         .recent
@@ -934,7 +971,12 @@ fn work(
     for step in 0..c.implementation_calls {
         m.pause_point();
         anyhow::ensure!(!stop.load(Ordering::SeqCst), "Stopped by operator");
-        for update in jobs.monitor(c, s.current_task.as_ref(), m, stop)? {
+        crate::workspace::check(&s.working_workspace, &s.working_branch)?;
+        let command_updates = jobs.monitor(c, s.current_task.as_ref(), m, stop)?;
+        if !command_updates.is_empty() {
+            session.observed_tree = working_tree(&s.working_workspace, &c.state_dir)?;
+        }
+        for update in command_updates {
             session.messages.push(
                 json!({"role":"user","content":json!({"command_update":update}).to_string()}),
             );
@@ -986,6 +1028,24 @@ fn work(
                 .push(crate::model::goal_completion_tool());
         }
         crate::events::send(crate::events::Event::Phase("Work".into()));
+        let proposal_has_commands = jobs.running();
+        let proposal_tree = working_tree(&s.working_workspace, &c.state_dir)?;
+        if !session.observed_tree.is_empty()
+            && session.observed_tree != proposal_tree
+            && !proposal_has_commands
+        {
+            session.reread.extend(
+                crate::workspace::changed_paths(
+                    &s.working_workspace,
+                    &c.state_dir,
+                    &session.observed_tree,
+                    &proposal_tree,
+                )
+                .unwrap_or_default(),
+            );
+            session.messages.push(json!({"role":"user","content":"The visible project changed outside your last recorded actions. Inspect the current files before editing; human work and commits must be preserved."}));
+        }
+        session.observed_tree = proposal_tree.clone();
         let response = match m.chat(&session.messages, Some(session.tools.clone()), false) {
             Ok(response) => response,
             Err(error) => {
@@ -1041,9 +1101,31 @@ fn work(
             break;
         }
         let mut completed_commands = Vec::new();
+        let mut observed_tree = working_tree(&s.working_workspace, &c.state_dir)?;
+        let mut stale_response = proposal_tree != observed_tree && !proposal_has_commands;
+        if stale_response {
+            session.reread.extend(crate::workspace::changed_paths(
+                &s.working_workspace,
+                &c.state_dir,
+                &proposal_tree,
+                &observed_tree,
+            )?);
+        }
         for (index, call) in calls.iter().enumerate() {
             m.pause_point();
+            crate::workspace::check(&s.working_workspace, &s.working_branch)?;
+            let had_running_commands = jobs.running();
             completed_commands.extend(jobs.refresh_finished(stop)?);
+            let now_tree = working_tree(&s.working_workspace, &c.state_dir)?;
+            if now_tree != observed_tree && !had_running_commands {
+                session.reread.extend(crate::workspace::changed_paths(
+                    &s.working_workspace,
+                    &c.state_dir,
+                    &observed_tree,
+                    &now_tree,
+                )?);
+                stale_response = true;
+            }
             let name = call["function"]["name"].as_str().unwrap_or("");
             let args = &call["function"]["arguments"];
             crate::events::send(crate::events::Event::Tool(format!(
@@ -1053,7 +1135,7 @@ fn work(
             let root = s.working_workspace.clone();
             let command = matches!(name, "run_command" | "run_checks" | "compiler_diagnostics");
             let before_command = if command && !jobs.running() {
-                working_tree(&root).ok()
+                working_tree(&root, &c.state_dir).ok()
             } else {
                 None
             };
@@ -1063,6 +1145,44 @@ fn work(
                     project_completion.is_none(),
                     "Goal completion already reported; remaining actions were not executed"
                 );
+                if matches!(name, "write_file" | "edit_file")
+                    && session.reread.contains(args["path"].as_str().unwrap_or(""))
+                {
+                    anyhow::bail!(
+                        "This file changed outside your recorded actions. Use read_file on its current version before editing it."
+                    );
+                }
+                if finish_requested.is_some()
+                    && matches!(
+                        name,
+                        "set_task"
+                            | "edit_file"
+                            | "write_file"
+                            | "run_command"
+                            | "run_checks"
+                            | "compiler_diagnostics"
+                    )
+                {
+                    anyhow::bail!(
+                        "Task completion is awaiting validation and saving. This later action was not executed; continue it after the task boundary."
+                    );
+                }
+                if stale_response
+                    && matches!(
+                        name,
+                        "write_file"
+                            | "edit_file"
+                            | "run_command"
+                            | "run_checks"
+                            | "compiler_diagnostics"
+                            | "finish_task"
+                            | "finish_project"
+                    )
+                {
+                    anyhow::bail!(
+                        "Project files changed while this response was pending. These actions were not executed. Re-read the current files before proposing edits or completion."
+                    );
+                }
                 if jobs.running()
                     && matches!(
                         name,
@@ -1277,37 +1397,9 @@ fn work(
                             .to_string())
                     }
                     "read_command_log" => Ok(crate::dev_tools::read_log(art, args)?.to_string()),
-                    "restore_checkpoint" => {
-                        let reference = args["commit"].as_str().context("Missing commit")?;
-                        let reason = args["reason"]
-                            .as_str()
-                            .context("Explain why this checkpoint should be restored")?;
-                        anyhow::ensure!(
-                            !reason.trim().is_empty()
-                                && reference.len() >= 7
-                                && reference.len() <= 64
-                                && reference.bytes().all(|b| b.is_ascii_hexdigit()),
-                            "Provide a commit hash and a reason"
-                        );
-                        project::git(&root, &["merge-base", "--is-ancestor", reference, "HEAD"])?;
-                        checkpoint(c, s, "chuggin: save work before requested restoration")?;
-                        emit(
-                            art,
-                            &format!("restore-{step}-{index}"),
-                            &json!({"from":s.working_ref,"to":reference,"reason":reason}),
-                        )?;
-                        let mut command = vec![
-                            "restore",
-                            "--source",
-                            reference,
-                            "--staged",
-                            "--worktree",
-                            "--",
-                        ];
-                        command.extend_from_slice(PROJECT_PATHS);
-                        project::git(&root, &command)?;
-                        Ok("Restored the requested checkpoint. Prior work is saved in Git. Inspect the files and run checks again.".into())
-                    }
+                    "restore_checkpoint" => anyhow::bail!(
+                        "Whole-project restoration is a user action in Progress → Recovery. Use targeted edits to repair the current files; do not reset Git."
+                    ),
                     _ => inspect_tool(&root, name, args, &mut research),
                 }
             })();
@@ -1340,7 +1432,7 @@ fn work(
             if command && value["result"]["running"] == true {
                 session.command_watch.reset_streak();
             } else if command {
-                let after_command = working_tree(&root).ok();
+                let after_command = working_tree(&root, &c.state_dir).ok();
                 let observed_args = if name == "run_checks" {
                     json!({"checks":c.checks})
                 } else {
@@ -1368,6 +1460,15 @@ fn work(
             {
                 session.command_watch.reset_streak();
             }
+            if name == "read_file"
+                && (value["ok"] == true
+                    || project::safe_path(&root, args["path"].as_str().unwrap_or(""))
+                        .is_ok_and(|p| p.try_exists().ok() == Some(false)))
+            {
+                session.reread.remove(args["path"].as_str().unwrap_or(""));
+            }
+            observed_tree = working_tree(&s.working_workspace, &c.state_dir)?;
+            session.observed_tree = observed_tree.clone();
             session.command_watch.record_activity(name, args, &value);
             session
                 .note
@@ -1418,6 +1519,7 @@ fn work(
             json!({"role":"user","content":json!({"command_final_result":update}).to_string()}),
         );
     }
+    session.observed_tree = working_tree(&s.working_workspace, &c.state_dir)?;
     save_conversation(c, session)?;
     Ok(WorkResult {
         finish_requested,
@@ -1455,7 +1557,9 @@ pub fn run_controlled(
     let c = load(path)?;
     crate::setup::ensure_git_identity(&c.repo)?;
     let _lock = lock_project(&c)?;
+    crate::workspace::recover_promotion(&c.repo)?;
     let mut state = prepare_state(&c)?;
+    crate::workspace::ignore_runtime(&c.repo, &c.state_dir)?;
     if c.allow_goal_completion && c.state_dir.join("goal-completion.json").exists() {
         crate::events::log(
             "Model reports project complete. Explicitly resume to reopen work.".into(),
@@ -1466,6 +1570,13 @@ pub fn run_controlled(
         fs::remove_file(c.state_dir.join("goal-completion.json"))?;
     }
     let mut session = load_conversation(&c, &state)?;
+    session.messages.push(json!({"role":"user","content":format!("Current visible project folder: {}. Branch: {}. HEAD: {}. Work directly here. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work; completed tasks may create normal commits.",state.working_workspace.display(),state.working_branch,state.branch_head)}));
+    save_conversation(&c, &session)?;
+    crate::events::log(format!(
+        "Working directly in {} on {}",
+        state.working_workspace.display(),
+        state.working_branch
+    ));
     let started = Instant::now();
     let time_up = || {
         let limit = fs::read(path)
@@ -1494,6 +1605,7 @@ pub fn run_controlled(
         if stop.load(Ordering::SeqCst) || time_up() {
             break;
         }
+        crate::workspace::check(&state.working_workspace, &state.working_branch)?;
         state.cycle += 1;
         while c
             .state_dir
@@ -1548,7 +1660,8 @@ pub fn run_controlled(
         }
         model.pause_point();
         crate::events::send(crate::events::Event::Phase("Check".into()));
-        let before_check = working_tree(&state.working_workspace)?;
+        crate::workspace::check(&state.working_workspace, &state.working_branch)?;
+        let before_check = working_tree(&state.working_workspace, &c.state_dir)?;
         let validation = (|| -> Result<Vec<CheckResult>> {
             if c.checks.is_empty() {
                 return Ok(Vec::new());
@@ -1572,13 +1685,15 @@ pub fn run_controlled(
             )?;
             job.wait(&c, state.current_task.as_ref(), &model, &stage_stop)
         })();
-        let after_check = working_tree(&state.working_workspace)?;
+        let after_check = working_tree(&state.working_workspace, &c.state_dir)?;
         let check_error = validation.as_ref().err().map(|e| format!("{e:#}"));
         let results = validation.unwrap_or_default();
         emit(&art, "verification", &results)?;
-        let checked_same_files = before_check == after_check;
-        let passed = !results.is_empty() && results.iter().all(|r| r.passed) && checked_same_files;
         model.pause_point();
+        let saved_candidate = working_tree(&state.working_workspace, &c.state_dir)?;
+        let mut checked_same_files = before_check == after_check && after_check == saved_candidate;
+        let mut passed =
+            !results.is_empty() && results.iter().all(|r| r.passed) && checked_same_files;
         crate::events::send(crate::events::Event::Phase("Review".into()));
         let task_title = state
             .current_task
@@ -1591,7 +1706,7 @@ pub fn run_controlled(
             .map(|r| r.summary.as_str())
             .unwrap_or("Model request interrupted");
         let unfinished=results.iter().filter(|r|!r.passed).map(|r|json!({"argv":r.argv,"exit_code":r.exit_code,"timed_out":r.timed_out,"output":r.output})).collect::<Vec<_>>();
-        let feedback = json!({"summary":summary,"checks_passed":passed,"check_results":unfinished,"check_error":check_error,"checked_snapshot_unchanged":checked_same_files,"request_error":error,"instruction":crate::prompts::REVIEW});
+        let mut feedback = json!({"summary":summary,"checks_passed":passed,"check_results":unfinished,"check_error":check_error,"checked_snapshot_unchanged":checked_same_files,"request_error":error,"instruction":crate::prompts::REVIEW});
         state.feedback = feedback.to_string();
         // Save the complete working tree even if requests or checks failed.
         crate::events::send(crate::events::Event::Phase("Checkpoint".into()));
@@ -1600,9 +1715,11 @@ pub fn run_controlled(
             state.cycle,
             project::excerpt(&task_title, 100)
         );
-        let changed = checkpoint(&c, &mut state, &message)?;
+        crate::workspace::check(&state.working_workspace, &state.working_branch)?;
+        let mut changed = checkpoint(&c, &mut state, &message)?;
         if passed {
             state.last_checks_passed_ref = Some(state.working_ref.clone());
+            state.last_validated_tree = Some(after_check.clone());
         }
         crate::events::send(crate::events::Event::ValidationDone {
             passed,
@@ -1613,6 +1730,52 @@ pub fn run_controlled(
             .is_ok_and(|r| r.finish_requested == Some(state.task_serial))
             && state.current_task.is_some()
             && passed;
+        if finished {
+            match crate::workspace::promote(
+                &state.working_workspace,
+                &c.state_dir,
+                &state.branch_head,
+                &after_check,
+                &format!("{}\n\n{}", task_title, project::excerpt(summary, 4000)),
+            ) {
+                Ok(head) => {
+                    let created = head != state.branch_head;
+                    state.branch_head = head;
+                    state.commit_pending = None;
+                    crate::events::log(if created {
+                        format!("Committed: {task_title}")
+                    } else {
+                        "Task complete; no new project commit needed.".into()
+                    });
+                }
+                Err(error) => {
+                    state.commit_pending = Some(format!("{error:#}"));
+                    crate::events::log(format!("Autosaved; normal commit deferred: {error:#}"));
+                }
+            }
+        }
+        state.branch_head = crate::workspace::head(&state.working_workspace);
+        let saved_tree = working_tree(&state.working_workspace, &c.state_dir)?;
+        if saved_tree != after_check {
+            passed = false;
+            checked_same_files = false;
+            state.last_validated_tree = None;
+            feedback["checks_passed"] = json!(false);
+            feedback["post_commit_changes"] = json!(
+                "Files changed during commit hooks; inspect and run checks again before completing the task."
+            );
+            state.feedback = feedback.to_string();
+            changed |= checkpoint(
+                &c,
+                &mut state,
+                "chuggin: recovery after commit hook changes",
+            )?;
+            crate::events::send(crate::events::Event::ValidationDone {
+                passed: false,
+                checkpoint: None,
+            });
+        }
+        let finished = finished && passed;
         if finished {
             let task = state
                 .current_task
@@ -1628,6 +1791,7 @@ pub fn run_controlled(
                 state.completed_tasks.remove(0);
             }
         }
+        workspace_event(&state);
         let disposition = if !changed {
             "unchanged"
         } else if passed {
@@ -1656,7 +1820,7 @@ pub fn run_controlled(
         emit(
             &art,
             "checkpoint",
-            &json!({"commit":state.working_ref,"changed":changed,"checks_passed":passed,"checked_tree":before_check,"saved_tree":after_check,"task_complete":finished,"completed_task":if finished {state.completed_tasks.last()} else {None},"action_recovery_interventions":session.action_watch.interventions,"command_diagnostics":session.command_watch.diagnoses,"last_checks_passed_ref":state.last_checks_passed_ref}),
+            &json!({"commit":state.working_ref,"changed":changed,"checks_passed":passed,"checked_tree":before_check,"saved_tree":saved_tree,"task_complete":finished,"completed_task":if finished {state.completed_tasks.last()} else {None},"action_recovery_interventions":session.action_watch.interventions,"command_diagnostics":session.command_watch.diagnoses,"last_checks_passed_ref":state.last_checks_passed_ref}),
         )?;
         session.messages.push(json!({"role":"user","content":json!({"checkpoint":state.working_ref,"task_complete":finished,"feedback":feedback,"instruction":"This checkpoint is saved, including unfinished changes. Continue from these files. If checks failed, inspect and repair the actual failure; do not recreate the feature from scratch. If the task is complete, select the next useful improvement toward the main goal."}).to_string()}));
         save_conversation(&c, &session)?;
@@ -1804,4 +1968,211 @@ mod stall_replay_tests {
             "The model did not recognize the recorded command loop"
         );
     }
+}
+
+pub fn needs_migration(path: &Path) -> Result<bool> {
+    let c = load(path)?;
+    if !c.state_dir.join("state.json").exists() {
+        return Ok(c.state_dir.join("working").exists());
+    }
+    Ok(fs::read(c.state_dir.join("state.json"))
+        .ok()
+        .map(|b| serde_json::from_slice::<State>(&b))
+        .transpose()?
+        .is_some_and(|s| s.schema_version < 4))
+}
+pub fn migration_preview(path: &Path) -> Result<String> {
+    let c = load(path)?;
+    let _lock = lock_project(&c)?;
+    crate::setup::ensure_git_identity(&c.repo)?;
+    anyhow::ensure!(
+        needs_migration(path)?,
+        "Project already uses its visible folder"
+    );
+    if c.state_dir.join("migration.json").exists() {
+        return crate::migration::describe(&crate::migration::load(&c.state_dir)?);
+    }
+    let s = prepare_legacy_state(&c)?;
+    // Validate the legacy source before granting migration access to it.
+    verify_workspace(&c, &s.working_workspace)?;
+    let plan = crate::migration::prepare(&c.repo, &s.working_workspace, &c.state_dir)?;
+    if !c.state_dir.join("migration/config-before.json").exists() {
+        fs::copy(path, c.state_dir.join("migration/config-before.json"))?;
+    }
+    crate::migration::describe(&plan)
+}
+pub fn migration_apply(path: &Path, clear_staging: bool) -> Result<()> {
+    let c = load(path)?;
+    let _lock = lock_project(&c)?;
+    let mut s: State = serde_json::from_slice(&fs::read(c.state_dir.join("state.json"))?)?;
+    let preview = crate::migration::load(&c.state_dir)?;
+    anyhow::ensure!(
+        fs::canonicalize(&preview.root)? == fs::canonicalize(&c.repo)?,
+        "Migration belongs to another checkout"
+    );
+    verify_workspace(&c, &preview.source)?;
+    let plan = crate::migration::apply(&c.state_dir, clear_staging)?;
+    s.schema_version = 4;
+    s.repo = fs::canonicalize(&c.repo)?;
+    s.working_workspace = s.repo.clone();
+    s.working_branch = crate::workspace::branch(&c.repo)?;
+    s.branch_head = crate::workspace::head(&c.repo);
+    s.seed_from_repo = false;
+    checkpoint(
+        &c,
+        &mut s,
+        "chuggin: recovery after visible workspace migration",
+    )?;
+    crate::migration::complete(&c.state_dir, plan)?;
+    crate::events::log(format!(
+        "Developing work is now visible in {}. Original workspace and migration backups retained.",
+        c.repo.display()
+    ));
+    Ok(())
+}
+pub fn migration_ui(path: &Path) -> Result<bool> {
+    if !needs_migration(path)? {
+        return Ok(true);
+    }
+    let preview = migration_preview(path)?;
+    crate::ui::show("Visible project migration", &preview)?;
+    let choice = crate::menu::select(
+        "Apply prepared project",
+        &[
+            "Apply and preserve staging".into(),
+            "Apply and clear old staging (backup retained)".into(),
+            "Back — inspect or resolve prepared files first".into(),
+            "Refresh preview (archive the prepared result)".into(),
+        ],
+        0,
+    )?;
+    match choice {
+        Some(0) => migration_apply(path, false)?,
+        Some(1) => migration_apply(path, true)?,
+        Some(3) => {
+            let c = load(path)?;
+            {
+                let _lock = lock_project(&c)?;
+                crate::migration::refresh(&c.state_dir)?;
+            }
+            return migration_ui(path);
+        }
+        _ => return Ok(false),
+    };
+    Ok(true)
+}
+pub fn recovery_ui(path: &Path) -> Result<()> {
+    let c = load(path)?;
+    let choice = crate::menu::select(
+        "Project history",
+        &[
+            "View progress".into(),
+            "Browse recovery saves / restore files".into(),
+            "Commit current changes".into(),
+            "Use current branch".into(),
+        ],
+        0,
+    )?;
+    if choice == Some(0) {
+        let text = fs::read_to_string(c.state_dir.join("state.json"))
+            .unwrap_or_else(|_| "No run started".into());
+        crate::ui::show("Saved progress", &crate::menu::progress_text(&text))?;
+        return Ok(());
+    }
+    let _lock = lock_project(&c)?;
+    let mut s: State = serde_json::from_slice(&fs::read(c.state_dir.join("state.json"))?)?;
+    anyhow::ensure!(
+        s.schema_version == 4,
+        "Resume and migrate this project first"
+    );
+    match choice {
+        Some(1) => {
+            let log = project::git(&c.repo, &["log", "-50", "--format=%h %s", &s.working_ref])?;
+            let items: Vec<String> = log.lines().map(str::to_owned).collect();
+            if let Some(index) =
+                crate::menu::select("Recovery history — choose a revision to preview", &items, 0)?
+            {
+                let target = items[index]
+                    .split_whitespace()
+                    .next()
+                    .context("Missing revision")?;
+                let before = working_tree(&c.repo, &c.state_dir)?;
+                let diff = project::git(
+                    &c.repo,
+                    &[
+                        "diff",
+                        "--stat",
+                        &before,
+                        target,
+                        "--",
+                        ".",
+                        ":(exclude).chuggin",
+                        ":(exclude)chuggin.json",
+                    ],
+                )?;
+                crate::ui::show(
+                    "Restore preview",
+                    &format!(
+                        "Restore project files from {}\n\n{}\n\nCurrent work will be autosaved first. History is retained.",
+                        items[index], diff
+                    ),
+                )?;
+                if crate::menu::select(
+                    "Restore these files?",
+                    &["Back".into(), "Restore files".into()],
+                    0,
+                )? == Some(1)
+                {
+                    crate::workspace::check(&c.repo, &s.working_branch)?;
+                    checkpoint(&c, &mut s, "chuggin: recovery before user restore")?;
+                    crate::migration::restore_files(&c.repo, &c.state_dir, target)?;
+                    checkpoint(&c, &mut s, "chuggin: user restored project files")?;
+                    s.last_validated_tree = None;
+                    save(&c.state_dir.join("state.json"), &s)?;
+                }
+            }
+        }
+        Some(2) => {
+            crate::workspace::check(&c.repo, &s.working_branch)?;
+            if crate::menu::select(
+                "Commit all current project files, including staged and unstaged changes?",
+                &["Back".into(), "Commit current files".into()],
+                0,
+            )? != Some(1)
+            {
+                return Ok(());
+            }
+            let message = crate::setup::ask("Commit description", "Save project progress")?;
+            checkpoint(&c, &mut s, "chuggin: recovery before user commit")?;
+            let tree = working_tree(&c.repo, &c.state_dir)?;
+            s.branch_head = crate::workspace::commit_current(
+                &c.repo,
+                &c.state_dir,
+                &s.branch_head,
+                &tree,
+                &message,
+            )?;
+            s.commit_pending = None;
+            save(&c.state_dir.join("state.json"), &s)?;
+        }
+        Some(3) => {
+            let branch = crate::workspace::branch(&c.repo)?;
+            crate::workspace::check(&c.repo, &branch)?;
+            if crate::menu::select(
+                &format!("Continue this goal on {branch}?"),
+                &[
+                    "Back".into(),
+                    "Use this branch and its current files".into(),
+                ],
+                0,
+            )? == Some(1)
+            {
+                s.working_branch = branch;
+                s.last_validated_tree = None;
+                checkpoint(&c, &mut s, "chuggin: recovery after user branch change")?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }

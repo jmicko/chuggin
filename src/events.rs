@@ -8,6 +8,13 @@ use std::sync::{
 
 #[derive(Clone, Debug)]
 pub enum Event {
+    Workspace {
+        path: String,
+        branch: String,
+        head: String,
+        recovery: String,
+        pending: Option<String>,
+    },
     Log(String),
     Phase(String),
     Cycle(u64),

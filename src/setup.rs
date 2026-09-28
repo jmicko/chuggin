@@ -441,7 +441,7 @@ pub fn wizard() -> Result<PathBuf> {
     // Check merged project/global settings before starting.
     runner::load(&config)?;
     crate::ui::notice(
-        "\nGoal accepted and saved. Select Resume project from the home menu to start.".to_string(),
+        "\nGoal accepted and saved. Chuggin will edit this folder on its current branch, keep recovery saves, and commit completed tasks. Existing staged changes are preserved. Select Resume project to start.".to_string(),
     );
     Ok(config)
 }

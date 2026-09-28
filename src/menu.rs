@@ -30,7 +30,7 @@ pub fn pause() -> Result<()> {
     io::stdin().read_line(&mut line)?;
     Ok(())
 }
-fn progress_text(progress: &str) -> String {
+pub(crate) fn progress_text(progress: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(progress) else {
         return progress.into();
     };
@@ -46,10 +46,23 @@ fn progress_text(progress: &str) -> String {
         .as_str()
         .filter(|reference| !reference.is_empty())
         .unwrap_or("None recorded");
+    let workspace_label = if v["schema_version"].as_u64().unwrap_or(0) < 4 {
+        "Developing folder (legacy)"
+    } else {
+        "Visible project"
+    };
     let mut text = format!(
-        "Cycle {}\nWorking branch: {branch}\nWorkspace: {workspace}\nLast checkpoint with passing checks: {passing}\n\nCheckpoints save unfinished work too. Check results and review findings guide the next cycle.\n\nRecent cycles\n",
+        "Cycle {}\nBranch: {branch}\n{workspace_label}: {workspace}\nLast recovery snapshot with passing checks: {passing}\n\nCheckpoints save unfinished work too. Check results and review findings guide the next cycle.\n\nRecent cycles\n",
         v["cycle"]
     );
+    text.push_str(&format!(
+        "\nNormal branch commit: {}\nLatest recovery save: {}\n",
+        v["branch_head"].as_str().unwrap_or("legacy"),
+        v["working_ref"].as_str().unwrap_or("—")
+    ));
+    if let Some(reason) = v["commit_pending"].as_str() {
+        text.push_str(&format!("Commit deferred: {reason}\n"));
+    }
     if let Some(items) = v["recent"].as_array() {
         for outcome in items.iter().rev() {
             text.push_str(&format!(
@@ -85,8 +98,13 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             "Run duration".into(),
             "Quit".into(),
         ];
-        let root = std::env::current_dir()?.display().to_string();
         let effective = project.as_ref().and_then(|p| runner::load(p).ok());
+        let root = effective
+            .as_ref()
+            .map(|c| c.repo.clone())
+            .unwrap_or(std::env::current_dir()?)
+            .display()
+            .to_string();
         let model = effective
             .as_ref()
             .map(|c| c.model.as_str())
@@ -117,6 +135,9 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             match choice {
                 0 => {
                     if let Some(path) = project.as_ref() {
+                        if !runner::migration_ui(path)? {
+                            return Ok(());
+                        }
                         stop.store(false, Ordering::SeqCst);
                         running.store(true, Ordering::SeqCst);
                         let result = crate::ui::dashboard(path, stop.clone(), running.clone());
@@ -138,11 +159,7 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                 }
                 2 => {
                     if let Some(path) = project.as_ref() {
-                        let c = runner::load(path)?;
-                        let progress = std::fs::read_to_string(c.state_dir.join("state.json"))
-                            .unwrap_or("This project has not started yet.".into());
-                        let text = progress_text(&progress);
-                        crate::ui::show("Saved progress", &text)?;
+                        runner::recovery_ui(path)?;
                     } else {
                         crate::ui::show("Saved progress", "This project has not started yet.")?;
                     }
@@ -179,8 +196,8 @@ mod tests {
         let text = progress_text(
             r#"{"cycle":5,"working_branch":"codex/working","working_workspace":"/project/workspace","last_checks_passed_ref":"abc123","recent":[{"cycle":5,"disposition":"checkpoint/checks-failing","task":"Repair the parser"}]}"#,
         );
-        assert!(text.contains("Working branch: codex/working"));
-        assert!(text.contains("Last checkpoint with passing checks: abc123"));
+        assert!(text.contains("Branch: codex/working"));
+        assert!(text.contains("Last recovery snapshot with passing checks: abc123"));
         assert!(text.contains("Saved · checks failing"));
         assert!(text.contains("Checkpoints save unfinished work too."));
     }
@@ -190,8 +207,8 @@ mod tests {
         let text = progress_text(
             r#"{"cycle":2,"accepted_branch":"codex/old","accepted_workspace":"/old/workspace"}"#,
         );
-        assert!(text.contains("Working branch: codex/old"));
-        assert!(text.contains("Workspace: /old/workspace"));
-        assert!(text.contains("Last checkpoint with passing checks: None recorded"));
+        assert!(text.contains("Branch: codex/old"));
+        assert!(text.contains("Developing folder (legacy): /old/workspace"));
+        assert!(text.contains("Last recovery snapshot with passing checks: None recorded"));
     }
 }

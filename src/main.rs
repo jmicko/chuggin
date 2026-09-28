@@ -7,6 +7,7 @@ mod command_watch;
 mod dev_tools;
 mod events;
 mod menu;
+mod migration;
 mod model;
 mod nudge;
 mod project;
@@ -20,6 +21,7 @@ mod stall_diagnostic;
 mod symbols;
 mod ui;
 mod web_tools;
+mod workspace;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -67,6 +69,15 @@ enum Command {
         #[arg(long)]
         forever: bool,
     },
+    /// Preview or apply a legacy workspace migration (also available in the menu).
+    Migrate {
+        #[arg(long, default_value = "chuggin.json")]
+        config: PathBuf,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        clear_staging: bool,
+    },
     /// Inspect saved progress.
     Status {
         #[arg(long)]
@@ -96,6 +107,18 @@ fn main() -> Result<()> {
         }
         Some(Command::Settings { show }) => setup::configure(show),
         Some(Command::Init { config, repo, goal }) => runner::init(&config, &repo, &goal),
+        Some(Command::Migrate {
+            config,
+            apply,
+            clear_staging,
+        }) => {
+            if apply {
+                runner::migration_apply(&config, clear_staging)
+            } else {
+                events::log(runner::migration_preview(&config)?);
+                Ok(())
+            }
+        }
         Some(Command::Status { config }) => {
             let path = config
                 .or(setup::find_project()?)

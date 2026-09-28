@@ -596,6 +596,11 @@ pub(crate) fn outcome_label(disposition: &str) -> &str {
     }
 }
 struct Dashboard {
+    workspace: String,
+    workspace_branch: String,
+    workspace_head: String,
+    recovery: String,
+    commit_pending: Option<String>,
     controls: Arc<crate::run_control::RunControl>,
     entries: VecDeque<Entry>,
     phase: String,
@@ -646,6 +651,11 @@ struct Dashboard {
 impl Dashboard {
     fn new(config: &runner::Config) -> Self {
         let mut d = Self {
+            workspace: config.repo.display().to_string(),
+            workspace_branch: String::new(),
+            workspace_head: String::new(),
+            recovery: String::new(),
+            commit_pending: None,
             controls: Arc::default(),
             entries: VecDeque::new(),
             phase: "Ready".into(),
@@ -697,6 +707,10 @@ impl Dashboard {
             && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
         {
             d.cycle = v["cycle"].as_u64().unwrap_or(0);
+            d.workspace_branch = v["working_branch"].as_str().unwrap_or("").into();
+            d.workspace_head = v["branch_head"].as_str().unwrap_or("").into();
+            d.recovery = v["working_ref"].as_str().unwrap_or("").into();
+            d.commit_pending = v["commit_pending"].as_str().map(str::to_owned);
             d.last_passing_checkpoint = v["last_checks_passed_ref"]
                 .as_str()
                 .filter(|reference| !reference.is_empty())
@@ -887,6 +901,19 @@ impl Dashboard {
     fn apply(&mut self, event: Event) {
         self.last_activity = Instant::now();
         match event {
+            Event::Workspace {
+                path,
+                branch,
+                head,
+                recovery,
+                pending,
+            } => {
+                self.workspace = path;
+                self.workspace_branch = branch;
+                self.workspace_head = head;
+                self.recovery = recovery;
+                self.commit_pending = pending;
+            }
             Event::RequestModel(name) => self.active_model = name,
             Event::RequestFinished => self.request_active = false,
             Event::ProviderWait { reason, seconds } => {
@@ -1063,7 +1090,18 @@ impl Dashboard {
             }
         };
         if self.tab == 3 {
-            let mut detail = goal.to_owned();
+            let mut detail = format!(
+                "WORKING FOLDER\n{}\nBranch: {}\nNormal commit: {}\nRecovery save: {}\n{}\n\nPROJECT GOAL\n{}",
+                self.workspace,
+                self.workspace_branch,
+                self.workspace_head,
+                self.recovery,
+                self.commit_pending
+                    .as_ref()
+                    .map(|s| format!("Commit deferred: {s}"))
+                    .unwrap_or_default(),
+                goal
+            );
             if let Some(n) = &self.nudges.active {
                 detail.push_str(&format!("\n\nACTIVE NUDGE #{}\n{}", n.id, n.request));
             }
@@ -1337,11 +1375,15 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             Some(n) => format!("{}\nNudge #{}: {}", d.task, n.id, n.request),
             None => d.task.clone(),
         })
-        .block(panel(if d.finished.is_some() {
-            "Last task"
-        } else {
-            "Current task"
-        })),
+        .block(panel(&format!(
+            "{} · {}",
+            if d.finished.is_some() {
+                "Last task"
+            } else {
+                "Current task"
+            },
+            d.workspace_branch
+        ))),
         r[2],
     );
     let body = Layout::horizontal(if wide {
@@ -1495,7 +1537,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             Line::from("CYCLES & SESSION").fg(CYAN).bold(),
             Line::from(format!("Overall cycle: #{}", d.cycle)),
             Line::from(format!("This session: {} finished", d.completed_cycles)),
-            Line::from(format!("Checkpoints saved: {}", d.checkpoints)),
+            Line::from(format!("Recovery saves: {}", d.checkpoints)),
             Line::from(format!(
                 "Elapsed {}",
                 duration(d.active_elapsed().as_secs())
@@ -2479,7 +2521,7 @@ mod tests {
         let text = screen_text(&t);
         assert!(text.contains("Overall cycle: #2"));
         assert!(text.contains("This session: 2 finished"));
-        assert!(text.contains("Checkpoints saved: 2"));
+        assert!(text.contains("Recovery saves: 2"));
         assert!(text.contains("work is kept for repair"));
         assert!(text.contains("Last passing: abc12345"));
         assert!(text.contains("Saved · checks failing"));

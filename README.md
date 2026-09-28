@@ -126,10 +126,15 @@ starts a new timer.
 
 ## One conversation, continuous refinement
 
-Chuggin separates **saving progress** from **verifying correctness**. One durable
-working branch and worktree hold the developing project. Failing checks, model
-errors, and cycle boundaries do not discard its edits. A checkpoint is a saved
-revision, not an approval.
+Chuggin works directly in **your project folder, on its current branch**. Open
+that folder in your editor or run the project's normal commands to see the actual
+work. New runs do not create a hidden developing checkout.
+
+Recovery saves and normal commits serve different purposes. Each changed cycle
+creates a recovery snapshot without moving your branch or changing your Git
+staging. Completed tasks whose configured checks pass can create normal commits
+with descriptive task summaries. Failing checks, model errors, and cycle boundaries
+do not discard edits. Unfinished work stays visible and recoverable.
 
 The agent uses **one conversation across tasks, cycles, and restarts**. Its system
 instructions, main goal, and tool definitions stay stable. New task directions,
@@ -160,17 +165,31 @@ There is no mandatory separate planning agent or reviewer, and no review veto.
 An ordinary prose response can end a work interval without marking the task done.
 
 At each cycle boundary Chuggin runs configured checks, even if the agent already
-ran them, saves a checkpoint when there are changes, and records the results.
+ran them, creates a recovery save when there are changes, and records the results.
 The last passing revision advances only when all configured checks pass and the
 project files remain unchanged during those checks. Commands that modify files
 leave a saved but unverified checkpoint for another validation pass. The next
 cycle continues from those files and the same conversation.
 
-Chuggin does not rebuild an attempt from an older passing snapshot. If an approach
-needs to be undone, the agent can make a targeted correction or explicitly use
-`restore_checkpoint` with an ancestor commit and a reason. Restoration first saves
-the current work in Git, then restores the requested project files. It does not
-erase the prior history or automatically certify the restored files.
+Chuggin does not rebuild an attempt from an older passing snapshot. The agent
+can make targeted corrections. Whole-project recovery is a user action under
+**Progress → Browse recovery saves / restore files**. Preview the changes before
+restoring; Chuggin saves the current files first and retains Git history. Restored
+files need validation again.
+
+**Progress → Commit current changes** lets you explicitly commit unfinished work,
+including staged and unstaged project changes. Automatic task commits defer when
+you have staged project changes, preserving your staging while useful work and
+recovery saves continue. Normal commits honor your Git hooks and signing settings;
+a commit failure is reported without discarding the work. Pause with P before
+making manual edits or running a build that needs stable inputs. Running local
+commands can still finish. On resume, changes outside recorded model actions are
+reported and affected files must be re-read before file-tool edits.
+
+A branch switch or unfinished Git merge/rebase stops further agent mutations.
+Return to the original branch, or explicitly select **Progress → Use current
+branch** after finishing the Git operation. A checkout lock prevents two Chuggin
+instances using different configurations from writing into the same checkout.
 
 Conversation recovery happens for reported context pressure, repeated request
 failures, or sustained repeated tool actions, not simply because a task or cycle ended or a text-size estimate was
@@ -364,9 +383,10 @@ nearby code, and compiler suggestions. It does
 not execute tests. Command success does not substitute for the configured final
 checks. Command-produced edits remain part of the persistent project and are
 saved at the next checkpoint.
-Like configured checks, commands execute with the user's OS permissions. A Git
-worktree isolates project revisions; it is not an OS sandbox. The model is
-instructed to keep commands within its task and leave Git commits/state to Chuggin.
+Like configured checks, commands execute with the user's OS permissions. The
+visible-folder workflow is cooperative and does not isolate arbitrary external
+processes. The model is instructed to keep commands within its task and leave Git
+commits/state to Chuggin.
 
 **lookup_symbol** inspects Rust files. It finds types,
 functions, private/public methods, and name-based reference candidates, with
@@ -452,26 +472,38 @@ time waiting counts toward the run duration unless you explicitly pause with P.
 Each provider failure and chosen retry delay is recorded in the cycle's
 `provider-error-NNN.json` files.
 
-`.chuggin/state.json` records `working_ref`, `working_branch`, `working_workspace`,
-`last_checks_passed_ref`, the current task and ID, the latest 32 completed tasks,
-feedback, and recent outcomes. Full completion evidence remains in cycle artifacts.
-New projects use `.chuggin/working` on a `codex/chuggin-working-...` branch.
-The initial worktree includes the original checkout's current project files,
-including uncommitted edits, deletions, and untracked files that Git does not ignore.
-The original checkout is not overwritten or automatically merged. The persistent
-worktree is the developing project; checkpoint commits can contain failing or
-unfinished work. `.chuggin/conversation.json` preserves the working conversation
-across tasks, cycles, and restarts.
+`.chuggin/state.json` records the visible `working_workspace`, current branch,
+`branch_head` (normal Git history), `working_ref` (latest recovery save),
+`last_validated_tree`, last passing recovery reference, current task, completion
+records, pending commit explanation, and recent outcomes. Full evidence remains
+in cycle artifacts. `.chuggin/conversation.json` retains the conversation across
+tasks, cycles, and restarts.
 
-Version 0.7 upgrades project state to schema 3 on resume, preserving existing work
-and the active task and saving the previous state as `state-before-v3.json`.
-Older binaries cannot resume the upgraded state. Prompt and tool updates apply
-once at run startup; they do not replace a healthy conversation on every request.
+Recovery snapshots use project-scoped `refs/chuggin/autosaves/...` references.
+They preserve failing and unfinished work without appearing in ordinary branch
+history or a normal branch push. Backups must include the Git objects and recovery
+refs plus Chuggin's state; a normal clone alone is not a complete recovery backup.
+For an explicitly chosen Git worktree, the shared Git directory is also required.
+Snapshots exclude ignored files and Chuggin's runtime/configuration paths. Existing
+ignored files remain in your working folder. Runtime paths are also added to
+Git’s local exclude file, keeping logs out of ordinary staging without editing
+your project’s tracked ignore rules.
 
-Existing projects adopt their latest compatible candidate with actual changes,
-skipping newer attempts that stopped before editing. They adopt that work in place and
-back up their previous state. Historical cycle folders, logs, and commits remain
-available for diagnosis. The adopted workspace retains uncommitted files too.
+**Upgrading an existing project:** choose Resume to prepare a migration preview.
+The old developing workspace and the visible folder are reconciled in a separate
+preparation directory. Nothing is copied over the visible folder until you apply
+that preview. Conflicts must be resolved and staged in the displayed prepared
+folder. You can refresh a stale preview while retaining the previous prepared
+result. Existing commits keep their IDs, authors, dates, and messages. Both input
+snapshots, staging backups, the old workspace, conversation, and diagnostic history
+remain available. A running or paused worker must stop before migration.
+
+The migration normally preserves staging. An explicit alternative clears old
+staging after retaining its backup. For maintenance/automation, `chuggin migrate`
+prints the preview and `chuggin migrate --apply` applies it; unattended runs never
+silently migrate. Interrupted application is journaled and can resume; intervening
+file or staging changes stop automatic recovery rather than being overwritten.
+Version 0.12 uses state schema 4; older binaries cannot resume that state.
 
 Each cycle-NNNNNN directory records the evidence for that interval:
 

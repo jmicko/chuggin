@@ -6,6 +6,10 @@ persistent conversation, retained work, nudges, optional goal completion,
 repetition recovery, provider backoff, and full-screen observation interface.
 The implementation remains Rust and ships as one executable.
 
+Workspace ownership now follows [Visible project workflow](VISIBLE_PROJECT_WORKFLOW.md):
+the parent works in the user’s chosen checkout. Future editing helpers can still
+use isolated snapshots and return changes for integration.
+
 ## 1. The user experience
 
 One Settings workspace, accessible from Home → Settings and observation tab 5.
