@@ -2338,6 +2338,61 @@ mod terminal_ui {
     }
 
     #[test]
+    fn home_chat_streams_persists_and_reopens_without_starting_the_loop() {
+        let server = Server::custom(false, false, None, |_, _| {
+            ("Hello from project chat".into(), json!([]))
+        });
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        for turn in 0..2 {
+            let mut ui = TerminalProcess::start(root.path());
+            ui.wait("Resume project");
+            ui.send(b"jjjjjj\r");
+            ui.wait("PROJECT CHAT");
+            if turn == 1 {
+                ui.wait("Hello from project chat");
+            }
+            ui.send(if turn == 0 {
+                b"Remember violet giraffe\r"
+            } else {
+                b"What did I say?\r"
+            });
+            ui.wait_until("chat response saved", || {
+                let path = root.path().join("state/operator/last-chat");
+                let Ok(session) = fs::read_to_string(path) else {
+                    return false;
+                };
+                let Ok(bytes) = fs::read(
+                    root.path()
+                        .join("state/operator/sessions")
+                        .join(session)
+                        .join("chat.json"),
+                ) else {
+                    return false;
+                };
+                let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+                    return false;
+                };
+                v["busy"] == false
+                    && v["messages"].as_array().is_some_and(|m| {
+                        m.iter().filter(|m| m["role"] == "assistant").count() == turn + 1
+                    })
+            });
+            ui.wait("Hello from project chat");
+            assert!(!root.path().join("state/state.json").exists());
+            ui.send(b"\t");
+            ui.wait("Run saved");
+            ui.send(b"\r");
+            ui.wait("Resume project");
+            ui.send(b"q");
+            ui.restored();
+        }
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].to_string().contains("violet giraffe"));
+    }
+
+    #[test]
     fn full_screen_settings_and_unicode_input_do_not_modify_project() {
         let root = tempfile::tempdir().unwrap();
         let mut ui = TerminalProcess::start(root.path());

@@ -36,6 +36,7 @@ pub struct Model {
     trace: RefCell<Option<PathBuf>>,
     sequence: Cell<u32>,
     settings_path: Option<PathBuf>,
+    chat_settings: Option<PathBuf>,
     completed_messages: RefCell<Option<Vec<Value>>>,
     context_pressure: Cell<bool>,
     run_controls: Option<(Arc<AtomicBool>, Instant)>,
@@ -64,6 +65,7 @@ impl Model {
             trace: RefCell::new(None),
             sequence: Cell::new(0),
             settings_path: None,
+            chat_settings: None,
             completed_messages: RefCell::new(None),
             context_pressure: Cell::new(false),
             run_controls: None,
@@ -90,6 +92,17 @@ impl Model {
     pub fn use_project_settings(&mut self, path: &Path) {
         self.settings_path = Some(path.to_owned());
     }
+    pub fn use_chat_settings(&mut self, path: &Path, session: &Path) {
+        self.settings_path = Some(path.into());
+        self.chat_settings = Some(session.join("provider-wait.json"));
+    }
+    fn selected_name<'a>(&self, c: &'a crate::runner::Config) -> &'a str {
+        if self.chat_settings.is_some() && !c.chat_model.trim().is_empty() {
+            &c.chat_model
+        } else {
+            &c.model
+        }
+    }
     pub fn use_run_controls(&mut self, stop: Arc<AtomicBool>, started: Instant) {
         self.run_controls = Some((stop, started));
     }
@@ -101,9 +114,13 @@ impl Model {
         if let Some(path) = &self.settings_path {
             let c = crate::runner::load(path)?;
             Ok((
-                c.model,
+                self.selected_name(&c).into(),
                 format!("{}/api/chat", c.ollama_url.trim_end_matches('/')),
-                Some(c.state_dir.join("provider-wait.json")),
+                Some(
+                    self.chat_settings
+                        .clone()
+                        .unwrap_or_else(|| c.state_dir.join("provider-wait.json")),
+                ),
             ))
         } else {
             Ok((self.name.clone(), self.url.clone(), None))
@@ -326,6 +343,12 @@ impl Model {
         format: Option<Value>,
     ) -> Result<Value> {
         self.pause_point();
+        if self.controls.stopped_while_held() {
+            return Err(crate::provider::Stopped(
+                "Stopped while paused; conversation retained".into(),
+            )
+            .into());
+        }
         // Snapshot settings once; edits never alter an in-flight request.
         let live = self
             .settings_path
@@ -334,7 +357,7 @@ impl Model {
             .transpose()?;
         let name = live
             .as_ref()
-            .map(|c| c.model.as_str())
+            .map(|c| self.selected_name(c))
             .unwrap_or(&self.name);
         let url = live
             .as_ref()
@@ -349,6 +372,10 @@ impl Model {
         } else {
             timeout
         };
+        let _permit = crate::inference::acquire(&url, &self.controls, &self.stop)?;
+        if self.controls.stopped_while_held() {
+            return Err(crate::provider::Stopped("Stopped while awaiting inference".into()).into());
+        }
         *self.request_target.borrow_mut() = (name.to_owned(), url.clone());
         crate::events::send(crate::events::Event::RequestModel(name.to_owned()));
         crate::events::send(crate::events::Event::Request);

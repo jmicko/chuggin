@@ -602,6 +602,7 @@ struct Dashboard {
     recovery: String,
     commit_pending: Option<String>,
     controls: Arc<crate::run_control::RunControl>,
+    chat: ChatPanel,
     entries: VecDeque<Entry>,
     phase: String,
     task: String,
@@ -637,6 +638,7 @@ struct Dashboard {
     finished: Option<String>,
     finished_at: Option<Instant>,
     finished_active_elapsed: Option<Duration>,
+    remote_active_elapsed: Option<Duration>,
     finished_phase_elapsed: Option<Duration>,
     expanded_commands: bool,
     last_output: Instant,
@@ -657,6 +659,7 @@ impl Dashboard {
             recovery: String::new(),
             commit_pending: None,
             controls: Arc::default(),
+            chat: ChatPanel::default(),
             entries: VecDeque::new(),
             phase: "Ready".into(),
             task: "Waiting for the next task".into(),
@@ -692,6 +695,7 @@ impl Dashboard {
             finished: None,
             finished_at: None,
             finished_active_elapsed: None,
+            remote_active_elapsed: None,
             finished_phase_elapsed: None,
             expanded_commands: false,
             last_output: Instant::now(),
@@ -874,15 +878,17 @@ impl Dashboard {
         ))
     }
     fn active_elapsed(&self) -> Duration {
-        self.finished_active_elapsed.unwrap_or_else(|| {
-            if let Some(end) = self.finished_at {
-                // The live session records its active duration when the worker finishes.
-                // Keep a wall-time fallback for historical/test dashboards.
-                end.saturating_duration_since(self.started)
-            } else {
-                self.controls.active_elapsed(self.started)
-            }
-        })
+        self.finished_active_elapsed
+            .or(self.remote_active_elapsed)
+            .unwrap_or_else(|| {
+                if let Some(end) = self.finished_at {
+                    // The live session records its active duration when the worker finishes.
+                    // Keep a wall-time fallback for historical/test dashboards.
+                    end.saturating_duration_since(self.started)
+                } else {
+                    self.controls.active_elapsed(self.started)
+                }
+            })
     }
     fn phase_elapsed(&self) -> Duration {
         self.finished_phase_elapsed.unwrap_or_else(|| {
@@ -894,7 +900,7 @@ impl Dashboard {
         })
     }
     fn freeze_elapsed(&mut self) {
-        self.finished_active_elapsed = Some(self.controls.active_elapsed(self.started));
+        self.finished_active_elapsed = Some(self.active_elapsed());
         self.finished_phase_elapsed = Some(self.controls.active_elapsed(self.phase_started));
         self.finished_at = Some(Instant::now());
     }
@@ -1187,6 +1193,13 @@ fn setting_value(c: &runner::Config, field: usize) -> String {
         0 => c.model.clone(),
         1 => format!("{}", c.request_timeout_seconds as f64 / 60.0),
         2 => format!("{}", c.run_duration_seconds as f64 / 3600.0),
+        5 => c
+            .active_hours
+            .at(chrono::Utc::now())
+            .map(|s| s.description)
+            .unwrap_or_else(|e| e.to_string()),
+        6 => "Choose model…".into(),
+        7 => "Connect another AI app…".into(),
         4 => if c.allow_goal_completion { "on" } else { "off" }.into(),
         _ => c.command_review_seconds.to_string(),
     }
@@ -1203,6 +1216,9 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
         "Run duration (hours; 0 unlimited)",
         "Command first review (seconds)",
         "Allow goal completion (on/off)",
+        "Active hours",
+        "Chat model",
+        "External AI access (MCP)",
     ]
     .iter()
     .enumerate()
@@ -1255,7 +1271,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     if d.nudge_edit.is_none() && d.finished.is_some() && (a.height < 20 || a.width < 44) {
         f.render_widget(
             p(format!(
-                "WORK PAUSED\nNo work is running.\n\n{}\n\nR resume · Enter / Q home",
+                "WORK PAUSED\nLoop stopped. Chat available.\n\n{}\n\nR resume · Enter / Q home",
                 d.finished.as_deref().unwrap_or("")
             ))
             .fg(GOLD)
@@ -1401,6 +1417,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             "3 Checks",
             "4 Goal",
             "5 Settings",
+            "6 Chat",
         ])
         .select(d.tab)
         .style(Style::default().fg(MUTED))
@@ -1436,9 +1453,26 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     f.render_widget(block, log[1]);
     let show_activity = d.tab <= 2 && d.finished.is_none() && inner.height >= 2;
     let output = Rect {
-        height: inner.height.saturating_sub(u16::from(show_activity)),
+        height: inner.height.saturating_sub(if d.tab == 5 {
+            3
+        } else {
+            u16::from(show_activity)
+        }),
         ..inner
     };
+    if d.tab == 5 {
+        f.render_widget(
+            p(format!("› {}▏", d.chat.draft))
+                .fg(CYAN)
+                .block(panel("Message · Enter sends · Tab changes view")),
+            Rect::new(
+                inner.x,
+                inner.y + output.height,
+                inner.width,
+                inner.height - output.height,
+            ),
+        );
+    }
     if show_activity && let Some(activity) = d.quiet_activity() {
         f.render_widget(
             Paragraph::new(activity).fg(CYAN),
@@ -1447,6 +1481,8 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     }
     let lines = if d.tab == 4 {
         settings_lines(d, c)
+    } else if d.tab == 5 {
+        d.chat.lines(inner.width.saturating_sub(1) as usize)
     } else {
         d.lines(inner.width.saturating_sub(1) as usize, &c.goal)
     };
@@ -1607,7 +1643,9 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             bars[1],
         );
     }
-    let footer = if let Some(s) = &d.finished {
+    let footer = if d.tab == 5 {
+        "Enter send · Esc cancel · Ctrl+N new chat · F2 tool details · Tab views".into()
+    } else if let Some(s) = &d.finished {
         format!("{s} · R resume · Enter / q returns home")
     } else if paused {
         if d.provider_wait.is_some() {
@@ -1633,13 +1671,17 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             )
         )
     } else {
-        "P pause · Ctrl+C finish cycle · N nudge · 1–5 views · ? help".into()
+        "P pause · Ctrl+C finish cycle · N nudge · 1–6 views · ? help".into()
     };
     if let Some(reason) = &d.finished {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from("WORK PAUSED").bold(),
-                Line::from("No work is running."),
+                Line::from(if d.chat.busy {
+                    "Chat is working; the loop is stopped."
+                } else {
+                    "Loop stopped. Chat available."
+                }),
                 Line::from(reason.clone()),
                 Line::from("R resume work  ·  N nudge  ·  Enter / Q return home"),
             ])
@@ -1667,7 +1709,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         f.render_widget(
             Paragraph::new(vec![
                 Line::from("CYCLE PAUSED").bold(),
-                Line::from(timer),
+                Line::from(format!("{} · {}", timer, d.controls.reasons().join(" · "))),
                 Line::from(footer),
             ])
             .style(Style::default().fg(GOLD).bg(Color::Rgb(42, 34, 20))),
@@ -1692,38 +1734,41 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     if d.help {
         let area = a.inner(Margin::new(2, 1));
         f.render_widget(Clear, area);
-        f.render_widget(p("P              Pause / continue current cycle\nT              Retry provider now; queue while paused\nCtrl+C / Q     Finish cycle, then stop\nCtrl+C again   Force stop immediately\nR              Cancel stop / resume saved run\nN              Add / manage a temporary nudge\n1–5 / Tab      Live, model, checks, goal, settings\n↑↓ / wheel     Scroll a few lines\nPgUp / PgDn    Scroll a page\nHome / End     Oldest / latest output\nF              Follow live output\nE              Expand / collapse command output\n/              Search current view\nEsc            Clear search / close help\n\nPause waits for the current operation; the run timer holds.\nStarted commands may finish. Full logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.").block(panel("Keyboard guide · ? / Esc closes")),area);
+        f.render_widget(p("P              Pause / continue current cycle\nT              Retry provider now; queue while paused\nCtrl+C / Q     Finish cycle, then stop\nCtrl+C again   Force stop immediately\nR              Cancel stop / resume saved run\nN              Add / manage a temporary nudge\n1–6 / Tab      Live, model, checks, goal, settings, chat\n↑↓ / wheel     Scroll a few lines\nPgUp / PgDn    Scroll a page\nHome / End     Oldest / latest output\nF              Follow live output\nE              Expand / collapse command output\n/              Search current view\nEsc            Clear search / close help\n\nPause waits for the current operation; the run timer holds.\nStarted commands may finish. Full logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.").block(panel("Keyboard guide · ? / Esc closes")),area);
     }
 }
 
 pub fn dashboard(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
-    while dashboard_session(path, stop.clone(), running.clone())? {}
+    while dashboard_session(path, stop.clone(), running.clone(), true, false)? {}
     Ok(())
 }
 
-fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<bool> {
+pub fn chat_home(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
+    dashboard_session(path, stop, running, false, true)?;
+    Ok(())
+}
+fn dashboard_session(
+    path: &Path,
+    stop: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    start: bool,
+    chat: bool,
+) -> Result<bool> {
     let mut config = runner::load(path)?;
     // Identity setup can prompt, so complete it on the thread that owns the terminal.
     crate::setup::ensure_git_identity(&config.repo)?;
     let mut d = Dashboard::new(&config);
     let rx = events::subscribe();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let owned_path = path.to_owned();
-    let worker_stop = stop.clone();
-    let worker_controls = d.controls.clone();
-    stop.store(false, Ordering::SeqCst);
-    running.store(true, Ordering::SeqCst);
-    let worker = std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(|| {
-            runner::run_controlled(&owned_path, None, worker_stop, worker_controls)
-        });
-        let result = match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(format!("{e:#}")),
-            Err(_) => Err("Runner panicked; the working files and logs remain on disk.".into()),
-        };
-        let _ = done_tx.send(result);
-    });
+    let client = crate::engine::Client::connect(path)?;
+    crate::engine::foreground(Some(client.clone()));
+    if start {
+        resume_client(&client)?;
+    }
+    if chat {
+        d.tab = 5;
+    }
+    let mut cursor = 0;
+    let mut sent_stop = false;
     let result = (|| -> Result<bool> {
         loop {
             for e in rx.try_iter().take(4096) {
@@ -1738,23 +1783,47 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
             if let Ok(updated) = runner::load(path) {
                 config = updated;
             }
-            if d.finished.is_none()
-                && let Ok(result) = done_rx.try_recv()
-            {
+            if stop.load(Ordering::SeqCst) && !sent_stop {
+                client.request(serde_json::json!({"action":"stop"}))?;
+                sent_stop = true;
+            }
+            let state = client.request(serde_json::json!({"action":"status"}))?;
+            d.controls.observe_remote(state.clone());
+            d.remote_active_elapsed = state["active_elapsed_seconds"]
+                .as_u64()
+                .map(Duration::from_secs);
+            let active = state["running"] == true;
+            running.store(active, Ordering::SeqCst);
+            if !active && d.finished.is_none() {
                 d.freeze_elapsed();
-                d.finished = Some(match result {
-                    Ok(())
-                        if config.state_dir.join("goal-completion.json").exists()
-                            && config.allow_goal_completion =>
-                    {
-                        "Model reports project complete".into()
-                    }
-                    Ok(()) => "Run saved".into(),
-                    Err(e) => format!("Stopped: {e}"),
-                });
+                d.finished = Some(
+                    state["last_error"]
+                        .as_str()
+                        .unwrap_or("Run saved · Chat remains available")
+                        .into(),
+                );
                 d.request_active = false;
-                running.store(false, Ordering::SeqCst);
                 d.flush_model();
+            } else if active && d.finished.is_some() {
+                d.finished = None;
+                d.finished_at = None;
+                d.finished_active_elapsed = None;
+                d.finished_phase_elapsed = None;
+                d.started = Instant::now();
+            }
+            let records: Vec<crate::engine::Record> = serde_json::from_value(
+                client.request(serde_json::json!({"action":"events","after":cursor}))?,
+            )?;
+            for record in records {
+                cursor = record.sequence;
+                if record.actor == "loop" {
+                    d.apply(record.event);
+                } else if d.chat.session.as_deref() == Some(&record.actor) {
+                    d.chat.apply(record.event);
+                }
+            }
+            if d.tab == 5 || d.chat.session.is_some() {
+                d.chat.poll(&client, &config)?;
             }
             draw(|f| render_dashboard(f, &mut d, &config, stop.load(Ordering::SeqCst)))?;
             if let Some(e) = input()? {
@@ -1775,6 +1844,17 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                     }
                     continue;
                 }
+                if d.tab == 5 {
+                    if let Input::Paste(value) = &e {
+                        d.chat.draft.push_str(value);
+                        continue;
+                    }
+                    if let Some(k) = pressed(&e)
+                        && d.chat.key(k, &client, &config)?
+                    {
+                        continue;
+                    }
+                }
                 if let Some(k) = pressed(&e) {
                     if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
                         if d.finished.is_some() {
@@ -1782,7 +1862,7 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                         }
                         if stop.swap(true, Ordering::SeqCst) {
                             restore();
-                            crate::project::kill_active_check();
+                            crate::engine::force_foreground();
                             std::process::exit(130);
                         }
                         d.controls.resume();
@@ -1876,15 +1956,23 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                         }
                         match k.code {
                             KeyCode::Up => {
-                                d.settings_selected = (d.settings_selected + 4) % 5;
+                                d.settings_selected = (d.settings_selected + 7) % 8;
                                 continue;
                             }
                             KeyCode::Down => {
-                                d.settings_selected = (d.settings_selected + 1) % 5;
+                                d.settings_selected = (d.settings_selected + 1) % 8;
                                 continue;
                             }
                             KeyCode::Enter => {
-                                d.settings_edit = Some(setting_value(&config, d.settings_selected));
+                                match d.settings_selected {
+                                    5 => crate::setup::active_hours_menu(Some(path))?,
+                                    6 => crate::setup::project_settings_menu(Some(path))?,
+                                    7 => crate::setup::external_control_info(path)?,
+                                    _ => {
+                                        d.settings_edit =
+                                            Some(setting_value(&config, d.settings_selected))
+                                    }
+                                }
                                 continue;
                             }
                             _ => {}
@@ -1915,29 +2003,19 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                     }
                     match k.code {
                         KeyCode::Char('p' | 'P') if d.finished.is_none() => {
-                            if !stop.load(Ordering::SeqCst) {
-                                let was_paused = d.controls.is_paused();
-                                let pausing = d.controls.toggle_pause();
-                                events::log(if pausing {
-                                    "Pause requested; finishing the current operation.".into()
-                                } else if was_paused {
-                                    "Resumed current cycle.".into()
-                                } else {
-                                    "Pause cancelled; continuing the current cycle.".into()
-                                });
+                            if d.controls.pause_requested() {
+                                resume_client(&client)?;
+                                stop.store(false, Ordering::SeqCst);
+                                sent_stop = false;
+                            } else {
+                                client.request(serde_json::json!({"action":"pause"}))?;
                             }
                         }
-                        KeyCode::Char('t' | 'T')
-                            if d.finished.is_none() && d.provider_wait.is_some() =>
-                        {
-                            if d.controls.retry_now() {
-                                events::log(if d.controls.pause_requested() {
-                                    "Retry queued; provider wait will be skipped when you resume."
-                                        .into()
-                                } else {
-                                    "Retry requested; checking the provider now.".into()
-                                });
-                            }
+                        KeyCode::Char('t' | 'T') => {
+                            client.request(serde_json::json!({"action":"retry"}))?;
+                            events::log(
+                                "Retry queued. Waiting for a safe request boundary.".into(),
+                            );
                         }
                         KeyCode::Char('n' | 'N') => {
                             d.nudge_id = d.nudges.active.as_ref().map(|n| n.id);
@@ -1951,15 +2029,28 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                             d.nudge_error.clear();
                         }
                         KeyCode::Char('r' | 'R') if d.finished.is_some() => {
-                            runner::reopen_goal(path)?;
-                            return Ok(true);
+                            resume_client(&client)?;
+                            stop.store(false, Ordering::SeqCst);
+                            sent_stop = false;
                         }
                         KeyCode::Char('r' | 'R') => {
                             if stop.swap(false, Ordering::SeqCst) {
-                                events::log("Stop cancelled; continuing normally.".into());
+                                events::log("Stop cancelled; continuing work.".into());
+                                resume_client(&client)?;
+                                sent_stop = false;
                             }
                         }
-                        KeyCode::Enter | KeyCode::Char('q') if d.finished.is_some() => break,
+                        KeyCode::Enter | KeyCode::Char('q') if d.finished.is_some() => {
+                            if d.chat.session.is_some() {
+                                d.chat.last_poll = None;
+                                d.chat.poll(&client, &config)?;
+                            }
+                            if d.chat.busy {
+                                events::log("Chat is still responding. Open tab 6 to cancel it or wait for its answer before returning home.".into());
+                            } else {
+                                break;
+                            }
+                        }
                         KeyCode::Char('q') => {
                             stop.store(true, Ordering::SeqCst);
                             d.controls.resume();
@@ -1977,14 +2068,19 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
                             d.scroll = 0;
                         }
                         KeyCode::End | KeyCode::Char('f') => d.follow = true,
-                        KeyCode::Tab => {
-                            d.tab = (d.tab + 1) % 5;
-                            d.follow = d.tab != 3;
+                        KeyCode::BackTab => {
+                            d.tab = (d.tab + 5) % 6;
+                            d.follow = !matches!(d.tab, 3 | 4);
                             d.scroll = 0;
                         }
-                        KeyCode::Char(c @ '1'..='5') => {
+                        KeyCode::Tab => {
+                            d.tab = (d.tab + 1) % 6;
+                            d.follow = !matches!(d.tab, 3 | 4);
+                            d.scroll = 0;
+                        }
+                        KeyCode::Char(c @ '1'..='6') => {
                             d.tab = (c as u8 - b'1') as usize;
-                            d.follow = d.tab != 3;
+                            d.follow = !matches!(d.tab, 3 | 4);
                             d.scroll = 0;
                         }
                         KeyCode::Char('/') => {
@@ -2000,12 +2096,11 @@ fn dashboard_session(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool
         Ok(false)
     })();
     events::unsubscribe();
-    if d.finished.is_some() || worker.is_finished() {
-        let _ = worker.join();
-    } else if result.is_err() {
-        stop.store(true, Ordering::SeqCst);
-        d.controls.resume();
+    crate::engine::foreground(None);
+    if result.is_err() {
+        let _ = client.request(serde_json::json!({"action":"stop"}));
     }
+
     result
 }
 
@@ -2165,7 +2260,7 @@ mod tests {
         assert_eq!(e.value, "héllo\nworld");
     }
     fn config() -> runner::Config {
-        runner::Config {repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
+        runner::Config {chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
     }
     fn screen_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();
@@ -2447,7 +2542,10 @@ mod tests {
                 .unwrap();
             let text = screen_text(&terminal);
             assert!(text.contains("WORK PAUSED"));
-            assert!(text.contains("No work is running."));
+            assert!(
+                text.contains("Loop stopped. Chat available."),
+                "{width}x{height} {text}"
+            );
             assert!(text.contains("R resume"));
             assert!(!text.contains("Current task"));
             assert!(!text.contains("following live"));
@@ -2635,4 +2733,194 @@ mod tests {
         d.finished = Some("Run saved".into());
         assert!(d.quiet_activity().is_none());
     }
+}
+
+#[derive(Default)]
+struct ChatPanel {
+    session: Option<String>,
+    draft: String,
+    history: Vec<serde_json::Value>,
+    partial: String,
+    busy: bool,
+    error: String,
+    last_poll: Option<Instant>,
+    expanded: bool,
+}
+impl ChatPanel {
+    fn poll(&mut self, client: &crate::engine::Client, c: &runner::Config) -> Result<()> {
+        if self.session.is_none() {
+            let previous = std::fs::read_to_string(c.state_dir.join("operator/last-chat")).ok();
+            let session = client.open_session(previous.as_deref())?;
+            std::fs::write(c.state_dir.join("operator/last-chat"), &session)?;
+            self.session = Some(session);
+        }
+        if self
+            .last_poll
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+        {
+            return Ok(());
+        }
+        self.last_poll = Some(Instant::now());
+        let value = client
+            .request(serde_json::json!({"action":"chat_status","session_id":self.session}))?;
+        let messages = value["messages"].as_array().cloned().unwrap_or_default();
+        if messages.last() != self.history.last() {
+            self.partial.clear();
+        }
+        self.history = messages;
+        self.busy = value["busy"] == true;
+        self.error = value["error"].as_str().unwrap_or("").into();
+        Ok(())
+    }
+    fn apply(&mut self, event: events::Event) {
+        match event {
+            events::Event::Delta(text) => self.partial.push_str(&text),
+            events::Event::ProviderWait { reason, seconds } => {
+                self.partial = format!("Waiting for provider · {reason} · retry in {seconds}s")
+            }
+            events::Event::Tool(name) => {
+                self.partial.clear();
+                self.partial = format!("Using {name}…");
+            }
+            _ => {}
+        }
+    }
+    fn lines(&self, width: usize) -> Vec<Line<'static>> {
+        let mut lines = vec![
+            Line::from("PROJECT CHAT").fg(ACCENT).bold(),
+            Line::from("Ask about progress, guide the loop, or work directly."),
+            Line::from(""),
+        ];
+        for message in &self.history {
+            let role = message["role"].as_str().unwrap_or("");
+            let text = message["content"].as_str().unwrap_or("");
+            if role == "system" || message["chuggin_context"] == true {
+                continue;
+            }
+            if role == "tool" && !self.expanded {
+                lines.push(
+                    Line::from(format!(
+                        "  ↳ {} · {}",
+                        message["tool_name"].as_str().unwrap_or("tool"),
+                        if text.contains("\"status\":\"failed\"") {
+                            crate::project::excerpt(text, 180)
+                        } else {
+                            "Result saved".into()
+                        }
+                    ))
+                    .fg(MUTED),
+                );
+                continue;
+            }
+            lines.push(
+                Line::from(if role == "user" { "You" } else { "Chuggin" })
+                    .fg(if role == "user" { CYAN } else { ACCENT })
+                    .bold(),
+            );
+            for line in textwrap::wrap(text, width.max(1)) {
+                lines.push(Line::from(line.into_owned()));
+            }
+            lines.push(Line::from(""));
+        }
+        if self.busy {
+            for line in textwrap::wrap(&self.partial, width.max(1)) {
+                lines.push(Line::from(line.into_owned()).fg(FG));
+            }
+            lines.push(Line::from("Working… Esc cancels this reply").fg(CYAN));
+        }
+        if !self.error.is_empty() {
+            lines.push(Line::from(self.error.clone()).fg(GOLD));
+        }
+        lines.push(Line::from(""));
+
+        lines
+    }
+    fn key(
+        &mut self,
+        k: event::KeyEvent,
+        client: &crate::engine::Client,
+        c: &runner::Config,
+    ) -> Result<bool> {
+        match k.code {
+            KeyCode::F(2) => self.expanded = !self.expanded,
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => return Ok(false),
+            KeyCode::Enter if !self.busy && !self.draft.trim().is_empty() => {
+                let result=client.request(serde_json::json!({"action":"chat_send","session_id":self.session,"message":self.draft}));
+                match result {
+                    Ok(_) => {
+                        self.draft.clear();
+                        self.busy = true;
+                        self.partial.clear();
+                        self.last_poll = None;
+                    }
+                    Err(e) => self.error = format!("{e:#}"),
+                }
+            }
+            KeyCode::Esc => {
+                if self.busy {
+                    client.request(
+                        serde_json::json!({"action":"chat_cancel","session_id":self.session}),
+                    )?;
+                } else {
+                    self.draft.clear();
+                }
+            }
+            KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) && !self.busy => {
+                let session = client.open_session(None)?;
+                std::fs::write(c.state_dir.join("operator/last-chat"), &session)?;
+                *self = Self {
+                    session: Some(session),
+                    ..Default::default()
+                };
+            }
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => self.draft.clear(),
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.busy {
+                    client.request(
+                        serde_json::json!({"action":"chat_cancel","session_id":self.session}),
+                    )?;
+                }
+            }
+            KeyCode::Backspace => {
+                self.draft.pop();
+            }
+            KeyCode::Char(ch)
+                if !k.modifiers.contains(KeyModifiers::CONTROL) && self.draft.len() < 100000 =>
+            {
+                self.draft.push(ch);
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+}
+fn resume_client(client: &crate::engine::Client) -> Result<()> {
+    let state = client.request(serde_json::json!({"action":"status"}))?;
+    let mode = if state["schedule"]["open"] == false {
+        match select(
+            "Outside active hours · resume loop",
+            &[
+                "Run until the next scheduled stop".into(),
+                "Run one cycle now".into(),
+                "Wait for active hours".into(),
+            ],
+            0,
+        )? {
+            Some(0) => "until_close",
+            Some(1) => "one_cycle",
+            Some(_) => "scheduled",
+            None => return Ok(()),
+        }
+    } else {
+        "scheduled"
+    };
+    client.request(serde_json::json!({"action":"resume","mode":mode}))?;
+    Ok(())
 }

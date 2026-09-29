@@ -1,5 +1,12 @@
 # Future feature: optional sequential sub-agents
 
+Latest planning record (September 28, 2026):
+[Active hours, operator chat, and MCP](docs/ACTIVE_HOURS_CHAT_AND_MCP.md).
+Implemented in the local 0.13.0 candidate: shared project control, scheduled
+pauses, independent operator conversations, and a local MCP adapter. See the
+README for the implemented workflow and the plan for remaining extensions.
+It supersedes the earlier single-conversation Chat mode proposal below.
+
 Recorded September 17, 2026. The user asked to preserve this idea for future work,
 not to implement it during the current overnight model comparison.
 

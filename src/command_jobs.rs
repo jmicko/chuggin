@@ -38,7 +38,7 @@ impl Job {
         diagnostic: bool,
     ) -> Result<Self> {
         anyhow::ensure!(!checks.is_empty(), "No commands configured");
-        let mut job = Self {
+        let job = Self {
             id: id.into(),
             pending: checks.into(),
             current: None,
@@ -50,10 +50,16 @@ impl Job {
             diagnostic,
             controls: None,
         };
-        job.advance()?;
         Ok(job)
     }
     fn advance(&mut self) -> Result<()> {
+        if let Some(c) = &self.controls {
+            c.wait_until_resumed(|| false);
+            anyhow::ensure!(
+                !c.stopped_while_held(),
+                "Stopped while paused; no new command started"
+            );
+        }
         if let Some(c) = self.pending.pop_front() {
             self.collected = false;
             let log = self.art.join(if self.checks {
@@ -73,6 +79,9 @@ impl Job {
     pub fn poll(&mut self, wait: u64, stop: &AtomicBool) -> Result<Value> {
         if let Some(controls) = &self.controls {
             controls.wait_until_resumed(|| stop.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        if self.current.is_none() && !self.pending.is_empty() {
+            self.advance()?;
         }
         if let Some(s) = &mut self.current {
             s.poll(wait, stop)?;
@@ -342,6 +351,7 @@ mod tests {
         )
         .unwrap();
         job.controls = Some(controls.clone());
+        job.advance().unwrap();
         controls.toggle_pause();
         let worker = thread::spawn(move || {
             let stop = AtomicBool::new(false);

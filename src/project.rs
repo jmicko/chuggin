@@ -1,22 +1,21 @@
-static ACTIVE_CHECK: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
+static ACTIVE_CHECKS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeSet<i32>>> =
+    std::sync::LazyLock::new(Default::default);
 pub fn register_check(pid: i32) {
-    ACTIVE_CHECK.store(pid, std::sync::atomic::Ordering::SeqCst);
+    ACTIVE_CHECKS.lock().unwrap().insert(pid);
 }
 pub fn unregister_check(pid: i32) {
-    let _ = ACTIVE_CHECK.compare_exchange(
-        pid,
-        0,
-        std::sync::atomic::Ordering::SeqCst,
-        std::sync::atomic::Ordering::SeqCst,
-    );
+    ACTIVE_CHECKS.lock().unwrap().remove(&pid);
+}
+pub fn active_checks() -> Vec<i32> {
+    ACTIVE_CHECKS.lock().unwrap().iter().copied().collect()
 }
 pub fn kill_active_check() {
-    let pid = ACTIVE_CHECK.load(std::sync::atomic::Ordering::SeqCst);
+    // Keep registration locked until signalling, preventing PID reuse after reaping.
+    let pids = ACTIVE_CHECKS.lock().unwrap();
     #[cfg(unix)]
-    if pid > 0 {
+    for pid in pids.iter() {
         unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(-*pid, libc::SIGKILL);
         }
     }
 }
@@ -193,7 +192,7 @@ pub fn check(
         .stderr(Stdio::from(err))
         .spawn()
         .with_context(|| format!("Cannot run check {:?}", c.argv))?;
-    ACTIVE_CHECK.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+    register_check(child.id() as i32);
     let start = Instant::now();
     let mut timed_out = false;
     let mut exit_code = None;
@@ -215,7 +214,7 @@ pub fn check(
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
-    ACTIVE_CHECK.store(0, std::sync::atomic::Ordering::SeqCst);
+    unregister_check(child.id() as i32);
     // Read only a bounded tail. Full output remains in the artifact log.
     use std::io::{Read, Seek, SeekFrom};
     let mut f = fs::File::open(log)?;

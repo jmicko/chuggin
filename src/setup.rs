@@ -13,6 +13,7 @@ use std::{
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub active_hours: crate::schedule::Schedule,
     pub ollama_url: String,
     pub model: String,
     pub context_tokens: u32,
@@ -24,6 +25,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            active_hours: crate::schedule::Schedule::Always,
             ollama_url: "http://localhost:11434".into(),
             model: String::new(),
             context_tokens: 32768,
@@ -54,9 +56,16 @@ pub fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(p) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(p)?;
     }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
-    fs::rename(tmp, path)?;
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".chuggin-save-")
+        .tempfile_in(parent)?;
+    tmp.write_all(&serde_json::to_vec_pretty(value)?)?;
+    tmp.persist(path)?;
     Ok(())
 }
 pub fn ask(label: &str, default: &str) -> Result<String> {
@@ -435,7 +444,7 @@ pub fn wizard() -> Result<PathBuf> {
     }
     save(
         &config,
-        &json!({"repo":".","goal":draft.goal,"state_dir":".chuggin",
+        &json!({"repo":".","goal":draft.goal,"state_dir":".chuggin","active_hours":{"mode":"shared"},
         "command_review_seconds":timeout,"checks":[{"argv":check,"timeout_seconds":timeout}]}),
     )?;
     // Check merged project/global settings before starting.
@@ -493,9 +502,13 @@ pub fn choose_model(project: Option<&Path>) -> Result<()> {
     if let Some(index) = crate::menu::select(title, &names, selected)? {
         s.model = names[index].clone();
         if let Some(path) = project {
-            let mut config: Value = serde_json::from_slice(&fs::read(path)?)?;
-            config["model"] = json!(s.model);
-            save(path, &config)?;
+            if runner::needs_migration(path)? {
+                let mut config: Value = serde_json::from_slice(&fs::read(path)?)?;
+                config["model"] = json!(s.model);
+                save(path, &config)?;
+            } else {
+                save_live_setting(path, 0, &s.model)?;
+            }
         } else {
             save(&settings_path()?, &s)?;
         }
@@ -533,6 +546,7 @@ pub fn settings_menu() -> Result<()> {
                 }
             ),
             "Test Brave connection".into(),
+            "Shared active hours".into(),
             "Back".into(),
         ];
         let Some(index) = crate::menu::select("Shared settings", &items, 0)? else {
@@ -623,6 +637,10 @@ pub fn settings_menu() -> Result<()> {
                     result["results"].as_array().map_or(0, Vec::len)
                 ));
             }
+            9 => {
+                active_hours_menu(None)?;
+                continue;
+            }
             _ => return Ok(()),
         }
         save(&settings_path()?, &s)?;
@@ -630,7 +648,7 @@ pub fn settings_menu() -> Result<()> {
 }
 
 pub fn run_duration(path: &Path) -> Result<()> {
-    let mut config: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let config: Value = serde_json::from_slice(&fs::read(path)?)?;
     let seconds = config["run_duration_seconds"].as_u64().unwrap_or(0);
     crate::ui::notice("Set the duration of each run in hours (0 means unlimited). The current cycle finishes before stopping. Resuming starts a new timer. This setting applies only to this project.".into());
     loop {
@@ -643,8 +661,7 @@ pub fn run_duration(path: &Path) -> Result<()> {
             && (0.0..=8760.0).contains(&hours)
             && (hours == 0.0 || hours * 3600.0 >= 1.0)
         {
-            config["run_duration_seconds"] = json!((hours * 3600.0).round() as u64);
-            save(path, &config)?;
+            save_live_setting(path, 2, &hours.to_string())?;
             return Ok(());
         }
         crate::ui::notice(
@@ -654,7 +671,11 @@ pub fn run_duration(path: &Path) -> Result<()> {
 }
 
 pub fn save_live_setting(path: &Path, field: usize, input: &str) -> Result<()> {
-    let mut config: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let client = crate::engine::Client::connect(path)?;
+    let session = client.open_session(None)?;
+    let current = client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
+    let original = current["result"]["settings"].clone();
+    let mut config = original.clone();
     match field {
         0 => {
             let name = input.trim();
@@ -696,7 +717,21 @@ pub fn save_live_setting(path: &Path, field: usize, input: &str) -> Result<()> {
         }
         _ => anyhow::bail!("Unknown project setting"),
     }
-    save(path, &config)
+    let patch: serde_json::Map<String, Value> = config
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(k, v)| original[*k] != **v)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let reply = client.call(
+        &session,
+        "update_settings",
+        json!({"expected_revision":current["result"]["revision"],"settings":patch}),
+        &crate::operator::id(),
+    )?;
+    anyhow::ensure!(reply["status"] == "complete", "{}", reply["error"]);
+    Ok(())
 }
 
 fn draft_recovery(root: &Path, detail: &str) -> Result<()> {
@@ -724,4 +759,141 @@ fn draft_recovery(root: &Path, detail: &str) -> Result<()> {
         ask("Press Enter to retry, or Ctrl-C to exit", "retry")?;
     }
     Ok(())
+}
+
+pub fn active_hours_menu(project: Option<&Path>) -> Result<()> {
+    use crate::schedule::{Closing, Schedule, Window};
+    let current = if let Some(p) = project {
+        crate::runner::load(p)?.active_hours
+    } else {
+        settings()?.active_hours
+    };
+    let mut choices = vec!["Always allowed".into(), "Set active hours…".into()];
+    if project.is_some() {
+        choices.push("Use shared active hours".into());
+    }
+    let Some(choice) = crate::ui::select(
+        "Active hours · controls the loop; chat remains available",
+        &choices,
+        0,
+    )?
+    else {
+        return Ok(());
+    };
+    let schedule = match choice {
+        0 => Schedule::Always,
+        2 => Schedule::Shared,
+        _ => {
+            let mut w = if let Schedule::Custom { window } = current {
+                window
+            } else {
+                Window::default()
+            };
+            w.start = ask("Loop may start at (HH:MM)", &w.start)?;
+            w.end = ask("Loop pauses at (HH:MM)", &w.end)?;
+            w.timezone = ask("Time zone", &w.timezone)?;
+            let days = ask(
+                "Opening days: Mon Tue Wed Thu Fri Sat Sun",
+                &w.days
+                    .iter()
+                    .map(|i| ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][*i as usize])
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )?;
+            w.days = days
+                .split_whitespace()
+                .map(|d| {
+                    ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+                        .iter()
+                        .position(|n| *n == d.to_lowercase())
+                        .map(|i| i as u32)
+                        .context("Use weekday names, for example Mon Tue Wed Thu Fri")
+                })
+                .collect::<Result<_>>()?;
+            w.closing = match crate::ui::select(
+                "At closing time",
+                &[
+                    "Finish current call (recommended) · started commands may finish".into(),
+                    "Finish current cycle · can run past closing time".into(),
+                ],
+                usize::from(w.closing == Closing::Cycle),
+            )? {
+                Some(0) => Closing::Call,
+                Some(_) => Closing::Cycle,
+                None => return Ok(()),
+            };
+            w.validate()?;
+            Schedule::Custom { window: w }
+        }
+    };
+    if let Some(path) = project {
+        let client = crate::engine::Client::connect(path)?;
+        let session = client.open_session(None)?;
+        let current = client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
+        let result=client.call(&session,"update_settings",json!({"expected_revision":current["result"]["revision"],"settings":{"active_hours":schedule}}),&crate::operator::id())?;
+        anyhow::ensure!(result["status"] == "complete", "{}", result["error"]);
+    } else {
+        let mut s = settings()?;
+        s.active_hours = schedule;
+        save(&settings_path()?, &s)?;
+    }
+    Ok(())
+}
+pub fn external_control_info(path: &Path) -> Result<()> {
+    let config = json!({"mcpServers":{"chuggin":{"command":std::env::current_exe()?,"args":["mcp","--project",fs::canonicalize(path)?]}}});
+    crate::ui::show(
+        "External AI access · MCP",
+        &format!(
+            "Add this local server to your AI application's MCP settings. Connecting doesn't start the loop.\n\n{config:#}\n\nOpen an operator session to inspect or control this project. The same tools are available in Chuggin Chat.\n\nIf the external AI uses its own file or shell tools, it must acquire begin_edit first, finish its background writers, then end_edit. Chuggin cannot coordinate edits that bypass this protocol.\n\nConnection and spending permissions remain in human settings."
+        ),
+    )
+}
+pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
+    if path.is_none() {
+        return settings_menu();
+    }
+    loop {
+        let Some(choice) = crate::ui::select(
+            "Settings",
+            &[
+                "This project · Active hours".into(),
+                "This project · Chat model".into(),
+                "This project · External AI access (MCP)".into(),
+                "Shared settings".into(),
+                "Back".into(),
+            ],
+            0,
+        )?
+        else {
+            return Ok(());
+        };
+        match choice {
+            0 => {
+                if let Some(p) = path {
+                    active_hours_menu(Some(p))?;
+                }
+            }
+            1 => {
+                if let Some(p) = path {
+                    let model = ask(
+                        "Chat model (leave project model by entering 'default')",
+                        "default",
+                    )?;
+                    let client = crate::engine::Client::connect(p)?;
+                    let session = client.open_session(None)?;
+                    let current =
+                        client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
+                    let result=client.call(&session,"update_settings",json!({"expected_revision":current["result"]["revision"],"settings":{"chat_model":if model=="default"{""}else{&model}}}),&crate::operator::id())?;
+                    anyhow::ensure!(result["status"] == "complete", "{}", result["error"]);
+                }
+            }
+            2 => {
+                if let Some(p) = path {
+                    external_control_info(p)?;
+                }
+            }
+            3 => settings_menu()?,
+            _ => return Ok(()),
+        }
+    }
 }

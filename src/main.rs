@@ -1,21 +1,27 @@
 mod action_watch;
+mod chat;
 mod code_index;
 mod command_jobs;
 mod command_output;
 mod command_session;
 mod command_watch;
 mod dev_tools;
+mod engine;
 mod events;
+mod inference;
+mod mcp;
 mod menu;
 mod migration;
 mod model;
 mod nudge;
+mod operator;
 mod project;
 mod prompts;
 mod provider;
 mod repetition;
 mod run_control;
 mod runner;
+mod schedule;
 mod setup;
 mod stall_diagnostic;
 mod symbols;
@@ -44,6 +50,16 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Expose project tools to an external AI application over local MCP.
+    Mcp {
+        #[arg(long)]
+        project: PathBuf,
+    },
+    #[command(hide = true)]
+    Engine {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Interactive project setup without starting the loop.
     Setup,
     /// Edit shared Ollama and model defaults.
@@ -93,6 +109,7 @@ fn main() -> Result<()> {
     ctrlc::set_handler(move || {
         if !active.load(Ordering::SeqCst) || flag.swap(true, Ordering::SeqCst) {
             ui::restore();
+            engine::force_foreground();
             project::kill_active_check();
             eprintln!("Stopped. Run chuggin again to resume from saved progress.");
             std::process::exit(130);
@@ -100,6 +117,19 @@ fn main() -> Result<()> {
         events::log("Stop requested: finishing this loop, then saving. In the dashboard, press R to resume; Ctrl-C again stops immediately.".into());
     })?;
     match cli.command {
+        Some(Command::Mcp { project }) => {
+            events::protocol_output();
+            let path = if project.is_dir() {
+                project.join("chuggin.json")
+            } else {
+                project
+            };
+            mcp::serve(&path)
+        }
+        Some(Command::Engine { config }) => {
+            events::protocol_output();
+            engine::serve(&config)
+        }
         None => menu::home(stopped, running),
         Some(Command::Setup) => {
             setup::wizard()?;

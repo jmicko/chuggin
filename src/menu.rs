@@ -94,8 +94,9 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             "Project goal".into(),
             "Progress".into(),
             "Choose model".into(),
-            "Shared settings".into(),
+            "Settings".into(),
             "Run duration".into(),
+            "Chat with this project".into(),
             "Quit".into(),
         ];
         let effective = project.as_ref().and_then(|p| runner::load(p).ok());
@@ -165,7 +166,7 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                     }
                 }
                 3 => setup::choose_model(project.as_deref())?,
-                4 => setup::settings_menu()?,
+                4 => setup::project_settings_menu(project.as_deref())?,
                 5 => {
                     if let Some(path) = project.as_ref() {
                         setup::run_duration(path)?;
@@ -173,11 +174,16 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                         crate::ui::show("Run duration", "Set up this project first.")?;
                     }
                 }
+                6 => {
+                    if let Some(path) = project.as_ref() {
+                        crate::ui::chat_home(path, stop.clone(), running.clone())?;
+                    }
+                }
                 _ => {}
             }
             Ok(())
         })();
-        if choice == 6 {
+        if choice == 7 {
             return Ok(());
         }
         if let Err(e) = action {

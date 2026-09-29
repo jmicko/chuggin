@@ -18,10 +18,14 @@ use std::{
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub active_hours: crate::schedule::Schedule,
     pub repo: PathBuf,
     pub goal: String,
     pub ollama_url: String,
     pub model: String,
+    #[serde(default)]
+    pub chat_model: String,
     pub context_tokens: u32,
     pub output_tokens: u32,
     pub implementation_calls: u32,
@@ -111,6 +115,8 @@ struct Conversation {
     command_watch: crate::command_watch::CommandWatch,
     nudge_revision: Option<u64>,
     delivered_nudge_id: Option<u64>,
+    #[serde(default)]
+    operator_revision: u64,
     migration_handoff_seen: Option<String>,
     migration_handoff: Option<Value>,
 }
@@ -314,7 +320,7 @@ fn emit(art: &Path, stage: &str, value: &impl Serialize) -> Result<()> {
     save(&art.join(format!("{stage}.json")), value)
 }
 
-fn lock_project(c: &Config) -> Result<Vec<fs::File>> {
+pub(crate) fn lock_project(c: &Config) -> Result<Vec<fs::File>> {
     fs::create_dir_all(&c.state_dir)?;
     let file = fs::OpenOptions::new()
         .write(true)
@@ -653,7 +659,13 @@ fn working_tree(workspace: &Path, state: &Path) -> Result<String> {
 fn prepare_state(c: &Config) -> Result<State> {
     let path = c.state_dir.join("state.json");
     let mut s = if path.exists() {
-        let s: State = serde_json::from_slice(&fs::read(&path)?)?;
+        let mut s: State = serde_json::from_slice(&fs::read(&path)?)?;
+        if s.goal != c.goal
+            && let Ok(change) = crate::operator::read_json(&c.state_dir.join("operator-goal.json"))
+            && change["goal"] == c.goal
+        {
+            s.goal = c.goal.clone();
+        }
         anyhow::ensure!(
             s.schema_version == 4,
             "This project needs workspace migration. Open Chuggin and choose Resume for a preview, or run chuggin migrate."
@@ -766,7 +778,7 @@ fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
     save_conversation(c, &session)?;
     Ok(session)
 }
-fn repair_pending_tools(messages: &mut Vec<Value>) {
+pub(crate) fn repair_pending_tools(messages: &mut Vec<Value>) {
     let Some(index) = messages.iter().rposition(|m| m["role"] == "assistant") else {
         return;
     };
@@ -985,6 +997,31 @@ fn recover_commands(
     save_conversation(c, session)
 }
 
+fn sync_operator(c: &Config, s: &mut State, session: &mut Conversation) -> Result<()> {
+    if let Ok(mut record) = crate::operator::read_json(&c.state_dir.join("operator-handoff.json")) {
+        let revision = record["revision"].as_u64().unwrap_or(0);
+        if revision > session.operator_revision {
+            if let Some(notes) = record["notes"].as_array_mut() {
+                notes.retain(|n| {
+                    n["revision"]
+                        .as_u64()
+                        .is_none_or(|r| r > session.operator_revision)
+                });
+            }
+            session.messages.push(json!({"role":"user","content":json!({"operator_update":record,"instruction":"Operator intervention: inspect changed files and reconsider the current task. Continue ordinary refinement, without repeatedly reviewing this update."}).to_string()}));
+            session.operator_revision = revision;
+            if let Ok(goal) = crate::operator::read_json(&c.state_dir.join("operator-goal.json"))
+                && let Some(goal) = goal["goal"].as_str()
+            {
+                s.goal = goal.into();
+            }
+            s.last_validated_tree = None;
+            save(&c.state_dir.join("state.json"), s)?;
+            save_conversation(c, session)?;
+        }
+    }
+    Ok(())
+}
 fn sync_nudge(c: &Config, session: &mut Conversation) -> Result<()> {
     let store = crate::nudge::read(&c.state_dir)?;
     if session.nudge_revision == Some(store.revision) {
@@ -1025,6 +1062,12 @@ fn work(
     let mut summary = String::new();
     for step in 0..c.implementation_calls {
         m.pause_point();
+        if m.controls.stopped_while_held() {
+            return Err(crate::provider::Stopped(
+                "Stopped while paused; continuation retained".into(),
+            )
+            .into());
+        }
         anyhow::ensure!(!stop.load(Ordering::SeqCst), "Stopped by operator");
         crate::workspace::check(&s.working_workspace, &s.working_branch)?;
         let command_updates = jobs.monitor(c, s.current_task.as_ref(), m, stop)?;
@@ -1072,6 +1115,7 @@ fn work(
                 true,
             )?;
         }
+        sync_operator(c, s, session)?;
         sync_nudge(c, session)?;
         let allow_completion = load(config_path)?.allow_goal_completion;
         session.tools = crate::model::tools();
@@ -1101,6 +1145,7 @@ fn work(
             session.messages.push(json!({"role":"user","content":"The visible project changed outside your last recorded actions. Inspect the current files before editing; human work and commits must be preserved."}));
         }
         session.observed_tree = proposal_tree.clone();
+        let proposal_generation = m.controls.changed.load(Ordering::SeqCst);
         let response = match m.chat(&session.messages, Some(session.tools.clone()), false) {
             Ok(response) => response,
             Err(error) => {
@@ -1152,6 +1197,12 @@ fn work(
         session.messages.push(response);
         save_conversation(c, session)?;
         m.pause_point();
+        if m.controls.stopped_while_held() {
+            return Err(crate::provider::Stopped(
+                "Stopped while paused; pending tools were not executed".into(),
+            )
+            .into());
+        }
         if calls.is_empty() {
             break;
         }
@@ -1168,6 +1219,12 @@ fn work(
         }
         for (index, call) in calls.iter().enumerate() {
             m.pause_point();
+            if m.controls.stopped_while_held() {
+                return Err(crate::provider::Stopped(
+                    "Stopped while paused; remaining tools were not executed".into(),
+                )
+                .into());
+            }
             crate::workspace::check(&s.working_workspace, &s.working_branch)?;
             let had_running_commands = jobs.running();
             completed_commands.extend(jobs.refresh_finished(stop)?);
@@ -1196,6 +1253,13 @@ fn work(
             };
             let previous_task = s.task_serial;
             let result: Result<String> = (|| {
+                if m.controls.changed.load(Ordering::SeqCst) != proposal_generation {
+                    finish_requested = None;
+                    project_completion = None;
+                    anyhow::bail!(
+                        "Not executed: an operator changed the project or goal. Re-read current state and replan after this tool batch."
+                    );
+                }
                 anyhow::ensure!(
                     project_completion.is_none(),
                     "Goal completion already reported; remaining actions were not executed"
@@ -1583,24 +1647,8 @@ fn work(
     })
 }
 
-pub fn reopen_goal(path: &Path) -> Result<()> {
-    let c = load(path)?;
-    let _lock = lock_project(&c)?;
-    let report = c.state_dir.join("goal-completion.json");
-    if report.exists() {
-        fs::remove_file(report)?;
-    }
-    // The full completion report remains in the cycle artifacts.
-    Ok(())
-}
-
 pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()> {
-    run_controlled(
-        path,
-        count,
-        stop,
-        Arc::new(crate::run_control::RunControl::default()),
-    )
+    crate::engine::run(path, count, stop)
 }
 pub fn run_controlled(
     path: &Path,
@@ -1609,9 +1657,14 @@ pub fn run_controlled(
     controls: Arc<crate::run_control::RunControl>,
 ) -> Result<()> {
     controls.bind_stop(stop.clone());
+    controls.configure(path);
     let c = load(path)?;
     crate::setup::ensure_git_identity(&c.repo)?;
-    let _lock = lock_project(&c)?;
+    let _lock = if controls.owns_project.load(Ordering::SeqCst) {
+        Vec::new()
+    } else {
+        lock_project(&c)?
+    };
     crate::workspace::recover_promotion(&c.repo)?;
     let mut state = prepare_state(&c)?;
     crate::workspace::ignore_runtime(&c.repo, &c.state_dir)?;
@@ -1625,7 +1678,7 @@ pub fn run_controlled(
         fs::remove_file(c.state_dir.join("goal-completion.json"))?;
     }
     let mut session = load_conversation(&c, &state)?;
-    session.messages.push(json!({"role":"user","content":format!("Current visible project folder: {}. Branch: {}. HEAD: {}. Work directly here. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work; completed tasks may create normal commits.",state.working_workspace.display(),state.working_branch,state.branch_head)}));
+    session.messages.push(json!({"role":"user","content":format!("Current overall goal: {}. Current visible project folder: {}. Branch: {}. HEAD: {}. Work directly here. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work; completed tasks may create normal commits.",c.goal,state.working_workspace.display(),state.working_branch,state.branch_head)}));
     save_conversation(&c, &session)?;
     crate::events::log(format!(
         "Working directly in {} on {}",
@@ -1661,6 +1714,7 @@ pub fn run_controlled(
             break;
         }
         crate::workspace::check(&state.working_workspace, &state.working_branch)?;
+        controls.cycle_active(true);
         state.cycle += 1;
         while c
             .state_dir
@@ -1695,7 +1749,8 @@ pub fn run_controlled(
             state.cycle
         ));
         start_migration_handoff(&c, &state, &mut session)?;
-        let result = work(
+        let work_generation = controls.changed.load(Ordering::SeqCst);
+        let mut result = work(
             path,
             &c,
             &mut state,
@@ -1715,8 +1770,20 @@ pub fn run_controlled(
             ));
         }
         model.pause_point();
+        if controls.stopped_while_held() {
+            save_conversation(&c, &session)?;
+            break;
+        }
         crate::events::send(crate::events::Event::Phase("Check".into()));
         crate::workspace::check(&state.working_workspace, &state.working_branch)?;
+        sync_operator(&c, &mut state, &mut session)?;
+        if controls.changed.load(Ordering::SeqCst) != work_generation
+            && let Ok(result) = &mut result
+        {
+            result.finish_requested = None;
+            result.project_completion = None;
+        }
+        let check_generation = controls.changed.load(Ordering::SeqCst);
         let before_check = working_tree(&state.working_workspace, &c.state_dir)?;
         let validation = (|| -> Result<Vec<CheckResult>> {
             if c.checks.is_empty() {
@@ -1746,8 +1813,21 @@ pub fn run_controlled(
         let results = validation.unwrap_or_default();
         emit(&art, "verification", &results)?;
         model.pause_point();
+        if controls.stopped_while_held() {
+            save_conversation(&c, &session)?;
+            break;
+        }
+        let same_generation = controls.changed.load(Ordering::SeqCst) == check_generation;
+        if !same_generation {
+            sync_operator(&c, &mut state, &mut session)?;
+            if let Ok(result) = &mut result {
+                result.finish_requested = None;
+                result.project_completion = None;
+            }
+        }
         let saved_candidate = working_tree(&state.working_workspace, &c.state_dir)?;
-        let mut checked_same_files = before_check == after_check && after_check == saved_candidate;
+        let mut checked_same_files =
+            same_generation && before_check == after_check && after_check == saved_candidate;
         let mut passed =
             !results.is_empty() && results.iter().all(|r| r.passed) && checked_same_files;
         crate::events::send(crate::events::Event::Phase("Review".into()));
@@ -1919,6 +1999,10 @@ pub fn run_controlled(
                 "Paused · {}",
                 error.as_deref().unwrap_or("Provider unavailable")
             )));
+            break;
+        }
+        controls.cycle_active(false);
+        if controls.finish_requested_cycle() {
             break;
         }
         if time_up() || count.is_some_and(|n| completed >= n) {
@@ -2100,6 +2184,7 @@ pub fn migration_preview(path: &Path) -> Result<String> {
 }
 pub fn migration_apply(path: &Path, clear_staging: bool) -> Result<()> {
     let c = load(path)?;
+    crate::engine::close_idle(path)?;
     let _lock = lock_project(&c)?;
     let mut s: State = serde_json::from_slice(&fs::read(c.state_dir.join("state.json"))?)?;
     let preview = crate::migration::load(&c.state_dir)?;

@@ -48,7 +48,7 @@ splash screen, in-place settings and goal drafting, and a live run dashboard.
 The dashboard shows the current task and stage, model output as it arrives,
 tool actions, check output, recovery messages, and recent outcomes.
 
-- **1–5 / Tab:** switch between live activity, model output, checks, the goal, and local settings.
+- **1–6 / Tab:** switch between live activity, model output, checks, the goal, local settings, and chat.
 - **Arrow keys / mouse wheel / Page Up / Page Down:** scroll without pausing work.
   Scrolling back to the bottom automatically resumes following live output.
 - **Home:** oldest retained output. **End / F:** follow live output again.
@@ -99,7 +99,8 @@ This preserves the current cycle, conversation, and pending tool calls without
 starting a new session. Already-started commands may still finish; pausing does
 not suspend operating-system processes. The run timer stops while the cycle is
 held. Pressing P again while a pause is pending cancels it. Ctrl+C or Q releases
-the pause and requests the usual stop after the cycle.
+the held continuation and saves without launching new work. Other holds, such as
+active hours or operator editing, remain independent of the manual pause.
 
 Choose **Run duration** from the home menu to set a project-specific duration
 in hours (fractional hours work; 0 means unlimited). The observation view shows
@@ -123,6 +124,104 @@ apply immediately against active elapsed time since this run started, excluding
 time held by P. Shortening the duration below elapsed time requests a stop after
 the current cycle; extending it allows additional time. Resuming a stopped run
 starts a new timer.
+
+## Active hours
+
+Open **Settings → This project · Active hours** (also available in tab 5).
+Choose Always allowed, custom hours, or the shared default under Shared settings.
+Set opening and closing times, weekdays, and a named timezone. Overnight windows
+belong to the day they open; daylight-saving changes follow that timezone.
+Existing projects remain Always allowed until you opt in.
+
+At closing time choose either:
+
+- **Finish current call:** finish the model response or tool action, then pause
+  before the next operation. Tools returned by that response wait for reopening.
+- **Finish current cycle:** continue through checks and saving, then pause before
+  another cycle. This can run well past the closing time. Provider backoff outside
+  hours parks the unfinished cycle instead of retrying throughout the day.
+
+These hours control **only the autonomous loop**. Chat and inspection remain
+available. Already-started processes may finish, and Ollama may retain its model
+in memory; the schedule does not unload a shared server's models.
+
+You can resume outside hours: choose **Run until the next scheduled stop**,
+**Run one cycle now**, or **Wait for active hours**. This leaves your saved schedule
+unchanged. A scheduled reopening never cancels a manual pause or another session's
+editing hold. Time spent paused does not consume the run-duration timer.
+
+Keep Chuggin open for scheduled work; it does not install a system scheduler or
+wake a sleeping computer. Closing the last viewer unexpectedly requests a pause
+after a one-minute reconnect grace period and the current operation. Reconnecting
+does not silently clear that manual pause.
+
+## Project chat
+
+Open **Chat with this project** from Home, or tab **6 Chat** during a run.
+Opening Chat does not start the loop. Ask about progress, request an edit, change
+the overall goal, or set a temporary nudge. The chat model can inspect files,
+search saved history, use configured web tools, run commands and checks, save or
+restore checkpoints, and control the loop. These operator controls are not given
+to the autonomous model.
+
+**Enter** sends; **Esc / Ctrl+C** cancel the chat reply; **Ctrl+N** starts a new
+chat; **F2** expands tool details. Tab returns to the observation views. The latest
+chat loads after restarting Chuggin. Chat and loop histories are separate and
+persist under the project's state directory. Older chat can be retrieved through
+the history tools even when it no longer fits in the model's working context.
+
+Chat uses the project model unless you set **This project · Chat model** in
+Settings. Requests sharing an Ollama endpoint are serialized; an interactive
+request gets the next free slot within its controller. The current response is
+allowed to finish. Connection-wide fairness across independent controllers is
+best effort; this is not a server-wide scheduler.
+
+Inspection leaves the loop running. Before an edit or command, Chat waits for a
+safe boundary and takes exclusive editing ownership. It keeps that ownership
+through its checks and repairs. The loop receives a concise change notice and
+reconsiders any stale, unexecuted tools before continuing. Existing commands are
+observable and can be explicitly stopped; a long command is not killed just to
+let Chat edit. Human Git staging and unfinished files are preserved.
+
+## External AI access (MCP)
+
+**Settings → This project · External AI access (MCP)** shows a project-specific
+configuration to copy into another AI application's MCP settings. The server is
+part of the same Rust binary, using the official Rust MCP SDK and local stdio:
+
+~~~json
+{
+  "mcpServers": {
+    "chuggin": {
+      "command": "chuggin",
+      "args": ["mcp", "--project", "/absolute/path/to/project"]
+    }
+  }
+}
+~~~
+
+The project argument may instead name its configuration file. Connecting is an
+explicit opt-in for that project and never starts the loop. TUI, scripted runs,
+and MCP share one local controller and checkout lock. Local IPC currently requires
+Unix; Linux is the tested platform. No separate daemon installation is needed.
+
+The external model calls `open_operator_session`, then uses that session ID on
+the same operator tools as Chat. Mutating calls include a unique `operation_id`;
+retries reuse that ID and the same arguments. `operation_status` retrieves a
+recorded outcome. Long commands return handles for inspection, input, and stop.
+Status is also exposed as a read-only MCP resource. Credentials and connection
+trust remain in human Settings rather than operator tool results.
+
+If an external harness uses its **own** edit or shell tools, it must acquire
+`begin_edit`, wait until granted, and retain ownership until all its writers
+finish; then call `end_edit`. Chuggin cannot coordinate tools that bypass this
+agreement. This is cooperative coordination, not an operating-system sandbox.
+
+Interrupted actions are recorded as uncertain and are never automatically
+replayed. Interrupted editing retains a recovery hold. Review files and logs,
+confirm any external writers have stopped, then use the recovery tools to release
+that hold. Restoring a snapshot requires a current preview and retains a backup;
+restoration refuses to overwrite human staging.
 
 ## One conversation, continuous refinement
 

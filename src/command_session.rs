@@ -15,16 +15,87 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone)]
+struct Managed {
+    handle: String,
+    actor: String,
+    id: String,
+    log: PathBuf,
+    argv: Vec<String>,
+    child: std::sync::Weak<std::sync::Mutex<Child>>,
+    exited: std::sync::Arc<std::sync::Mutex<Option<std::process::ExitStatus>>>,
+    stopped: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    started: Instant,
+}
+static MANAGED: std::sync::LazyLock<std::sync::Mutex<Vec<Managed>>> =
+    std::sync::LazyLock::new(Default::default);
+pub fn managed_commands() -> Vec<Value> {
+    MANAGED.lock().unwrap().iter().rev().take(100).map(|m| json!({"command_id":m.handle,"actor":m.actor,"job_id":m.id,"argv":m.argv,"running":m.exited.lock().unwrap().is_none() && m.child.strong_count()>0,"log":m.log,"elapsed_seconds":m.started.elapsed().as_secs()})).collect()
+}
+pub fn manage(id: &str, action: &str, args: &Value) -> Result<Value> {
+    let m = MANAGED
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m.handle == id)
+        .cloned()
+        .context("Unknown command; use list_commands")?;
+    let mut written = None;
+    if action != "command_status" {
+        let child = m.child.upgrade().context("Command has ended")?;
+        let mut child = child.lock().unwrap();
+        anyhow::ensure!(m.exited.lock().unwrap().is_none(), "Command has ended");
+        if action == "stop_command" {
+            *m.stopped.lock().unwrap() = Some(
+                args["reason"]
+                    .as_str()
+                    .unwrap_or("Stopped by operator")
+                    .into(),
+            );
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            child.kill()?;
+        } else {
+            let text = args["text"].as_str().unwrap_or("");
+            anyhow::ensure!(text.len() <= 16000, "Input exceeds 16000 bytes");
+            let stdin = child.stdin.as_mut().context("stdin is closed")?;
+            let n = match stdin.write(text.as_bytes()) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                Err(e) => return Err(e.into()),
+            };
+            if args["close_stdin"] == true && n == text.len() {
+                child.stdin.take();
+            }
+            written = Some(n);
+        }
+    }
+    let mut f = fs::File::open(&m.log)?;
+    let bytes = f.metadata()?.len();
+    f.seek(SeekFrom::Start(bytes.saturating_sub(7000)))?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail)?;
+    let exit = *m.exited.lock().unwrap();
+    Ok(
+        json!({"command_id":m.handle,"actor":m.actor,"argv":m.argv,"running":exit.is_none() && m.child.strong_count()>0,"exit_code":exit.and_then(|e|e.code()),"passed":exit.map(|e|e.success()),"output_tail":String::from_utf8_lossy(&tail),"log":m.log,"written_bytes":written}),
+    )
+}
 pub struct Session {
     pub id: String,
     pub log: PathBuf,
     pub argv: Vec<String>,
-    child: Child,
+    child: std::sync::Arc<std::sync::Mutex<Child>>,
+    pid: u32,
+    exited: std::sync::Arc<std::sync::Mutex<Option<std::process::ExitStatus>>>,
     started: Instant,
     next_review: Instant,
     pub reviews: u64,
     pub result: Option<CheckResult>,
     pub stop_reason: Option<String>,
+    external_stop: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 impl Session {
     pub fn start(root: &Path, c: &Check, log: &Path, id: &str) -> Result<Self> {
@@ -63,7 +134,53 @@ impl Session {
             command: c.argv.join(" "),
             path: log.into(),
         });
-        Ok(Self {
+        let pid = child.id();
+        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        let exited = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let external_stop = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut registry = MANAGED.lock().unwrap();
+        if registry.len() >= 1024
+            && let Some(index) = registry.iter().position(|m| m.child.strong_count() == 0)
+        {
+            registry.remove(index);
+        }
+        registry.push(Managed {
+            handle: crate::operator::id(),
+            actor: events::actor(),
+            id: id.into(),
+            log: log.into(),
+            argv: c.argv.clone(),
+            child: std::sync::Arc::downgrade(&child),
+            exited: exited.clone(),
+            stopped: external_stop.clone(),
+            started: Instant::now(),
+        });
+        drop(registry);
+        let monitored = child.clone();
+        let observed = exited.clone();
+        std::thread::spawn(move || {
+            loop {
+                let mut child = monitored.lock().unwrap();
+                let status = child.try_wait();
+                if let Ok(Some(status)) = status {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                    crate::project::unregister_check(pid as i32);
+                    *observed.lock().unwrap() = Some(status);
+                    break;
+                }
+                if status.is_err() {
+                    break;
+                }
+                drop(child);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let session = Self {
+            pid,
+            exited,
             id: id.into(),
             log: log.into(),
             argv: c.argv.clone(),
@@ -73,7 +190,10 @@ impl Session {
             reviews: 0,
             result: None,
             stop_reason: None,
-        })
+            external_stop,
+        };
+        session.persist()?;
+        Ok(session)
     }
     pub fn running(&self) -> bool {
         self.result.is_none()
@@ -85,13 +205,18 @@ impl Session {
         self.next_review = Instant::now() + Duration::from_secs(seconds.clamp(1, 900));
     }
     fn cleanup(&mut self) {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        let mut child = self.child.lock().unwrap();
+        if self.exited.lock().unwrap().is_none() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(self.pid as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            if let Ok(status) = child.wait() {
+                *self.exited.lock().unwrap() = Some(status);
+            }
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        crate::project::unregister_check(self.child.id() as i32);
+        crate::project::unregister_check(self.pid as i32);
     }
     pub fn tail(&self) -> Result<String> {
         let mut f = fs::File::open(&self.log)?;
@@ -115,9 +240,13 @@ impl Session {
         Ok(())
     }
     pub fn poll(&mut self, milliseconds: u64, stop: &AtomicBool) -> Result<Value> {
+        if let Some(reason) = self.external_stop.lock().unwrap().clone() {
+            self.stop_reason = Some(reason);
+        }
         let deadline = Instant::now() + Duration::from_millis(milliseconds.min(1000));
         while self.running() {
-            if let Some(status) = self.child.try_wait()? {
+            let exit_status = *self.exited.lock().unwrap();
+            if let Some(status) = exit_status {
                 self.finish(status.code(), status.success())?;
                 break;
             }
@@ -148,7 +277,8 @@ impl Session {
         if !self.running() {
             return Ok(());
         }
-        if let Some(status) = self.child.try_wait()? {
+        let exit_status = *self.exited.lock().unwrap();
+        if let Some(status) = exit_status {
             return self.finish(status.code(), status.success());
         }
         self.stop_reason = Some(reason.into());
@@ -157,14 +287,15 @@ impl Session {
     pub fn input(&mut self, text: &str, close: bool) -> Result<usize> {
         anyhow::ensure!(self.running(), "Command has finished");
         anyhow::ensure!(text.len() <= 16000, "Input exceeds 16000 bytes");
-        let stdin = self.child.stdin.as_mut().context("stdin is closed")?;
+        let mut child = self.child.lock().unwrap();
+        let stdin = child.stdin.as_mut().context("stdin is closed")?;
         let written = match stdin.write(text.as_bytes()) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
             Err(e) => return Err(e.into()),
         };
         if close && written == text.len() {
-            self.child.stdin.take();
+            child.stdin.take();
         }
         Ok(written)
     }
@@ -179,7 +310,7 @@ impl Session {
             self.log.file_name().unwrap_or_default().to_string_lossy()
         );
         Ok(
-            json!({"command_id":self.id,"argv":self.argv,"running":self.running(),"elapsed_seconds":self.started.elapsed().as_secs(),"next_review_seconds":self.next_review.saturating_duration_since(Instant::now()).as_secs(),"watchdog_reviews":self.reviews,"log_bytes":fs::metadata(&self.log)?.len(),"seconds_since_output":fs::metadata(&self.log)?.modified().ok().and_then(|t|t.elapsed().ok()).map(|d|d.as_secs()),"processes":process_observations(self.child.id()),"exit_code":self.result.as_ref().and_then(|r|r.exit_code),"passed":self.result.as_ref().map(|r|r.passed),"timed_out":false,"stop_reason":self.stop_reason,"output_tail":self.tail()?,"log_id":log_id,"instruction":"If running, inspect relevant evidence or use command_status to wait. Do not launch duplicates or edit files being checked. A running command is not a passing check."}),
+            json!({"pid":self.pid,"command_id":self.id,"argv":self.argv,"running":self.running(),"elapsed_seconds":self.started.elapsed().as_secs(),"next_review_seconds":self.next_review.saturating_duration_since(Instant::now()).as_secs(),"watchdog_reviews":self.reviews,"log_bytes":fs::metadata(&self.log)?.len(),"seconds_since_output":fs::metadata(&self.log)?.modified().ok().and_then(|t|t.elapsed().ok()).map(|d|d.as_secs()),"processes":process_observations(self.pid),"exit_code":self.result.as_ref().and_then(|r|r.exit_code),"passed":self.result.as_ref().map(|r|r.passed),"timed_out":false,"stop_reason":self.stop_reason,"output_tail":self.tail()?,"log_id":log_id,"instruction":"If running, inspect relevant evidence or use command_status to wait. Do not launch duplicates or edit files being checked. A running command is not a passing check."}),
         )
     }
     fn persist(&self) -> Result<()> {

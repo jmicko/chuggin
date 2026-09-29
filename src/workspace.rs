@@ -50,6 +50,7 @@ pub fn paths(root: &Path, state: Option<&Path>) -> Result<Vec<String>> {
         ".".into(),
         ":(exclude).chuggin".into(),
         ":(exclude)chuggin.json".into(),
+        ":(exclude,glob)**/.chuggin-save-*".into(),
     ];
     if let Some(state) = state
         && let Ok(relative) = state.strip_prefix(fs::canonicalize(root)?)
@@ -416,6 +417,7 @@ pub fn ignore_runtime(root: &Path, state: &Path) -> Result<()> {
     let mut names = vec![
         format!("{prefix}.chuggin/"),
         format!("{prefix}chuggin.json"),
+        ".chuggin-save-*".into(),
     ];
     if let Ok(relative) = state.strip_prefix(root)
         && !relative.as_os_str().is_empty()
