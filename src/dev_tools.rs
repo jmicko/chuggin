@@ -15,13 +15,76 @@ use std::{
 
 pub fn schemas() -> Vec<Value> {
     vec![
-        json!({"type":"function","function":{"name":"command_status","description":"Inspect or wait briefly for an existing command; returns output tail, elapsed time, running status and final result. Do not start duplicate commands. Polls are not new tests.","parameters":{"type":"object","properties":{"command_id":{"type":"string"},"wait_ms":{"type":"integer","minimum":0,"maximum":1000}},"required":["command_id"]}}}),
+        json!({"type":"function","function":{"name":"command_status","description":"Inspect an existing command, or wait up to 60 seconds for completion or new output. Use next_output_offset and log_id from the previous reply as output_offset and output_log_id to receive only new output. A changed log (for the next check in a batch) restarts the cursor automatically. Read older/full output with read_command_log. Do not start duplicate commands; polls are not new tests.","parameters":{"type":"object","properties":{"command_id":{"type":"string"},"wait_ms":{"type":"integer","minimum":0,"maximum":60000},"output_offset":{"type":"integer","minimum":0},"output_log_id":{"type":"string"}},"required":["command_id"]}}}),
         json!({"type":"function","function":{"name":"command_input","description":"Send text to an existing command stdin, optionally closing stdin. No implicit newline; include it when needed.","parameters":{"type":"object","properties":{"command_id":{"type":"string"},"text":{"type":"string"},"close_stdin":{"type":"boolean"}},"required":["command_id"]}}}),
         json!({"type":"function","function":{"name":"stop_command","description":"Terminate a command and its descendants when evidence establishes it should stop. Provide an explanation; preserve files for repair.","parameters":{"type":"object","properties":{"command_id":{"type":"string"},"reason":{"type":"string"}},"required":["command_id","reason"]}}}),
-        json!({"type":"function","function":{"name":"run_command","description":"Run an executable with argv in the private task workspace. Examples: [\"cargo\",\"test\",\"test_name\"], [\"cargo\",\"fmt\"]. No implicit shell; pipes/redirection are literal arguments. Returns promptly with a command_id and running status if unfinished. Use command_status, command_input or stop_command. timeout_seconds is an initial watchdog review interval, NOT an automatic kill deadline. Background children are cleaned up when the command finishes. Returns exit_code, output tail and log_id. Honor task scope. Do not commit, reset Git, modify Chuggin state or operate outside this workspace. Configured final checks still run independently.","parameters":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":86400},"reason":{"type":"string","description":"Optional purpose: what new evidence this run should obtain, especially for repeated trials or polling."}},"required":["argv"]}}}),
+        json!({"type":"function","function":{"name":"run_command","description":"Run an executable with argv in the visible project folder. The task plan guides the work and can be revised as evidence changes. No implicit shell: for pipes/redirection explicitly use [\"sh\",\"-c\",\"command | other-command\"], or separate tool calls. Returns promptly with a command_id and running status if unfinished. Use command_status, command_input or stop_command. timeout_seconds is an initial watchdog review interval, NOT an automatic kill deadline. Background children are cleaned up when the command finishes. Returns exit_code, output tail and log_id; use read_command_log for full logs. Do not commit, reset Git, modify Chuggin state or operate outside the project. Configured final checks still run independently.","parameters":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":86400},"reason":{"type":"string","description":"Optional purpose: what new evidence this run should obtain, especially for repeated trials or polling."}},"required":["argv"]}}}),
         json!({"type":"function","function":{"name":"compiler_diagnostics","description":"Run cargo check --all-targets and group Rust errors/warnings with source locations, snippets and compiler suggestions. Use after compiler failure rather than guessing APIs. This does not run tests or replace run_checks. Full raw output is available through log_id.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"read_command_log","description":"Read an earlier command/diagnostics log, including prior cycles, in bounded byte chunks. Use the complete log_id and next_offset returned by tools; do not repeat the same offset.","parameters":{"type":"object","properties":{"log_id":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["log_id"]}}}),
     ]
+}
+/// Catch the common accidental argv encoding of a shell pipeline. Quoted shell
+/// programs remain explicit; ordinary arguments containing punctuation are valid.
+pub fn validate_argv(argv: &[String]) -> Result<()> {
+    anyhow::ensure!(
+        !argv.is_empty() && !argv[0].is_empty() && argv.len() <= 128,
+        "Supply an executable and at most 127 arguments"
+    );
+    anyhow::ensure!(
+        argv.iter().all(|s| !s.contains('\0'))
+            && argv.iter().map(String::len).sum::<usize>() <= 16000,
+        "Command arguments too large or contain NUL"
+    );
+    let shell = Path::new(&argv[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "sh" | "bash" | "dash" | "zsh" | "fish"));
+    let shell_program = shell
+        && argv
+            .iter()
+            .any(|arg| arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'));
+    let literal_text = Path::new(&argv[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "printf" | "echo" | "rg" | "grep" | "fgrep" | "egrep" | "sed" | "awk" | "jq"
+            )
+        });
+    // `shell -c script` owns its following positional arguments as well.
+    if !shell_program && !literal_text {
+        anyhow::ensure!(
+            !argv.iter().skip(1).any(|arg| matches!(
+                arg.as_str(),
+                "|" | "||" | "&&" | ";" | ">" | ">>" | "<" | "2>" | "2>>" | "2>&1"
+            )),
+            "argv runs an executable directly: shell pipes and redirection are not interpreted. Use separate tools, or explicitly pass [\"sh\", \"-c\", \"your command | next command\"]. No command was started."
+        );
+    }
+    Ok(())
+}
+
+/// Explain the appropriate evidence tool without granting access to state files.
+pub fn log_guidance(path: &str) -> Option<String> {
+    let components: Vec<_> = Path::new(path)
+        .components()
+        .filter_map(|part| part.as_os_str().to_str())
+        .collect();
+    let filename = components.last()?;
+    if !log_filename(filename) {
+        return None;
+    }
+    let id = components
+        .iter()
+        .rev()
+        .skip(1)
+        .find(|part| cycle_name(part))
+        .map(|cycle| format!("{cycle}/{filename}"))
+        .unwrap_or_else(|| (*filename).to_owned());
+    Some(format!(
+        "Command evidence is read through read_command_log, not read_file. Use read_command_log with log_id {id:?} and offset 0; follow next_offset for subsequent pages."
+    ))
 }
 #[cfg(test)]
 pub fn run(root: &Path, art: &Path, id: &str, args: &Value, stop: &AtomicBool) -> Result<Value> {
@@ -127,7 +190,12 @@ pub fn read_log(art: &Path, args: &Value) -> Result<Value> {
         art
     };
     let path = project::safe_path(root, id)?;
-    anyhow::ensure!(fs::metadata(&path)?.is_file(), "Log is not a regular file");
+    anyhow::ensure!(
+        fs::metadata(&path)
+            .with_context(|| format!("Cannot read command log {id:?}; use the exact log_id returned by a command tool (including its cycle directory when supplied)"))?
+            .is_file(),
+        "Log is not a regular file"
+    );
     let mut file = fs::File::open(path)?;
     let total = file.metadata()?.len();
     let offset = match args.get("offset") {
@@ -138,9 +206,15 @@ pub fn read_log(art: &Path, args: &Value) -> Result<Value> {
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = Vec::new();
     file.take(6000).read_to_end(&mut bytes)?;
+    if let Err(error) = std::str::from_utf8(&bytes)
+        && error.error_len().is_none()
+        && error.valid_up_to() > 0
+    {
+        bytes.truncate(error.valid_up_to());
+    }
     let next = offset + bytes.len() as u64;
     Ok(
-        json!({"log_id":id,"offset":offset,"total_bytes":total,"text":String::from_utf8_lossy(&bytes),"next_offset":if next<total{Some(next)}else{None}}),
+        json!({"log_id":id,"offset":offset,"total_bytes":total,"text":String::from_utf8_lossy(&bytes),"complete":next>=total,"truncated":next<total,"next_offset":if next<total{Some(next)}else{None}}),
     )
 }
 #[cfg(test)]
@@ -256,6 +330,63 @@ pub(crate) fn summarize(root: &Path, raw: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shell_operators_require_an_explicit_shell_but_literal_text_remains_valid() {
+        let argv = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| (*item).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let error = validate_argv(&argv(&[
+            "git",
+            "show",
+            "HEAD:src/main.rs",
+            "|",
+            "sed",
+            "-n",
+            "1,30p",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(validate_argv(&argv(&["printf", "%s", "|"])).is_ok());
+        assert!(validate_argv(&argv(&["rg", "|", "src"])).is_ok());
+        assert!(error.contains("No command was started"));
+        assert!(
+            validate_argv(&argv(&[
+                "sh",
+                "-c",
+                "git show HEAD:src/main.rs | sed -n '1,30p'"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            validate_argv(&argv(&[
+                "printf",
+                "%s",
+                "literal $(touch unexpected) ; | >"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            validate_argv(&argv(&[
+                "/bin/bash",
+                "-lc",
+                "printf '%s' \"$1\"",
+                "argument",
+                "|"
+            ]))
+            .is_ok()
+        );
+    }
+    #[test]
+    fn reserved_command_paths_explain_the_log_reader_and_cycle_id() {
+        let message = log_guidance(".chuggin/cycle-000748/command-0-20.log").unwrap();
+        assert!(message.contains("read_command_log"));
+        assert!(message.contains("cycle-000748/command-0-20.log"));
+        assert!(log_guidance("src/command_session.rs").is_none());
+        assert!(log_guidance(".chuggin/state.json").is_none());
+    }
     #[test]
     fn json_encoded_argv_is_normalized_without_shell_interpretation() {
         let root = tempfile::tempdir().unwrap();

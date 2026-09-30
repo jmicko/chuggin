@@ -6,6 +6,14 @@ persistent conversation, retained work, nudges, optional goal completion,
 repetition recovery, provider backoff, and full-screen observation interface.
 The implementation remains Rust and ships as one executable.
 
+September 30 implementation note: the first helper slice is now implemented as
+optional, sequential, read-only investigations. Human Settings select the helper
+model and response allowance, globally as new-project defaults or per project.
+The primary conversation remains intact, and helper evidence/results persist.
+See [Investigation helpers](../README.md#investigation-helpers) for current behavior.
+The broader named-connection registry, parallel helper scheduler, editable helper
+snapshots, and cumulative spending policies below remain roadmap items.
+
 Workspace ownership now follows [Visible project workflow](VISIBLE_PROJECT_WORKFLOW.md):
 the parent works in the user’s chosen checkout. Future editing helpers can still
 use isolated snapshots and return changes for integration.

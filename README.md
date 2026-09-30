@@ -70,6 +70,9 @@ The display redraws at up to ten frames per second and keeps 2,000 output lines.
 Its bounded event stream cannot block the agent; full diagnostic logs remain on
 disk. Narrow windows hide the side panel, and resizing does not stop the run.
 Shell settings and the previous terminal screen are restored on exit.
+Terminal window titles start with the project folder, such as
+`werd-ornith-35b · Chuggin`, to distinguish runs in the taskbar. Compatible terminals
+restore the previous title when Chuggin exits.
 
 Updating the executable does not change an already-running process. The new UI
 appears the next time you launch Chuggin. Explicit `chuggin run` commands retain plain
@@ -124,6 +127,37 @@ apply immediately against active elapsed time since this run started, excluding
 time held by P. Shortening the duration below elapsed time requests a stop after
 the current cycle; extending it allows additional time. Resuming a stopped run
 starts a new timer.
+
+**Investigation helpers** in tab 5 opens the same project settings as
+**Settings → This project · Investigation helpers**. Enable helpers, choose their
+model, and set their response allowance there. These permissions remain in human
+Settings; Chat and MCP cannot turn on helpers or authorize another provider.
+
+## Investigation helpers
+
+Helpers are optional and disabled by default. The main model can ask one to
+investigate a focused question with fresh context, then use its findings in the
+existing working conversation. Helpers can read project files, search, inspect
+saved evidence and logs, and use enabled web tools. They cannot edit files, run
+commands, launch other helpers, or decide whether work is complete. Their reports
+are advisory, and main work remains saved even when an investigation is inconclusive.
+
+Choose **Use project model** to use the project's connection, or explicitly
+select an Ollama or Groq model. Ollama uses the project's server; Groq uses the
+configured shared key and request/token budgets. Investigations run sequentially
+with main work. Separate-provider parallel jobs are not enabled by this feature.
+Helper traffic passes through the same provider recovery and quota handling as
+other requests. It does not bypass Groq waits or silently switch providers.
+
+The default allowance is 12 model responses per investigation, adjustable in
+Settings. Reaching it preserves available findings and returns control to the
+main model. Pause and stop apply at safe operation boundaries. The live view
+shows investigation activity; inputs, tool evidence, and results persist under
+`.chuggin/agents/`. Saved results can be retrieved without repeating an investigation.
+
+Model and allowance changes apply to the next investigation; an existing job
+keeps its chosen route and allowance. Shared helper settings are defaults for new
+projects. Existing projects stay disabled until you enable them explicitly.
 
 ## Active hours
 
@@ -241,8 +275,8 @@ tool results, and check feedback are appended to the same history. This keeps
 useful reasoning available and gives Ollama the opportunity to reuse a cached
 prompt prefix instead of processing a different conversation for each activity.
 Actual cache reuse depends on the server, model, and available context.
-Tool definitions are fixed during a run; changes such as enabling web tools are
-applied when the next run starts.
+Tool availability follows project capabilities and enabled settings. Enabling or
+disabling helpers updates their availability on the next main-model request.
 
 Within that conversation the agent can:
 
@@ -306,6 +340,10 @@ and failures are recorded too. These notes work with any language or artifact
 format and remain advisory; current files and observed validation take precedence.
 Notes are stored in full, with replacement or append support. Handoffs include a
 6KB excerpt; `read_progress_note` retrieves the full note through byte pagination.
+Task evidence distinguishes current validation from incidental tool errors and
+older task notes. It records the file state checked, so a past passing result
+does not describe files changed afterward. The working model can search and read
+saved conversation history after a handoff instead of repeating earlier research.
 
 ## Tools and recovery
 
@@ -318,13 +356,17 @@ Setup asks for a validation command appropriate to the project; it only suggests
 `cargo test` when a Cargo manifest exists. Documents and data can use linters,
 consistency checkers, or custom scripts. A validation command is still required.
 
-The model can list files, search literal text, read numbered line ranges, replace
+The model can list files, search literal text within selected paths, read numbered line ranges, replace
 a file, make an exact targeted edit, and run configured checks. Long reads include
 continuation positions. Unique-match edits prevent accidental broad replacement.
 File size alone does not block reads or edits. Very long lines can be retrieved
 exactly using `read_file` byte pagination. Edits and writes replace files atomically,
 preserve existing permissions, and report `changed: false` if the bytes are identical.
 Structured tool results expose fields directly instead of nesting escaped JSON.
+Searches include surrounding lines, pagination, and an explicit completeness
+indicator. Command status can wait for new output or completion instead of rapidly
+polling the same tail. Plans can be updated while commands run; edits and new
+execution still wait until commands using the project have finished.
 Edits can address any relevant project file, including supporting work omitted from
 the original plan. Chuggin configuration, runtime state, and Git control files remain
 protected.
@@ -492,9 +534,9 @@ functions, private/public methods, and name-based reference candidates, with
 paths, line numbers, source snippets, and pagination. It parses Rust syntax, so
 comments and string contents do not appear as references. This is not a language
 server: it does not resolve types, expand macros, or filter inactive cfg branches.
-These helper definitions remain available to keep the tool schema stable; they
-are useful only for the formats they support. They are not required validation
-steps for other projects.
+The loop advertises these Rust tools when the project has a Cargo manifest;
+other projects use the general file, search, and command tools. They are not
+required validation steps for other projects.
 
 ## Optional Brave search and page reading
 

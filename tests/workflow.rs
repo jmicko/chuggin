@@ -4317,3 +4317,240 @@ fn migration_handoff_only_for_changed_agent_files_and_only_one_completed_cycle()
         }
     }
 }
+
+fn named_tool_results(request: &Value, name: &str) -> Vec<Value> {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool" && message["tool_name"] == name)
+        .map(|message| serde_json::from_str(message["content"].as_str().unwrap()).unwrap())
+        .collect()
+}
+
+#[test]
+fn investigation_retains_main_context_and_returns_read_only_evidence() {
+    let mut main_calls = 0;
+    let mut helper_calls = 0;
+    let server = Server::custom(false, false, None, move |body, _| {
+        let helper = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|schema| schema["function"]["name"] == "report_investigation");
+        if helper {
+            helper_calls += 1;
+            return (
+                String::new(),
+                if helper_calls == 1 {
+                    json!([
+                        {"function":{"name":"read_file","arguments":{"path":"value.txt"}}},
+                        {"function":{"name":"search","arguments":{"path":"value.txt","text":"USER_EDIT","context_lines":1}}}
+                    ])
+                } else {
+                    json!([{"function":{"name":"report_investigation","arguments":{
+                        "summary":"The current file still contains the operator's baseline value.",
+                        "findings":["Refine the current value rather than recreate the project."],
+                        "evidence":["value.txt:1 contains USER_EDIT; scoped search returned this match."],
+                        "uncertainties":[],"next_step":"Replace the baseline with REPAIRED_FROM_EVIDENCE and validate."}}}])
+                },
+            );
+        }
+        main_calls += 1;
+        if main_calls == 1 {
+            (
+                "MAIN_ONLY_REASONING_MUST_SURVIVE".into(),
+                json!([
+                    task_tool("Refine the observed value"),
+                    {"function":{"name":"save_progress_note","arguments":{"note":"Baseline observation: inspect value.txt before choosing a fix."}}},
+                    {"function":{"name":"delegate_investigation","arguments":{"question":"What is the current value and what should the next edit accomplish?","evidence":["value.txt"],"model":"groq/UNAUTHORIZED_MODEL"}}}
+                ]),
+            )
+        } else {
+            (
+                String::new(),
+                json!([
+                    {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"REPAIRED_FROM_EVIDENCE"}}},
+                    {"function":{"name":"finish_task","arguments":{"summary":"Refined the existing value after inspecting current evidence.","task_id":1}}}
+                ]),
+            )
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let config = fixture(root.path(), &server.url, true);
+    let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    settings["helpers"] = json!({"enabled":true,"model":"","max_calls":4});
+    fs::write(config, settings.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    let original = requests[0]["messages"].as_array().unwrap();
+    let resumed = requests[3]["messages"].as_array().unwrap();
+    assert_eq!(&resumed[..original.len()], original);
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("MAIN_ONLY_REASONING_MUST_SURVIVE")
+    );
+    assert_eq!(requests[1]["messages"].as_array().unwrap().len(), 2);
+    assert!(
+        !requests[1]["messages"]
+            .to_string()
+            .contains("MAIN_ONLY_REASONING_MUST_SURVIVE")
+    );
+    assert!(
+        requests[1]["messages"]
+            .to_string()
+            .contains("Refine the observed value")
+    );
+    for request in &requests[1..3] {
+        assert_eq!(
+            request["model"], "fake",
+            "A tool argument cannot change the human-approved helper route"
+        );
+        for schema in request["tools"].as_array().unwrap() {
+            assert!(!matches!(
+                schema["function"]["name"].as_str(),
+                Some(
+                    "write_file"
+                        | "edit_file"
+                        | "run_command"
+                        | "finish_task"
+                        | "delegate_investigation"
+                )
+            ));
+        }
+    }
+    let read = named_tool_results(&requests[2], "read_file");
+    assert_eq!(read[0]["ok"], true);
+    assert!(read[0]["result"].to_string().contains("USER_EDIT"));
+    let search = named_tool_results(&requests[2], "search");
+    assert_eq!(search[0]["ok"], true);
+    assert_eq!(search[0]["result"]["matches"][0]["path"], "value.txt");
+    let report = named_tool_results(&requests[3], "delegate_investigation");
+    assert_eq!(report[0]["ok"], true);
+    assert_eq!(report[0]["result"]["status"], "completed");
+    assert!(
+        report[0]["result"]
+            .to_string()
+            .contains("REPAIRED_FROM_EVIDENCE")
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/value.txt")).unwrap(),
+        "REPAIRED_FROM_EVIDENCE"
+    );
+    assert!(state(root.path())["current_task"].is_null());
+    let jobs: Vec<_> = fs::read_dir(root.path().join("state/agents"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(jobs.len(), 1);
+    let job: Value = serde_json::from_slice(&fs::read(jobs[0].join("job.json")).unwrap()).unwrap();
+    assert_eq!(job["model"], "fake");
+    assert_eq!(job["calls_used"], 2);
+    assert_eq!(job["max_calls"], 4);
+    assert_eq!(job["status"], "completed");
+}
+
+#[test]
+fn absent_helper_settings_do_not_authorize_an_investigation() {
+    let server = Server::custom(false, false, None, |_, n| {
+        (
+            String::new(),
+            if n == 0 {
+                json!([
+                    task_tool("Work without helpers"),
+                    {"function":{"name":"delegate_investigation","arguments":{"question":"Unauthorized investigation","model":"groq/UNAUTHORIZED_MODEL"}}}
+                ])
+            } else {
+                json!([{"function":{"name":"finish_task","arguments":{"summary":"Inspection complete without delegated work","task_id":1}}}])
+            },
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        !requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|schema| schema["function"]["name"] == "delegate_investigation")
+    );
+    let refused = named_tool_results(&requests[1], "delegate_investigation");
+    assert_eq!(refused[0]["ok"], false);
+    assert!(refused[0]["error"].as_str().unwrap().contains("disabled"));
+    assert!(!root.path().join("state/agents").exists());
+}
+
+#[test]
+fn task_evidence_preserves_validation_failure_separately_from_tool_error() {
+    let server = Server::custom(false, false, None, |_, n| {
+        (
+            String::new(),
+            match n {
+                0 => json!([
+                    task_tool("First investigation"),
+                    {"function":{"name":"save_progress_note","arguments":{"note":"OBSERVATION_FOR_FIRST_TASK"}}}
+                ]),
+                2 => json!([
+                    {"function":{"name":"read_file","arguments":{"path":"missing-file.txt"}}},
+                    {"function":{"name":"read_task_evidence","arguments":{}}}
+                ]),
+                3 => json!([
+                    task_tool("Second investigation"),
+                    {"function":{"name":"read_task_evidence","arguments":{}}}
+                ]),
+                _ => json!([]),
+            },
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, false);
+    run_cycles(root.path(), 1);
+    run_cycles(root.path(), 1);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    let first = named_tool_results(&requests[3], "read_task_evidence");
+    let evidence = &first[0]["result"]["evidence"];
+    assert_eq!(first[0]["result"]["task_id"], 1);
+    assert_eq!(evidence["validation"]["status"], "failing");
+    assert_eq!(evidence["validation"]["current_files_match"], true);
+    assert!(
+        evidence["validation"]["results"]
+            .to_string()
+            .contains("nonexistent-ref")
+    );
+    assert!(
+        evidence["last_tool_error"]
+            .as_str()
+            .unwrap()
+            .contains("read_file")
+    );
+    assert!(
+        evidence["last_tool_error"]
+            .as_str()
+            .unwrap()
+            .contains("No such file")
+    );
+    let second = named_tool_results(&requests[4], "read_task_evidence");
+    let evidence = &second[1]["result"]["evidence"];
+    assert_eq!(second[1]["result"]["task_id"], 2);
+    assert!(evidence["validation"].is_null());
+    assert_eq!(evidence["previous_tasks"][0]["task_id"], 1);
+    assert_eq!(
+        evidence["previous_tasks"][0]["validation_status"],
+        "failing"
+    );
+    assert_eq!(evidence["note_task_id"], 1);
+    assert!(
+        evidence["note_scope"]
+            .as_str()
+            .unwrap()
+            .contains("earlier task")
+    );
+    assert_eq!(evidence["last_tool_error"], "");
+}

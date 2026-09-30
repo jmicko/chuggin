@@ -387,6 +387,19 @@ impl Controller {
             self.controls.hold("operator","Operator disconnected during editing. Resume the session and release ownership after reviewing its commands.");
         }
     }
+    pub(crate) fn update_helpers(&self, args: &Value) -> Result<Value> {
+        let _guard = self.settings.lock().unwrap();
+        check_revision(&self.path, args)?;
+        let mut helpers: crate::agents::Settings = serde_json::from_value(args["helpers"].clone())?;
+        helpers.model = helpers.model.trim().into();
+        helpers.validate()?;
+        let mut config = read_json(&self.path)?;
+        config["helpers"] = serde_json::to_value(helpers)?;
+        crate::setup::save(&self.path, &config)?;
+        Ok(
+            json!({"status":"complete","result":{"revision":config_revision(&self.path)?,"settings":config}}),
+        )
+    }
     pub fn operation_path(&self, session: &str, operation: &str) -> Result<PathBuf> {
         valid_id(session)?;
         valid_id(operation)?;
@@ -586,6 +599,7 @@ impl Controller {
                 }
                 let proposed: runner::Config = serde_json::from_value(v.clone())?;
                 proposed.active_hours.at(chrono::Utc::now())?;
+                proposed.helpers.validate()?;
                 ensure!(
                     !proposed.model.trim().is_empty()
                         && proposed.context_tokens >= 1024
@@ -796,10 +810,11 @@ impl Controller {
                 if name == "command_input" {
                     job.input(args)?;
                 }
-                job.poll(
-                    args["wait_ms"].as_u64().unwrap_or(0).min(1000),
-                    &AtomicBool::new(false),
-                )
+                if name == "command_status" {
+                    job.status(args, &AtomicBool::new(false))
+                } else {
+                    job.poll(0, &AtomicBool::new(false))
+                }
             }
             _ => {
                 let version = if name == "read_file" {

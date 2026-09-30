@@ -42,6 +42,10 @@ impl ActionWatch {
                 name,
                 "read_file"
                     | "read_progress_note"
+                    | "read_task_evidence"
+                    | "read_history"
+                    | "search_history"
+                    | "read_agent_result"
                     | "search"
                     | "list_files"
                     | "project_map"

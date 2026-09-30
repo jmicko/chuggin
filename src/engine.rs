@@ -200,6 +200,16 @@ impl Client {
     pub fn call(&self, session: &str, name: &str, args: Value, operation: &str) -> Result<Value> {
         self.request(json!({"action":"call","session_id":session,"name":name,"arguments":args,"operation_id":operation}))
     }
+    /// Human UI only: this operation is deliberately absent from chat/MCP schemas.
+    pub fn update_helpers(
+        &self,
+        revision: &Value,
+        helpers: &crate::agents::Settings,
+    ) -> Result<Value> {
+        self.request(
+            json!({"action":"helper_settings","expected_revision":revision,"helpers":helpers}),
+        )
+    }
 }
 struct Engine {
     controller: Arc<Controller>,
@@ -272,6 +282,7 @@ impl Engine {
                 self.controller.status()
             }
             "retry" => Ok(json!({"retry_queued":self.controller.controls.retry_now()})),
+            "helper_settings" => self.controller.update_helpers(&v),
             "force_stop" => {
                 crate::project::kill_active_check();
                 self.quit.store(true, Ordering::SeqCst);

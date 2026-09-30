@@ -42,6 +42,7 @@ pub struct Model {
     run_controls: Option<(Arc<AtomicBool>, Instant)>,
     pub(crate) controls: Arc<crate::run_control::RunControl>,
     request_target: RefCell<(String, String)>,
+    pinned_target: Option<(String, String, PathBuf)>,
 }
 impl Model {
     pub fn new(
@@ -71,6 +72,7 @@ impl Model {
             run_controls: None,
             controls: Arc::new(crate::run_control::RunControl::default()),
             request_target: RefCell::new((name.into(), crate::groq::url(url, name))),
+            pinned_target: None,
         })
     }
     pub fn take_completed_messages(&self) -> Option<Vec<Value>> {
@@ -93,8 +95,10 @@ impl Model {
         self.settings_path = Some(path.into());
         self.chat_settings = Some(session.join("provider-wait.json"));
     }
-    fn selected_name<'a>(&self, c: &'a crate::runner::Config) -> &'a str {
-        if self.chat_settings.is_some() && !c.chat_model.trim().is_empty() {
+    fn selected_name<'a>(&'a self, c: &'a crate::runner::Config) -> &'a str {
+        if let Some((name, _, _)) = &self.pinned_target {
+            name
+        } else if self.chat_settings.is_some() && !c.chat_model.trim().is_empty() {
             &c.chat_model
         } else {
             &c.model
@@ -103,11 +107,31 @@ impl Model {
     pub fn use_run_controls(&mut self, stop: Arc<AtomicBool>, started: Instant) {
         self.run_controls = Some((stop, started));
     }
+    pub(crate) fn stopped(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+    pub(crate) fn configure_helper(
+        &self,
+        helper: &mut Model,
+        config_path: &Path,
+        jobdir: &Path,
+        name: &str,
+        url: &str,
+    ) {
+        helper.stop = self.stop.clone();
+        helper.controls = self.controls.clone();
+        helper.run_controls = self.run_controls.clone();
+        helper.settings_path = Some(config_path.into());
+        helper.pinned_target = Some((name.into(), url.into(), jobdir.join("provider-wait.json")));
+    }
     pub fn pause_point(&self) {
         self.controls
             .wait_until_resumed(|| self.stop.load(Ordering::SeqCst));
     }
     fn provider_target(&self) -> Result<(String, String, Option<PathBuf>)> {
+        if let Some((name, url, wait)) = &self.pinned_target {
+            return Ok((name.clone(), url.clone(), Some(wait.clone())));
+        }
         if let Some(path) = &self.settings_path {
             let c = crate::runner::load(path)?;
             Ok((
@@ -399,6 +423,10 @@ impl Model {
             .as_ref()
             .map(|c| crate::groq::url(&c.ollama_url, self.selected_name(c)))
             .unwrap_or_else(|| self.url.clone());
+        let url = self
+            .pinned_target
+            .as_ref()
+            .map_or(url, |(_, url, _)| url.clone());
         let timeout = live
             .as_ref()
             .map(|c| c.request_timeout_seconds)
@@ -750,7 +778,6 @@ pub fn tools() -> Value {
      {"type":"function","function":{"name":"read_file","description":"Read numbered lines from files of any size. Follow start_line continuation. For long lines or exact text use byte_offset and follow next_byte_offset.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"line_count":{"type":"integer"},"byte_offset":{"type":"integer","minimum":0}},"required":["path"]}}},
      {"type":"function","function":{"name":"edit_file","description":"Replace an exact, unique old_text occurrence with new_text, atomically. Reports changed=false for identical content. Supply exact file text without line-number prefixes.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}}},
      {"type":"function","function":{"name":"list_files","description":"List project paths.","parameters":{"type":"object","properties":{}}}},
-     {"type":"function","function":{"name":"search","description":"Find literal text in project files; returns paths and line numbers.","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}},
      {"type":"function","function":{"name":"write_file","description":"Create or replace a project file. Read existing files first. Use project-relative paths; preserve operator settings and Git metadata.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
      {"type":"function","function":{"name":"run_checks","description":"Start the operator-configured validation commands sequentially. If unfinished, returns running=true and command_id; use command_status to inspect or wait. A running check is not a passing check. Long-running checks are reviewed by a watchdog rather than automatically killed.","parameters":{"type":"object","properties":{}}}}
     ]);
@@ -759,12 +786,35 @@ pub fn tools() -> Value {
         .unwrap()
         .extend(crate::dev_tools::schemas());
     tools.as_array_mut().unwrap().push(crate::symbols::schema());
+    tools.as_array_mut().unwrap().push(crate::search::schema());
+    tools
+        .as_array_mut()
+        .unwrap()
+        .extend(crate::history::schemas());
+    tools.as_array_mut().unwrap().push(json!({"type":"function","function":{"name":"read_task_evidence","description":"Read the active task, validation evidence tagged with the checked file state, attempted actions, separate tool errors and older task notes. Check current_files_match before trusting a previous validation result.","parameters":{"type":"object","properties":{}}}}));
+    // Reading old reports never authorizes a new helper request.
+    tools
+        .as_array_mut()
+        .unwrap()
+        .push(crate::agents::schemas().remove(1));
     if crate::web_tools::enabled() {
         tools
             .as_array_mut()
             .unwrap()
             .extend(crate::web_tools::schemas());
     }
+    tools
+}
+pub(crate) fn project_tools(root: &Path) -> Value {
+    let mut tools = tools();
+    let rust_project = root.join("Cargo.toml").is_file();
+    tools.as_array_mut().unwrap().retain(|tool| {
+        rust_project
+            || !matches!(
+                tool["function"]["name"].as_str(),
+                Some("compiler_diagnostics" | "lookup_symbol")
+            )
+    });
     tools
 }
 #[cfg(test)]

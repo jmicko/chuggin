@@ -712,6 +712,17 @@ pub(crate) fn outcome_label(disposition: &str) -> &str {
         historical => historical,
     }
 }
+#[derive(Default)]
+struct HelperActivity {
+    actor: String,
+    model: String,
+    request_active: bool,
+    wait: Option<(String, u64)>,
+    calls: u64,
+    prompt: u64,
+    generated: u64,
+    speed: f64,
+}
 struct Dashboard {
     workspace: String,
     workspace_branch: String,
@@ -730,6 +741,7 @@ struct Dashboard {
     speed: f64,
     request_active: bool,
     provider_wait: Option<u64>,
+    helper: Option<HelperActivity>,
     checkpoints: u64,
     completed_cycles: u64,
     started: Instant,
@@ -787,6 +799,7 @@ impl Dashboard {
             speed: 0.,
             request_active: false,
             provider_wait: None,
+            helper: None,
             checkpoints: 0,
             completed_cycles: 0,
             started: Instant::now(),
@@ -980,6 +993,14 @@ impl Dashboard {
             "Waiting for Groq budget"
         } else if self.provider_wait.is_some() {
             "Waiting for provider"
+        } else if let Some(helper) = &self.helper {
+            if helper.wait.is_some() {
+                "Helper waiting for provider"
+            } else if helper.request_active {
+                "Helper investigating"
+            } else {
+                "Helper inspecting evidence"
+            }
         } else if self.request_active {
             "Waiting for response"
         } else if self.command_status.is_some()
@@ -1054,6 +1075,9 @@ impl Dashboard {
             }
             Event::Log(s) => self.push(Kind::Activity, concise_activity(&s)),
             Event::Phase(s) => {
+                if s != "Investigate" {
+                    self.helper = None;
+                }
                 self.provider_wait = None;
                 self.request_active = false;
                 self.flush_model();
@@ -1073,6 +1097,7 @@ impl Dashboard {
             }
             Event::Task(s) => self.task = s,
             Event::Request => {
+                self.helper = None;
                 if self.provider_wait.take().is_some() {
                     self.phase = "Work".into();
                 }
@@ -1172,6 +1197,66 @@ impl Dashboard {
                 self.history.truncate(5);
                 self.push(Kind::Activity, format!("{label} · {task}"));
             }
+        }
+    }
+    fn apply_helper(&mut self, actor: &str, event: Event) {
+        self.last_activity = Instant::now();
+        if self
+            .helper
+            .as_ref()
+            .is_none_or(|helper| helper.actor != actor)
+        {
+            self.helper = Some(HelperActivity {
+                actor: actor.into(),
+                ..HelperActivity::default()
+            });
+        }
+        let helper = self.helper.as_mut().unwrap();
+        match event {
+            Event::RequestModel(model) => helper.model = model,
+            Event::Request => {
+                helper.calls += 1;
+                helper.request_active = true;
+                helper.wait = None;
+            }
+            Event::RequestFinished => helper.request_active = false,
+            Event::ProviderWait { reason, seconds } => {
+                let changed = helper.wait.as_ref().is_none_or(|(old, _)| old != &reason);
+                helper.wait = Some((reason.clone(), seconds));
+                helper.request_active = false;
+                if changed {
+                    self.push(
+                        Kind::Activity,
+                        format!("Helper · {}", crate::project::excerpt(&reason, 240)),
+                    );
+                }
+            }
+            Event::Tool(tool) => {
+                helper.request_active = false;
+                self.push(Kind::Activity, format!("Helper · {tool}"));
+            }
+            Event::Metrics {
+                prompt,
+                generated,
+                seconds,
+            } => {
+                helper.prompt = prompt;
+                helper.generated += generated;
+                helper.speed = if seconds > 0.0 {
+                    generated as f64 / seconds
+                } else {
+                    0.0
+                };
+                helper.request_active = false;
+            }
+            Event::Log(message) => {
+                self.push(
+                    Kind::Activity,
+                    format!("Helper · {}", concise_activity(&message)),
+                );
+            }
+            // Helper prose and control events do not enter the main transcript or counters.
+            _ => {}
         }
     }
     fn back(&mut self, n: usize) {
@@ -1325,6 +1410,16 @@ fn setting_value(c: &runner::Config, field: usize) -> String {
             .unwrap_or_else(|e| e.to_string()),
         6 => "Choose model…".into(),
         7 => "Connect another AI app…".into(),
+        8 => format!(
+            "{} · {} · {} responses",
+            if c.helpers.enabled { "on" } else { "off" },
+            if c.helpers.model.is_empty() {
+                "project model"
+            } else {
+                &c.helpers.model
+            },
+            c.helpers.max_calls
+        ),
         4 => if c.allow_goal_completion { "on" } else { "off" }.into(),
         _ => c.command_review_seconds.to_string(),
     }
@@ -1344,6 +1439,7 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
         "Active hours",
         "Chat model",
         "External AI access (MCP)",
+        "Investigation helpers",
     ]
     .iter()
     .enumerate()
@@ -1375,9 +1471,9 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
                 FG
             }),
         );
-        lines.push(Line::from(""));
     }
     lines.extend([
+        Line::from(""),
         Line::from("↑↓ select · Enter edit/save · Ctrl+U clear · Esc cancel"),
         Line::from("Model and timeout apply to the NEXT request."),
         Line::from(format!("Current/last request model: {}", d.active_model)),
@@ -1721,7 +1817,15 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     };
     d.total_rows = lines.len();
     d.rows = output.height as usize;
-    if d.follow {
+    if d.tab == 4 {
+        d.scroll = d.scroll.min(d.total_rows.saturating_sub(d.rows));
+        let selected = 3 + d.settings_selected;
+        if selected < d.scroll {
+            d.scroll = selected;
+        } else if selected >= d.scroll + d.rows {
+            d.scroll = (selected + 1).saturating_sub(d.rows);
+        }
+    } else if d.follow {
         d.scroll = d.total_rows.saturating_sub(d.rows);
     } else {
         d.scroll = d.scroll.min(d.total_rows.saturating_sub(d.rows));
@@ -1758,46 +1862,88 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             Constraint::Min(0),
         ])
         .split(inner);
-        let model = vec![
-            Line::from("MODEL").fg(CYAN).bold(),
-            Line::from(d.active_model.clone()),
-            Line::from(if d.finished.is_some() {
-                "○ Idle · no work running".to_owned()
-            } else if paused {
-                "Ⅱ Paused in current cycle".to_owned()
-            } else if let Some(seconds) = d.provider_wait {
-                if d.phase.starts_with("Waiting for Groq budget") {
-                    format!("◷ Budget ready in {seconds}s")
+        let model = if let Some(helper) = &d.helper {
+            vec![
+                Line::from("HELPER MODEL").fg(CYAN).bold(),
+                Line::from(if helper.model.is_empty() {
+                    if c.helpers.model.is_empty() {
+                        c.model.clone()
+                    } else {
+                        c.helpers.model.clone()
+                    }
                 } else {
-                    format!("◷ Provider retry in {seconds}s")
-                }
-            } else if d.request_active {
-                "● Receiving response".to_owned()
-            } else {
-                if let Some((id, elapsed, review, at)) = &d.command_status {
-                    format!(
-                        "Cmd {id}: {}s · review {}s",
-                        elapsed + at.elapsed().as_secs(),
-                        review.saturating_sub(at.elapsed().as_secs())
-                    )
+                    helper.model.clone()
+                }),
+                Line::from(if paused {
+                    "Ⅱ Investigation paused".into()
+                } else if let Some((reason, seconds)) = &helper.wait {
+                    if reason.starts_with("Groq budget:") {
+                        format!("◷ Budget ready in {seconds}s")
+                    } else {
+                        format!("◷ Provider retry in {seconds}s")
+                    }
+                } else if helper.request_active {
+                    "● Investigating".into()
                 } else {
-                    "○ Between requests".to_owned()
-                }
-            })
-            .fg(if d.request_active { GREEN } else { MUTED }),
-            Line::from(format!("{:.1} tok/s · last reply", d.speed)),
-            Line::from(format!("Requests this cycle: {}", d.calls)),
-            Line::from(format!("Generated: {} tokens", d.generated)),
-        ];
+                    "○ Inspecting evidence".into()
+                })
+                .fg(if helper.request_active { GREEN } else { MUTED }),
+                Line::from(format!("{:.1} tok/s · helper reply", helper.speed)),
+                Line::from(format!("Helper requests: {}", helper.calls)),
+                Line::from(format!("Generated: {} tokens", helper.generated)),
+            ]
+        } else {
+            vec![
+                Line::from("MODEL").fg(CYAN).bold(),
+                Line::from(d.active_model.clone()),
+                Line::from(if d.finished.is_some() {
+                    "○ Idle · no work running".to_owned()
+                } else if paused {
+                    "Ⅱ Paused in current cycle".to_owned()
+                } else if let Some(seconds) = d.provider_wait {
+                    if d.phase.starts_with("Waiting for Groq budget") {
+                        format!("◷ Budget ready in {seconds}s")
+                    } else {
+                        format!("◷ Provider retry in {seconds}s")
+                    }
+                } else if d.request_active {
+                    "● Receiving response".to_owned()
+                } else {
+                    if let Some((id, elapsed, review, at)) = &d.command_status {
+                        format!(
+                            "Cmd {id}: {}s · review {}s",
+                            elapsed + at.elapsed().as_secs(),
+                            review.saturating_sub(at.elapsed().as_secs())
+                        )
+                    } else {
+                        "○ Between requests".to_owned()
+                    }
+                })
+                .fg(if d.request_active { GREEN } else { MUTED }),
+                Line::from(format!("{:.1} tok/s · last reply", d.speed)),
+                Line::from(format!("Requests this cycle: {}", d.calls)),
+                Line::from(format!("Generated: {} tokens", d.generated)),
+            ]
+        };
         f.render_widget(p(Text::from(model)), side[0]);
         f.render_widget(
             p(Text::from(vec![
-                Line::from("CONTEXT · LAST RESPONSE").fg(CYAN).bold(),
-                Line::from(format!("{} / {} tokens", d.prompt, c.context_tokens)),
+                Line::from(if d.helper.is_some() {
+                    "CONTEXT · HELPER RESPONSE"
+                } else {
+                    "CONTEXT · LAST RESPONSE"
+                })
+                .fg(CYAN)
+                .bold(),
+                Line::from(if let Some(helper) = &d.helper {
+                    format!("{} input tokens", helper.prompt)
+                } else {
+                    format!("{} / {} tokens", d.prompt, c.context_tokens)
+                }),
             ])),
             side[1],
         );
-        if side[1].height > 2 {
+        if side[1].height > 2 && d.helper.is_none() {
             f.render_widget(
                 Gauge::default()
                     .gauge_style(Style::default().fg(ACCENT).bg(BG))
@@ -2031,6 +2177,8 @@ fn dashboard_session(
                 cursor = record.sequence;
                 if record.actor == "loop" {
                     d.apply(record.event);
+                } else if record.actor.starts_with("agent/") {
+                    d.apply_helper(&record.actor, record.event);
                 } else if d.chat.session.as_deref() == Some(&record.actor) {
                     d.chat.apply(record.event);
                 }
@@ -2169,11 +2317,11 @@ fn dashboard_session(
                         }
                         match k.code {
                             KeyCode::Up => {
-                                d.settings_selected = (d.settings_selected + 7) % 8;
+                                d.settings_selected = (d.settings_selected + 8) % 9;
                                 continue;
                             }
                             KeyCode::Down => {
-                                d.settings_selected = (d.settings_selected + 1) % 8;
+                                d.settings_selected = (d.settings_selected + 1) % 9;
                                 continue;
                             }
                             KeyCode::Enter => {
@@ -2181,6 +2329,7 @@ fn dashboard_session(
                                     5 => crate::setup::active_hours_menu(Some(path))?,
                                     6 => crate::setup::project_settings_menu(Some(path))?,
                                     7 => crate::setup::external_control_info(path)?,
+                                    8 => crate::setup::helpers_menu(Some(path))?,
                                     _ => {
                                         d.settings_edit =
                                             Some(setting_value(&config, d.settings_selected))
@@ -2399,6 +2548,75 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     #[test]
+    fn helper_activity_is_visible_without_changing_main_request_counters() {
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::Phase("Investigate".into()));
+        d.apply_helper(
+            "agent/example",
+            Event::RequestModel("groq/helper-model".into()),
+        );
+        d.apply_helper("agent/example", Event::Request);
+        d.apply_helper("agent/example", Event::Delta("PRIVATE_HELPER_PROSE".into()));
+        d.apply_helper(
+            "agent/example",
+            Event::Metrics {
+                prompt: 1200,
+                generated: 200,
+                seconds: 2.0,
+            },
+        );
+        d.apply_helper("agent/example", Event::Tool("read_file example.txt".into()));
+        let wait = |seconds| Event::ProviderWait {
+            reason: "Groq budget: waiting before sending a request".into(),
+            seconds,
+        };
+        d.apply_helper("agent/example", wait(60));
+        let entries = d.entries.len();
+        d.apply_helper("agent/example", wait(59));
+        assert_eq!(
+            d.entries.len(),
+            entries,
+            "Countdowns must not flood activity"
+        );
+        assert_eq!(d.calls, 0);
+        assert_eq!(d.generated, 0);
+        assert_eq!(d.prompt, 0);
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.contains("HELPER MODEL"));
+        assert!(text.contains("groq/helper-model"));
+        assert!(text.contains("Budget ready in 59s"));
+        assert!(text.contains("Helper requests: 1"));
+        assert!(text.contains("Helper · read_file example.txt"));
+        assert!(!text.contains("PRIVATE_HELPER_PROSE"));
+        d.apply(Event::Phase("Work".into()));
+        assert!(d.helper.is_none());
+    }
+    #[test]
+    fn helper_settings_remain_visible_at_small_terminal_sizes() {
+        let mut c = config();
+        c.helpers.enabled = true;
+        c.helpers.model = "groq/example-model".into();
+        c.helpers.max_calls = 24;
+        let mut d = Dashboard::new(&c);
+        d.tab = 4;
+        d.settings_selected = 8;
+        d.scroll = 500;
+        for (width, height) in [(80, 24), (100, 30)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| render_dashboard(f, &mut d, &c, false))
+                .unwrap();
+            let text = screen_text(&terminal);
+            assert!(text.contains("Investigation helpers"));
+            assert!(text.contains("on · groq/example-model · 24 responses"));
+        }
+    }
+    #[test]
     fn cold_start_restores_visible_history_without_session_activity() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = config();
@@ -2473,7 +2691,7 @@ mod tests {
         assert_eq!(e.value, "héllo\nworld");
     }
     fn config() -> runner::Config {
-        runner::Config {chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
+        runner::Config {helpers:crate::agents::Settings::default(),chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
     }
     fn screen_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();

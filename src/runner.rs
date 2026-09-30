@@ -26,6 +26,8 @@ pub struct Config {
     pub model: String,
     #[serde(default)]
     pub chat_model: String,
+    #[serde(default)]
+    pub helpers: crate::agents::Settings,
     pub context_tokens: u32,
     pub output_tokens: u32,
     pub implementation_calls: u32,
@@ -119,6 +121,7 @@ struct Conversation {
     operator_revision: u64,
     migration_handoff_seen: Option<String>,
     migration_handoff: Option<Value>,
+    helper_links: std::collections::BTreeMap<String, String>,
 }
 
 /// Compact evidence accompanies the transcript and survives conversation handoffs.
@@ -126,18 +129,68 @@ struct Conversation {
 #[serde(default)]
 struct RepairNote {
     model_note: String,
+    /// The task which authored the model's note; distinct from the active evidence task.
     task_id: Option<u64>,
+    active_task_id: Option<u64>,
     recent_actions: Vec<String>,
     last_failure: String,
+    validation: Option<Value>,
+    previous_tasks: Vec<Value>,
 }
 impl RepairNote {
+    fn select_task(&mut self, task_id: Option<u64>) {
+        if self.active_task_id == task_id {
+            return;
+        }
+        if self.active_task_id.is_some() {
+            self.previous_tasks.push(json!({"task_id":self.active_task_id,"recent_actions":self.recent_actions,"validation":self.validation,"last_tool_error":self.last_failure}));
+            if self.previous_tasks.len() > 8 {
+                self.previous_tasks.remove(0);
+            }
+        }
+        self.active_task_id = task_id;
+        self.recent_actions.clear();
+        self.last_failure.clear();
+        self.validation = None;
+    }
+    fn validation(
+        &mut self,
+        task: (Option<u64>, u64),
+        tree: &str,
+        results: Value,
+        logs: Vec<String>,
+        unchanged: bool,
+    ) {
+        let (task_id, cycle) = task;
+        let has_results = results.as_array().is_some_and(|rows| !rows.is_empty());
+        let failed = results
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|r| r["passed"] != true));
+        let incomplete = results.as_array().is_some_and(|rows| {
+            rows.iter().any(|r| {
+                r["output"]
+                    .as_str()
+                    .is_some_and(|output| output.starts_with(crate::command_jobs::UNEXECUTED_CHECK))
+            })
+        });
+        let validation = json!({"task_id":task_id,"cycle":cycle,"checked_tree":tree,"checked_snapshot_unchanged":unchanged,"status":if unchanged && has_results && !incomplete {if failed {"failing"} else {"passed"}} else {"unverified"},"results":results,"log_ids":logs,"instruction":"Only evidence for the checked file state. Inspect failures and full logs; successful checks do not establish the entire goal is complete."});
+        if task_id == self.active_task_id {
+            self.validation = Some(validation);
+        } else {
+            self.previous_tasks
+                .push(json!({"task_id":task_id,"validation":validation}));
+            if self.previous_tasks.len() > 8 {
+                self.previous_tasks.remove(0);
+            }
+        }
+    }
     fn record(&mut self, action: &str, result: &str, failed: bool) {
         let entry = project::excerpt(&format!("{action}: {result}"), 700);
         if failed {
             self.last_failure = entry.clone();
         }
         self.recent_actions.push(entry);
-        if self.recent_actions.len() > 4 {
+        if self.recent_actions.len() > 12 {
             self.recent_actions.remove(0);
         }
     }
@@ -146,8 +199,27 @@ impl RepairNote {
         self.task_id = None;
         Ok(())
     }
+    #[cfg(test)]
     fn context(&self) -> Value {
-        json!({"model_note_excerpt":project::excerpt(&self.model_note,6000),"model_note_bytes":self.model_note.len(),"note_task_id":self.task_id,"instruction":"Use read_progress_note to retrieve the complete note. A missing or different note_task_id means the note is not tied to the current task. Notes and past failures may be stale; verify against current files.","recent_actions":self.recent_actions,"last_observed_failure":self.last_failure})
+        self.context_at(self.active_task_id, None)
+    }
+    fn context_at(&self, task_id: Option<u64>, tree: Option<&str>) -> Value {
+        let note_current = task_id.is_some() && self.task_id == task_id;
+        let mut validation = self.validation.clone();
+        if let Some(v) = &mut validation {
+            v["current_files_match"] =
+                json!(tree.is_some_and(|t| v["checked_tree"].as_str() == Some(t)));
+            if let Some(rows) = v["results"].as_array() {
+                let mut summaries:Vec<Value> = rows.iter().map(|r|json!({"argv":r["argv"],"passed":r["passed"],"exit_code":r["exit_code"],"output_excerpt":project::excerpt(r["output"].as_str().unwrap_or(""),1800)})).collect();
+                summaries.sort_by_key(|r| r["passed"] == true);
+                v["result_count"] = json!(summaries.len());
+                v["results_truncated"] = json!(summaries.len() > 8);
+                summaries.truncate(8);
+                v["results"] = json!(summaries);
+            }
+        }
+        let previous:Vec<Value> = self.previous_tasks.iter().map(|t|json!({"task_id":t["task_id"],"validation_status":t["validation"]["status"],"checked_tree":t["validation"]["checked_tree"],"history_available":true})).collect();
+        json!({"active_task_id":task_id,"current_tree":tree,"model_note_excerpt":project::excerpt(&self.model_note,4000),"model_note_bytes":self.model_note.len(),"note_task_id":self.task_id,"note_scope":if note_current {"current task; model claims require verification"} else {"earlier task or unscoped project notes; not current task evidence"},"instruction":"Use read_progress_note for full notes, search_history/read_history for older observations. Validation and tool errors are separate. Check file-state labels before relying on a result; previous task evidence is historical.","recent_actions":self.recent_actions,"validation":validation,"last_tool_error":self.last_failure,"previous_tasks":previous})
     }
     fn page(&self, offset: usize) -> Result<Value> {
         let text = &self.model_note;
@@ -180,7 +252,7 @@ mod repair_note_tests {
         }
         let saved = serde_json::to_vec(&note).unwrap();
         let restored: RepairNote = serde_json::from_slice(&saved).unwrap();
-        assert_eq!(restored.recent_actions.len(), 4);
+        assert_eq!(restored.recent_actions.len(), 12);
         assert!(restored.last_failure.contains("unknown column"));
         assert!(restored.model_note.contains("existing column names"));
         assert!(
@@ -216,6 +288,75 @@ mod repair_note_tests {
         assert!(note.model_note.is_empty());
         assert!(RepairNote::default().last_failure.is_empty());
     }
+    #[test]
+    fn validation_survives_incidental_tool_errors_and_marks_stale_files() {
+        let mut note = RepairNote::default();
+        note.select_task(Some(42));
+        note.validation(
+            (Some(42), 7),
+            "tree-a",
+            json!([{"argv":["validate"],"passed":false,"output":"Expected two colors, got one"}]),
+            vec!["cycle-000007/command-verification-0.log".into()],
+            true,
+        );
+        note.record("read_file", "Not found: accidental path", true);
+        let state = note.context_at(Some(42), Some("tree-a"));
+        assert_eq!(state["validation"]["status"], "failing");
+        assert!(
+            state["validation"]["results"][0]["output_excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("two colors")
+        );
+        assert!(
+            state["last_tool_error"]
+                .as_str()
+                .unwrap()
+                .contains("Not found")
+        );
+        assert_eq!(state["validation"]["current_files_match"], true);
+        assert_eq!(
+            note.context_at(Some(42), Some("tree-b"))["validation"]["current_files_match"],
+            false
+        );
+    }
+    #[test]
+    fn previous_task_notes_and_late_checks_do_not_become_current_evidence() {
+        let mut note = RepairNote::default();
+        note.select_task(Some(1));
+        note.set_note("First task is passing").unwrap();
+        note.task_id = Some(1);
+        note.validation(
+            (Some(1), 1),
+            "tree-a",
+            json!([{"passed":true}]),
+            vec![],
+            true,
+        );
+        note.select_task(Some(2));
+        note.validation(
+            (Some(1), 1),
+            "tree-a",
+            json!([{"passed":true}]),
+            vec![],
+            true,
+        );
+        let context = note.context_at(Some(2), Some("tree-b"));
+        assert_eq!(context["active_task_id"], 2);
+        assert!(
+            context["note_scope"]
+                .as_str()
+                .unwrap()
+                .starts_with("earlier task")
+        );
+        assert!(context["validation"].is_null());
+        assert!(!context["previous_tasks"].as_array().unwrap().is_empty());
+        note.validation((Some(2), 2), "tree-b", json!([]), vec![], true);
+        assert_eq!(
+            note.context_at(Some(2), Some("tree-b"))["validation"]["status"],
+            "unverified"
+        );
+    }
 }
 fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     let tmp = path.with_extension("tmp");
@@ -231,6 +372,11 @@ pub fn load(path: &Path) -> Result<Config> {
         .context("Project configuration must be an object")?;
     for (key, value) in fields {
         merged[key] = value.clone();
+    }
+    // Enabling a shared default affects newly created projects, never silently opts
+    // an existing project into helper traffic (including cloud spending).
+    if !fields.contains_key("helpers") {
+        merged["helpers"] = serde_json::to_value(crate::agents::Settings::default())?;
     }
     let mut c: Config = serde_json::from_value(merged)?;
     let parent = fs::canonicalize(
@@ -265,6 +411,7 @@ pub fn load(path: &Path) -> Result<Config> {
         "implementation_calls must be 1..100"
     );
     anyhow::ensure!(c.retry_seconds >= 1, "retry_seconds must be positive");
+    c.helpers.validate()?;
     anyhow::ensure!(
         (1..=86400).contains(&c.command_review_seconds),
         "Command review interval must be 1–86400 seconds"
@@ -773,10 +920,46 @@ fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
     }
     // Schemas remain identical between calls. Intentional tool configuration changes
     // can update them once when a run starts.
-    session.tools = crate::model::tools();
+    session.tools = crate::model::project_tools(&s.working_workspace);
+    session
+        .note
+        .select_task(s.current_task.as_ref().map(|_| s.task_serial));
+    repair_helper_results(c, &mut session)?;
     repair_pending_tools(&mut session.messages);
     save_conversation(c, &session)?;
     Ok(session)
+}
+fn repair_helper_results(c: &Config, session: &mut Conversation) -> Result<()> {
+    let Some(index) = session
+        .messages
+        .iter()
+        .rposition(|m| m["role"] == "assistant")
+    else {
+        return Ok(());
+    };
+    let calls = session.messages[index]["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let answered = session.messages[index + 1..]
+        .iter()
+        .take_while(|m| m["role"] == "tool")
+        .count();
+    for (call_index, call) in calls.iter().enumerate().skip(answered) {
+        if call["function"]["name"] != "delegate_investigation" {
+            break;
+        }
+        let Some(id) = session.helper_links.get(&format!("{index}-{call_index}")) else {
+            break;
+        };
+        let result = crate::agents::read_result(&c.state_dir, &json!({"job_id":id})).unwrap_or_else(|e|json!({"job_id":id,"status":"interrupted","message":format!("Helper result unavailable: {e:#}. A saved job can be resumed with delegate_investigation using this job_id; do not blindly launch a duplicate.")}));
+        let mut reply = json!({"role":"tool","tool_name":"delegate_investigation","content":json!({"ok":true,"result":result,"recovered":true,"job_id":id,"instruction":"Recovered the saved investigation instead of launching it again. Completed and partial observations remain available. An interrupted job may be resumed using job_id after inspecting its saved result."}).to_string()});
+        if let Some(id) = call.get("id") {
+            reply["tool_call_id"] = id.clone();
+        }
+        session.messages.push(reply);
+    }
+    Ok(())
 }
 pub(crate) fn repair_pending_tools(messages: &mut Vec<Value>) {
     let Some(index) = messages.iter().rposition(|m| m["role"] == "assistant") else {
@@ -831,9 +1014,11 @@ fn refresh_conversation(
         Vec::new()
     };
     session.messages.truncate(2);
+    session.helper_links.clear();
     session.nudge_revision = None;
     session.delivered_nudge_id = None;
-    session.messages.push(json!({"role":"user","content":json!({"reason":reason,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"working_checkpoint":s.working_ref,"feedback":s.feedback,"progress_note":session.note.context(),"instruction":"Earlier history was archived. Continue with existing files. Closed tasks remain closed. If there is no current task, use set_task to select useful work toward the main goal; do not report an old completion again. Research and foundational work are valid. Inspect files and evidence rather than repeating prior narration."}).to_string()}));
+    let tree = working_tree(&s.working_workspace, &c.state_dir).ok();
+    session.messages.push(json!({"role":"user","content":json!({"reason":reason,"history_source_id":format!("{}/{}",art.file_name().unwrap_or_default().to_string_lossy(),archive.file_name().unwrap_or_default().to_string_lossy()),"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"working_checkpoint":s.working_ref,"feedback":s.feedback,"progress_note":session.note.context_at(s.current_task.as_ref().map(|_|s.task_serial),tree.as_deref()),"instruction":"Earlier history was archived and is retrievable with search_history/read_history. Continue with existing files and evidence. Closed tasks remain closed. If there is no current task, use set_task to select useful work toward the main goal. Research and foundational work are valid. Inspect evidence rather than repeating prior narration."}).to_string()}));
     session.messages.extend(recent);
     if let Some(note) = &session.migration_handoff {
         let content = note.to_string();
@@ -867,6 +1052,13 @@ pub(crate) fn inspect_tool(
     args: &Value,
     research: &mut crate::web_tools::Research,
 ) -> Result<String> {
+    if name == "read_file"
+        && !project::safe_path(root, args["path"].as_str().unwrap_or(""))
+            .is_ok_and(|path| path.is_file())
+        && let Some(guidance) = crate::dev_tools::log_guidance(args["path"].as_str().unwrap_or(""))
+    {
+        anyhow::bail!("{guidance}");
+    }
     match name {
         "project_map" => Ok(crate::code_index::index(root)?.to_string()),
         "lookup_symbol" => Ok(crate::symbols::lookup(root, args)?.to_string()),
@@ -885,30 +1077,7 @@ pub(crate) fn inspect_tool(
             args["line_count"].as_u64().unwrap_or(80) as usize,
         ),
         "list_files" => Ok(project::inventory(root)?.join("\n")),
-        "search" => {
-            let text = args["text"].as_str().context("Missing search text")?;
-            anyhow::ensure!(!text.is_empty(), "Search text is empty");
-            let mut output = String::new();
-            for file in project::inventory(root)? {
-                if let Ok(content) = project::read(root, &file) {
-                    for (line, value) in content
-                        .lines()
-                        .enumerate()
-                        .filter(|(_, v)| v.contains(text))
-                    {
-                        output.push_str(&format!(
-                            "{file}:{}: {}\n",
-                            line + 1,
-                            project::excerpt(value, 400)
-                        ));
-                        if output.len() > 12000 {
-                            return Ok(output);
-                        }
-                    }
-                }
-            }
-            Ok(output)
-        }
+        "search" => crate::search::search(root, args),
         "web_search" | "read_web_page" => research.call(name, args),
         _ => anyhow::bail!("Unknown tool: {name}"),
     }
@@ -1043,6 +1212,48 @@ struct WorkResult {
     project_completion: Option<Value>,
     summary: String,
 }
+type ValidationTickets = std::collections::HashMap<String, (Option<u64>, String)>;
+fn observe_command_validation(
+    c: &Config,
+    s: &State,
+    session: &mut Conversation,
+    update: &Value,
+    tickets: &mut ValidationTickets,
+    art: &Path,
+) -> Result<()> {
+    if update["running"] != false {
+        return Ok(());
+    }
+    let Some(id) = update["command_id"].as_str() else {
+        return Ok(());
+    };
+    let Some((task_id, checked_tree)) = tickets.remove(id) else {
+        return Ok(());
+    };
+    let current = working_tree(&s.working_workspace, &c.state_dir)?;
+    let results = update["checks"].clone();
+    let logs = if let Some(rows) = results.as_array() {
+        (0..rows.len())
+            .filter(|i| art.join(format!("command-{id}-{i}.log")).is_file())
+            .map(|i| {
+                format!(
+                    "{}/command-{id}-{i}.log",
+                    art.file_name().unwrap_or_default().to_string_lossy()
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    session.note.validation(
+        (task_id, s.cycle),
+        &checked_tree,
+        results,
+        logs,
+        current == checked_tree,
+    );
+    Ok(())
+}
 fn work(
     config_path: &Path,
     c: &Config,
@@ -1053,10 +1264,14 @@ fn work(
     stop: &AtomicBool,
 ) -> Result<WorkResult> {
     crate::events::send(crate::events::Event::Phase("Orient".into()));
+    session
+        .note
+        .select_task(s.current_task.as_ref().map(|_| s.task_serial));
     session.messages.push(json!({"role":"user","content":json!({"cycle":s.cycle,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"working_checkpoint":s.working_ref,"instruction":if s.current_task.is_some() {"Continue the active task from existing files and the latest check feedback. Investigate and repair unresolved failures. All work is retained."} else {"There is no active task. Previous completions are already saved. Inspect what is needed toward the main goal and use set_task for the next useful task, then work on it. Research and foundational work count; do not report an old task complete again."}}).to_string()}));
     save_conversation(c, session)?;
     let mut research = crate::web_tools::Research::default();
     let mut jobs = crate::command_jobs::Jobs::with_controls(m.controls.clone());
+    let mut validation_tickets = ValidationTickets::new();
     let mut finish_requested = None;
     let mut project_completion = None;
     let mut summary = String::new();
@@ -1075,6 +1290,7 @@ fn work(
             session.observed_tree = working_tree(&s.working_workspace, &c.state_dir)?;
         }
         for update in command_updates {
+            observe_command_validation(c, s, session, &update, &mut validation_tickets, art)?;
             session.messages.push(
                 json!({"role":"user","content":json!({"command_update":update}).to_string()}),
             );
@@ -1117,8 +1333,16 @@ fn work(
         }
         sync_operator(c, s, session)?;
         sync_nudge(c, session)?;
-        let allow_completion = load(config_path)?.allow_goal_completion;
-        session.tools = crate::model::tools();
+        let live_config = load(config_path)?;
+        let allow_completion = live_config.allow_goal_completion;
+        session.tools = crate::model::project_tools(&s.working_workspace);
+        if live_config.helpers.enabled {
+            session
+                .tools
+                .as_array_mut()
+                .unwrap()
+                .push(crate::agents::schemas().remove(0));
+        }
         if allow_completion {
             session
                 .tools
@@ -1194,6 +1418,9 @@ fn work(
         if let Some(content) = response["content"].as_str() {
             summary = content.to_owned();
         }
+        // Only the pending response needs a delivery link. Context fitting may
+        // change message indices, so never reuse an old response's positional key.
+        session.helper_links.clear();
         session.messages.push(response);
         save_conversation(c, session)?;
         m.pause_point();
@@ -1314,21 +1541,24 @@ fn work(
                             | "finish_task"
                             | "finish_nudge"
                             | "finish_project"
-                            | "set_task"
                     )
                 {
                     anyhow::bail!(
-                        "A command is still running. Inspect it with command_status, read relevant files, or stop it with an evidence-based reason before editing, launching more work, or completing the task."
+                        "A command is still running: {}. Use command_status with command_id and wait_ms (up to 60000), or read_command_log with log_id. Read files, update the task plan, or request a read-only investigation while waiting. Finish or explicitly stop the command before edits, more commands, or task completion.",
+                        serde_json::to_string(&jobs.running_snapshots()?)?
                     );
                 }
                 match name {
                     "set_task" => {
                         let task: Task = serde_json::from_value(args.clone())?;
                         anyhow::ensure!(!task.title.trim().is_empty(), "Task needs a title");
-                        if s.current_task.as_ref() != Some(&task) {
+                        if s.current_task.as_ref().is_none_or(|current| {
+                            current.title != task.title || current.objective != task.objective
+                        }) {
                             s.task_serial += 1;
-                            s.current_task = Some(task);
                         }
+                        s.current_task = Some(task);
+                        session.note.select_task(Some(s.task_serial));
                         finish_requested = None;
                         emit(art, "task", s.current_task.as_ref().unwrap())?;
                         save(&c.state_dir.join("state.json"), s)?;
@@ -1414,6 +1644,89 @@ fn work(
                         };
                         Ok(session.note.page(offset)?.to_string())
                     }
+                    "read_task_evidence" => {
+                        let tree = working_tree(&root, &c.state_dir)?;
+                        Ok(json!({"task_id":s.current_task.as_ref().map(|_|s.task_serial),"task":s.current_task,"evidence":session.note.context_at(s.current_task.as_ref().map(|_|s.task_serial),Some(&tree))}).to_string())
+                    }
+                    "search_history" => Ok(crate::history::search(&c.state_dir, args)?.to_string()),
+                    "read_history" => Ok(crate::history::read(&c.state_dir, args)?.to_string()),
+                    "read_agent_result" => {
+                        Ok(crate::agents::read_result(&c.state_dir, args)?.to_string())
+                    }
+                    "delegate_investigation" => {
+                        let live = load(config_path)?;
+                        anyhow::ensure!(
+                            live.helpers.enabled,
+                            "Investigation helpers are disabled in project Settings"
+                        );
+                        let key = format!(
+                            "{}-{index}",
+                            session
+                                .messages
+                                .iter()
+                                .rposition(|msg| msg["role"] == "assistant")
+                                .context("Missing helper parent response")?
+                        );
+                        let id = if let Some(id) = args["job_id"].as_str() {
+                            crate::agents::read_result(&c.state_dir, &json!({"job_id":id}))?;
+                            id.to_owned()
+                        } else {
+                            session
+                                .helper_links
+                                .entry(key.clone())
+                                .or_insert_with(|| format!("investigate-{}", crate::operator::id()))
+                                .clone()
+                        };
+                        session.helper_links.insert(key, id.clone());
+                        save_conversation(c, session)?;
+                        let tree = working_tree(&root, &c.state_dir)?;
+                        let input = json!({"question":args["question"],"selected_evidence":args["evidence"],"goal":s.goal,"task":s.current_task,"task_id":s.current_task.as_ref().map(|_|s.task_serial),"inspected_tree":tree,"active_nudge":crate::nudge::read(&c.state_dir)?.active,"task_evidence":session.note.context_at(s.current_task.as_ref().map(|_|s.task_serial),Some(&tree)),"running_commands":jobs.running_snapshots()?,"workspace":root,"config_path":config_path});
+                        crate::events::log(format!(
+                            "Investigation {id}: {}",
+                            project::excerpt(args["question"].as_str().unwrap_or(""), 160)
+                        ));
+                        crate::events::send(crate::events::Event::Phase("Investigate".into()));
+                        let report = crate::agents::investigate(
+                            &live,
+                            &live.helpers,
+                            m,
+                            input,
+                            art,
+                            &id,
+                            |tool, args| match tool {
+                                "read_command_log" => {
+                                    Ok(crate::dev_tools::read_log(art, args)?.to_string())
+                                }
+                                "read_progress_note" => Ok(session
+                                    .note
+                                    .page(args["offset"].as_u64().unwrap_or(0) as usize)?
+                                    .to_string()),
+                                "read_task_evidence" => Ok(session
+                                    .note
+                                    .context_at(
+                                        s.current_task.as_ref().map(|_| s.task_serial),
+                                        Some(&tree),
+                                    )
+                                    .to_string()),
+                                "search_history" => {
+                                    Ok(crate::history::search(&c.state_dir, args)?.to_string())
+                                }
+                                "read_history" => {
+                                    Ok(crate::history::read(&c.state_dir, args)?.to_string())
+                                }
+                                _ => inspect_tool(&root, tool, args, &mut research),
+                            },
+                        );
+                        crate::events::send(crate::events::Event::Phase("Work".into()));
+                        crate::events::log(format!(
+                            "Investigation {id}: {}",
+                            report
+                                .as_ref()
+                                .map(|v| v["status"].as_str().unwrap_or("report saved"))
+                                .unwrap_or("interrupted; evidence retained")
+                        ));
+                        Ok(report?.to_string())
+                    }
                     "edit_file" => {
                         let path = args["path"].as_str().context("Missing path")?;
                         file_target(&root, path)?;
@@ -1435,6 +1748,12 @@ fn work(
                         Ok(json!({"path":path,"changed":changed,"message":if changed {"File written"} else {"No bytes changed; the file already has this content."}}).to_string())
                     }
                     "run_checks" | "run_command" | "compiler_diagnostics" => {
+                        if name == "compiler_diagnostics" {
+                            anyhow::ensure!(
+                                root.join("Cargo.toml").is_file(),
+                                "Rust compiler diagnostics require Cargo.toml. Use run_command or configured run_checks for this project's actual tools."
+                            );
+                        }
                         let mut checks = if name == "run_checks" {
                             c.checks.clone()
                         } else if name == "compiler_diagnostics" {
@@ -1490,6 +1809,20 @@ fn work(
                             name == "compiler_diagnostics",
                         )?;
                         let mut output = jobs.start(job, stop)?;
+                        if name == "run_checks" {
+                            validation_tickets.insert(
+                                output["command_id"]
+                                    .as_str()
+                                    .context("Missing started command id")?
+                                    .to_owned(),
+                                (
+                                    s.current_task.as_ref().map(|_| s.task_serial),
+                                    before_command
+                                        .clone()
+                                        .context("Missing validation file state")?,
+                                ),
+                            );
+                        }
                         output["arguments_normalized"] = json!(args["argv"].is_string());
                         Ok(output.to_string())
                     }
@@ -1511,9 +1844,11 @@ fn work(
                             );
                             return Ok(output.to_string());
                         }
-                        Ok(job
-                            .poll(args["wait_ms"].as_u64().unwrap_or(1000).min(1000), stop)?
-                            .to_string())
+                        if name == "command_status" {
+                            Ok(job.status(args, stop)?.to_string())
+                        } else {
+                            Ok(job.poll(0, stop)?.to_string())
+                        }
                     }
                     "read_command_log" => Ok(crate::dev_tools::read_log(art, args)?.to_string()),
                     "restore_checkpoint" => anyhow::bail!(
@@ -1524,30 +1859,26 @@ fn work(
             })();
             let value = match result {
                 Ok(value) => {
-                    let value = if matches!(
-                        name,
-                        "run_command"
-                            | "run_checks"
-                            | "compiler_diagnostics"
-                            | "command_status"
-                            | "command_input"
-                            | "stop_command"
-                    ) || name == "read_progress_note"
-                        || (name == "read_file" && args.get("byte_offset").is_some())
-                    {
-                        value
-                    } else {
-                        project::excerpt(&value, 12000)
-                    };
-                    // Keep typed results as objects rather than JSON inside a JSON string.
+                    // Each inspection tool owns its paging. Never truncate serialized
+                    // JSON and lose completion markers/cursors or validation evidence.
                     let result = serde_json::from_str::<Value>(&value)
                         .ok()
                         .filter(|v| v.is_object() || v.is_array())
-                        .unwrap_or(Value::String(value));
+                        .unwrap_or_else(|| Value::String(project::excerpt(&value, 12000)));
                     json!({"ok":true,"result":result})
                 }
                 Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
             };
+            if value["ok"] == true {
+                observe_command_validation(
+                    c,
+                    s,
+                    session,
+                    &value["result"],
+                    &mut validation_tickets,
+                    art,
+                )?;
+            }
             if command && value["result"]["running"] == true {
                 session.command_watch.reset_streak();
             } else if command {
@@ -1589,9 +1920,19 @@ fn work(
             observed_tree = working_tree(&s.working_workspace, &c.state_dir)?;
             session.observed_tree = observed_tree.clone();
             session.command_watch.record_activity(name, args, &value);
-            session
-                .note
-                .record(name, &value.to_string(), value["ok"] == false);
+            let detail = args["path"]
+                .as_str()
+                .or_else(|| args["text"].as_str())
+                .or_else(|| args["reason"].as_str())
+                .unwrap_or("");
+            // A ledger read must not manufacture new evidence by recording itself.
+            if name != "read_task_evidence" {
+                session.note.record(
+                    &format!("{name} {}", project::excerpt(detail, 180)),
+                    &value.to_string(),
+                    value["ok"] == false,
+                );
+            }
             emit(art, &format!("tool-{step}-{index}"), &value)?;
             emit(art, "repair-note", &session.note)?;
             let reply_value = if command {
@@ -1619,6 +1960,7 @@ fn work(
             save_conversation(c, session)?;
         }
         for update in completed_commands {
+            observe_command_validation(c, s, session, &update, &mut validation_tickets, art)?;
             session.messages.push(
                 json!({"role":"user","content":json!({"command_update":update}).to_string()}),
             );
@@ -1634,6 +1976,7 @@ fn work(
     }
     m.pause_point();
     for update in jobs.drain(c, s.current_task.as_ref(), m, stop)? {
+        observe_command_validation(c, s, session, &update, &mut validation_tickets, art)?;
         session.messages.push(
             json!({"role":"user","content":json!({"command_final_result":update}).to_string()}),
         );
@@ -1919,6 +2262,25 @@ pub fn run_controlled(
             });
         }
         let finished = finished && passed;
+        session.note.validation(
+            (
+                state.current_task.as_ref().map(|_| state.task_serial),
+                state.cycle,
+            ),
+            &before_check,
+            serde_json::to_value(&results)?,
+            (0..results.len())
+                .filter(|i| art.join(format!("command-verification-{i}.log")).is_file())
+                .map(|i| {
+                    format!(
+                        "{}/command-verification-{i}.log",
+                        art.file_name().unwrap_or_default().to_string_lossy()
+                    )
+                })
+                .collect(),
+            checked_same_files,
+        );
+        emit(&art, "repair-note", &session.note)?;
         if finished {
             let task = state
                 .current_task

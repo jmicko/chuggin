@@ -778,3 +778,107 @@ fn stopping_a_held_response_does_not_execute_its_pending_tools() {
     assert!(!f.dir.path().join("new.txt").exists());
     assert_eq!(model.requests.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn helper_permissions_require_human_settings_and_preserve_other_settings() {
+    let f = Fixture::new("http://127.0.0.1:1");
+    let session = f.session();
+    let current = f.call(&session, "get_settings", json!({}));
+    let original = fs::read(f.dir.path().join("chuggin.json")).unwrap();
+    let refused = f.call(
+        &session,
+        "update_settings",
+        json!({"expected_revision":current["result"]["revision"],"settings":{"helpers":{"enabled":true,"model":"groq/UNAUTHORIZED","max_calls":100}}}),
+    );
+    assert_eq!(refused["status"], "failed");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("human connection setup")
+    );
+    assert_eq!(
+        fs::read(f.dir.path().join("chuggin.json")).unwrap(),
+        original
+    );
+    let granted = f.rpc(json!({"action":"helper_settings","expected_revision":current["result"]["revision"],"helpers":{"enabled":true,"model":" groq/USER_APPROVED ","max_calls":24}}));
+    assert_eq!(granted["status"], "complete");
+    assert_eq!(
+        granted["result"]["settings"]["helpers"]["model"],
+        "groq/USER_APPROVED"
+    );
+    assert_eq!(granted["result"]["settings"]["helpers"]["max_calls"], 24);
+    assert_eq!(
+        granted["result"]["settings"]["model"],
+        current["result"]["settings"]["model"]
+    );
+    assert_eq!(f.rpc(json!({"action":"status"}))["running"], false);
+    assert_ne!(granted["result"]["revision"], current["result"]["revision"]);
+    let mut stream = UnixStream::connect(&f.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    writeln!(stream, "{}", json!({"action":"helper_settings","expected_revision":current["result"]["revision"],"helpers":{"enabled":false,"model":"","max_calls":12}})).unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    let stale: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(stale["ok"], false);
+    let latest = f.call(&session, "get_settings", json!({}));
+    assert_eq!(
+        latest["result"]["settings"]["helpers"],
+        granted["result"]["settings"]["helpers"]
+    );
+}
+
+#[test]
+fn stopping_a_paused_investigation_retains_partial_work_without_extra_requests() {
+    let model = Model::new(|body, _| {
+        let helper = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|schema| schema["function"]["name"] == "report_investigation");
+        if helper {
+            thread::sleep(Duration::from_millis(400));
+            json!({"role":"assistant","content":"PARTIAL_HELPER_OBSERVATION","tool_calls":[{"id":"helper-read","function":{"name":"read_file","arguments":{"path":"file.txt"}}}]})
+        } else {
+            task_and_tool(
+                "delegate_investigation",
+                json!({"question":"Inspect the fixture value","evidence":["file.txt"]}),
+            )
+        }
+    });
+    let f = Fixture::new(&model.url);
+    let session = f.session();
+    let current = f.call(&session, "get_settings", json!({}));
+    f.rpc(json!({"action":"helper_settings","expected_revision":current["result"]["revision"],"helpers":{"enabled":true,"model":"","max_calls":8}}));
+    f.rpc(json!({"action":"start","mode":"one_cycle"}));
+    f.wait(|| model.requests.lock().unwrap().len() >= 2);
+    f.rpc(json!({"action":"pause"}));
+    f.wait(|| f.rpc(json!({"action":"status"}))["paused"] == true);
+    f.rpc(json!({"action":"stop"}));
+    f.wait(|| f.rpc(json!({"action":"status"}))["running"] == false);
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        2,
+        "Stopping a held investigation must not launch another inference request"
+    );
+    assert_eq!(
+        fs::read_to_string(f.dir.path().join("file.txt")).unwrap(),
+        "before\n"
+    );
+    let jobs: Vec<_> = fs::read_dir(f.dir.path().join(".chuggin/agents"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(jobs.len(), 1);
+    let job: Value = serde_json::from_slice(&fs::read(jobs[0].join("job.json")).unwrap()).unwrap();
+    assert_eq!(job["status"], "interrupted");
+    assert_eq!(job["calls_used"], 1);
+    assert!(
+        job["messages"]
+            .to_string()
+            .contains("PARTIAL_HELPER_OBSERVATION")
+    );
+    assert!(job["result"].is_null());
+}

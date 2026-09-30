@@ -47,7 +47,7 @@ pub fn acquire(
     controls: &crate::run_control::RunControl,
     stopped: &std::sync::atomic::AtomicBool,
 ) -> Result<Permit> {
-    let interactive = crate::events::actor() != "loop";
+    let interactive = interactive_actor(&crate::events::actor());
     {
         let mut q = QUEUE.0.lock().unwrap();
         let r = q.entry(key.into()).or_default();
@@ -110,5 +110,22 @@ pub fn acquire(
                 .wait_timeout(map, Duration::from_millis(100))
                 .unwrap(),
         );
+    }
+}
+
+/// User conversations may interrupt background inference queues. An investigation
+/// is work requested by the loop, so it must not inherit user-chat priority merely
+/// because its output is recorded under a separate actor name.
+fn interactive_actor(actor: &str) -> bool {
+    actor != "loop" && !actor.starts_with("agent/")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn helper_actors_do_not_jump_the_user_queue() {
+        assert!(!super::interactive_actor("loop"));
+        assert!(!super::interactive_actor("agent/investigate-42"));
+        assert!(super::interactive_actor("operator-session-42"));
     }
 }

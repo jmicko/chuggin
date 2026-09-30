@@ -13,6 +13,7 @@ use std::{
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub helpers: crate::agents::Settings,
     pub active_hours: crate::schedule::Schedule,
     pub ollama_url: String,
     pub model: String,
@@ -25,6 +26,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            helpers: crate::agents::Settings::default(),
             active_hours: crate::schedule::Schedule::Always,
             ollama_url: "http://localhost:11434".into(),
             model: String::new(),
@@ -408,7 +410,7 @@ pub fn wizard() -> Result<PathBuf> {
     }
     save(
         &config,
-        &json!({"repo":".","goal":draft.goal,"state_dir":".chuggin","active_hours":{"mode":"shared"},
+        &json!({"repo":".","goal":draft.goal,"state_dir":".chuggin","helpers":s.helpers,"active_hours":{"mode":"shared"},
         "command_review_seconds":timeout,"checks":[{"argv":check,"timeout_seconds":timeout}]}),
     )?;
     // Check merged project/global settings before starting.
@@ -508,6 +510,7 @@ pub fn settings_menu() -> Result<()> {
             "Test Brave connection".into(),
             "Shared active hours".into(),
             "Groq connection and limits".into(),
+            "Investigation helpers · defaults for new projects".into(),
             "Back".into(),
         ];
         let Some(index) = crate::menu::select("Shared settings", &items, 0)? else {
@@ -604,6 +607,10 @@ pub fn settings_menu() -> Result<()> {
             }
             10 => {
                 groq_settings()?;
+                continue;
+            }
+            11 => {
+                helpers_menu(None)?;
                 continue;
             }
             _ => return Ok(()),
@@ -847,6 +854,7 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
             &[
                 "This project · Active hours".into(),
                 "This project · Chat model".into(),
+                "This project · Investigation helpers".into(),
                 "This project · External AI access (MCP)".into(),
                 "Shared settings".into(),
                 "Back".into(),
@@ -877,12 +885,127 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
                 }
             }
             2 => {
+                helpers_menu(path)?;
+            }
+            3 => {
                 if let Some(p) = path {
                     external_control_info(p)?;
                 }
             }
-            3 => settings_menu()?,
+            4 => settings_menu()?,
             _ => return Ok(()),
+        }
+    }
+}
+
+fn helper_rows(helpers: &crate::agents::Settings) -> Vec<String> {
+    vec![
+        format!(
+            "Helpers · {}",
+            if helpers.enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+        ),
+        format!(
+            "Model · {}",
+            if helpers.model.is_empty() {
+                "Use project model"
+            } else {
+                &helpers.model
+            }
+        ),
+        format!("Model responses per helper · {}", helpers.max_calls),
+        "Back".into(),
+    ]
+}
+
+pub fn helpers_menu(project: Option<&Path>) -> Result<()> {
+    loop {
+        let mut helpers = if let Some(path) = project {
+            runner::load(path)?.helpers
+        } else {
+            settings()?.helpers
+        };
+        let title = if project.is_some() {
+            "Investigation helpers · this project"
+        } else {
+            "Investigation helpers · defaults for new projects"
+        };
+        crate::ui::clear_notes();
+        crate::ui::notice(
+            "Optional helpers investigate a specific question with fresh context and return evidence to the main conversation. They can read files, search, inspect saved logs, and use enabled web tools; they cannot edit or run commands. The main model chooses when a helper is useful.\n\nUse project model shares its connection and budget. Ollama requests to the same server run one at a time. Choosing Groq uses the configured cloud key and shared Groq limits. Changes apply to the next helper; running helpers keep their model. The response allowance ends the investigation with its available findings, without rejecting the main work."
+                .into(),
+        );
+        let Some(choice) = crate::menu::select(title, &helper_rows(&helpers), 0)? else {
+            return Ok(());
+        };
+        match choice {
+            0 => helpers.enabled = !helpers.enabled,
+            1 => {
+                crate::ui::clear_notes();
+                let Some(route) = crate::menu::select(
+                    "Helper model",
+                    &[
+                        "Use project model".into(),
+                        "Choose a model from Ollama or Groq…".into(),
+                        "Back".into(),
+                    ],
+                    usize::from(!helpers.model.is_empty()),
+                )?
+                else {
+                    continue;
+                };
+                if route == 0 {
+                    helpers.model.clear();
+                } else if route == 1 {
+                    let mut connection = settings()?;
+                    if let Some(path) = project {
+                        let config = runner::load(path)?;
+                        connection.model = config.model;
+                        connection.ollama_url = config.ollama_url;
+                    }
+                    if !helpers.model.is_empty() {
+                        connection.model = helpers.model.clone();
+                    }
+                    let names = select_provider_models(&connection)?;
+                    let selected = names
+                        .iter()
+                        .position(|name| name == &connection.model)
+                        .unwrap_or(0);
+                    if let Some(index) =
+                        crate::menu::select("Choose investigation model", &names, selected)?
+                    {
+                        helpers.model = names[index].clone();
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            2 => {
+                helpers.max_calls = number(
+                    "Model responses per helper (partial findings are kept)",
+                    helpers.max_calls,
+                    1,
+                    1000,
+                )?;
+            }
+            _ => return Ok(()),
+        }
+        if let Some(path) = project {
+            let client = crate::engine::Client::connect(path)?;
+            let session = client.open_session(None)?;
+            let current =
+                client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
+            let reply = client.update_helpers(&current["result"]["revision"], &helpers)?;
+            anyhow::ensure!(reply["status"] == "complete", "{}", reply["error"]);
+        } else {
+            let mut defaults = settings()?;
+            defaults.helpers = helpers;
+            save(&settings_path()?, &defaults)?;
         }
     }
 }

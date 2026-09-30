@@ -1,4 +1,5 @@
 mod action_watch;
+mod agents;
 mod chat;
 mod code_index;
 mod command_jobs;
@@ -9,6 +10,7 @@ mod dev_tools;
 mod engine;
 mod events;
 mod groq;
+mod history;
 mod inference;
 mod mcp;
 mod menu;
@@ -23,9 +25,11 @@ mod repetition;
 mod run_control;
 mod runner;
 mod schedule;
+mod search;
 mod setup;
 mod stall_diagnostic;
 mod symbols;
+mod terminal_title;
 mod ui;
 mod web_tools;
 mod workspace;
@@ -103,6 +107,27 @@ enum Command {
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Background engines and MCP must never emit terminal controls on protocol stdout.
+    let _title = if matches!(
+        cli.command,
+        Some(Command::Mcp { .. } | Command::Engine { .. })
+    ) {
+        None
+    } else {
+        let requested = match &cli.command {
+            Some(Command::Run { config, .. } | Command::Migrate { config, .. }) => {
+                Some(config.clone())
+            }
+            Some(Command::Status { config }) => config.clone(),
+            _ => None,
+        };
+        let project = requested
+            .or_else(|| setup::find_project().ok().flatten())
+            .and_then(|path| runner::load(&path).ok())
+            .map(|c| c.repo)
+            .unwrap_or(std::env::current_dir()?);
+        Some(terminal_title::Guard::enter(&project))
+    };
     let stopped = Arc::new(AtomicBool::new(false));
     let running = Arc::new(AtomicBool::new(false));
     let flag = stopped.clone();
@@ -110,6 +135,7 @@ fn main() -> Result<()> {
     ctrlc::set_handler(move || {
         if !active.load(Ordering::SeqCst) || flag.swap(true, Ordering::SeqCst) {
             ui::restore();
+            terminal_title::restore();
             engine::force_foreground();
             project::kill_active_check();
             eprintln!("Stopped. Run chuggin again to resume from saved progress.");
