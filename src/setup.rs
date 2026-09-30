@@ -230,7 +230,8 @@ pub fn wizard() -> Result<PathBuf> {
     let s = settings()?;
     crate::ui::notice(format!(
         "Using {} on {} (change from Settings on the home menu).",
-        s.model, s.ollama_url
+        s.model,
+        crate::cloud::label(&s.ollama_url, &s.model)
     ));
     let draft_path = root.join(".chuggin/goal-draft.json");
     let mut draft = if draft_path.exists() {
@@ -511,6 +512,7 @@ pub fn settings_menu() -> Result<()> {
             "Shared active hours".into(),
             "Groq connection and limits".into(),
             "Investigation helpers · defaults for new projects".into(),
+            "OpenRouter · free cloud models and connection".into(),
             "Back".into(),
         ];
         let Some(index) = crate::menu::select("Shared settings", &items, 0)? else {
@@ -611,6 +613,10 @@ pub fn settings_menu() -> Result<()> {
             }
             11 => {
                 helpers_menu(None)?;
+                continue;
+            }
+            12 => {
+                openrouter_settings()?;
                 continue;
             }
             _ => return Ok(()),
@@ -937,7 +943,7 @@ pub fn helpers_menu(project: Option<&Path>) -> Result<()> {
         };
         crate::ui::clear_notes();
         crate::ui::notice(
-            "Optional helpers investigate a specific question with fresh context and return evidence to the main conversation. They can read files, search, inspect saved logs, and use enabled web tools; they cannot edit or run commands. The main model chooses when a helper is useful.\n\nUse project model shares its connection and budget. Ollama requests to the same server run one at a time. Choosing Groq uses the configured cloud key and shared Groq limits. Changes apply to the next helper; running helpers keep their model. The response allowance ends the investigation with its available findings, without rejecting the main work."
+            "Optional helpers investigate a specific question with fresh context and return evidence to the main conversation. They can read files, search, inspect saved logs, and use enabled web tools; they cannot edit or run commands. The main model chooses when a helper is useful.\n\nUse project model shares its connection and budget. Ollama requests to the same server run one at a time. Cloud helpers use the selected provider's connection and limits. OpenCode Zen needs no account; OpenRouter needs a key. Free models can have capacity limits or temporary availability. Changes apply to the next helper; running helpers keep their model. The response allowance ends the investigation with its available findings, without rejecting the main work."
                 .into(),
         );
         let Some(choice) = crate::menu::select(title, &helper_rows(&helpers), 0)? else {
@@ -951,7 +957,7 @@ pub fn helpers_menu(project: Option<&Path>) -> Result<()> {
                     "Helper model",
                     &[
                         "Use project model".into(),
-                        "Choose a model from Ollama or Groq…".into(),
+                        "Choose a model and inference provider…".into(),
                         "Back".into(),
                     ],
                     usize::from(!helpers.model.is_empty()),
@@ -1013,12 +1019,18 @@ pub fn helpers_menu(project: Option<&Path>) -> Result<()> {
 }
 
 fn select_provider_models(s: &Settings) -> Result<Vec<String>> {
-    let selected = usize::from(crate::groq::model_id(&s.model).is_some());
+    let selected = match crate::cloud::provider(&s.model) {
+        Some(crate::cloud::Provider::Zen) => 2,
+        Some(crate::cloud::Provider::OpenRouter) => 3,
+        None => usize::from(crate::groq::model_id(&s.model).is_some()),
+    };
     let choice = crate::menu::select(
         "Inference provider",
         &[
             format!("Ollama · {}", s.ollama_url),
             "Groq · cloud API".into(),
+            "OpenCode Zen · free models, no account needed".into(),
+            "OpenRouter · free models, API key needed".into(),
         ],
         selected,
     )?;
@@ -1041,7 +1053,97 @@ fn select_provider_models(s: &Settings) -> Result<Vec<String>> {
             }
             crate::ui::busy("Loading Groq models", crate::groq::models)
         }
+        Some(2) => {
+            crate::ui::clear_notes();
+            crate::ui::notice("OpenCode Zen offers free models without an account. Some models are temporary previews; availability, capacity, and rate limits can change. Chuggin waits and retries provider errors, and never falls back to a paid model. Loading the catalog does not generate a response.".into());
+            crate::ui::busy("Loading free OpenCode Zen models", || {
+                crate::cloud::models(crate::cloud::Provider::Zen)
+            })
+        }
+        Some(3) => {
+            if crate::cloud::key("openrouter/connection-check")?.is_none() {
+                openrouter_settings()?;
+            }
+            anyhow::ensure!(
+                crate::cloud::key("openrouter/connection-check")?.is_some(),
+                "Add an OpenRouter API key in Shared settings before selecting its models"
+            );
+            crate::ui::clear_notes();
+            crate::ui::notice("Only free OpenRouter models are offered here. Free-tier rate and capacity limits can require waiting; Chuggin retries without switching to a paid model. Your project context and response settings remain unchanged.".into());
+            crate::ui::busy("Loading free OpenRouter models", || {
+                crate::cloud::models(crate::cloud::Provider::OpenRouter)
+            })
+        }
         _ => anyhow::bail!("Model selection cancelled; settings unchanged"),
+    }
+}
+
+pub fn openrouter_settings() -> Result<()> {
+    loop {
+        let key_set = crate::cloud::key("openrouter/connection-check")?.is_some();
+        crate::ui::clear_notes();
+        crate::ui::notice("This shared connection is used only when you select an openrouter/ model. Chuggin offers free models and does not switch to paid models. Free capacity and rate limits vary; exhausted capacity uses provider backoff. A catalog check lists models without generating a response or consuming an inference request.".into());
+        let rows = vec![
+            format!(
+                "API key · {}",
+                if key_set {
+                    "Configured"
+                } else {
+                    "Not configured"
+                }
+            ),
+            "Test catalog connection / list free models".into(),
+            "Free providers and availability".into(),
+            "Back".into(),
+        ];
+        match crate::menu::select("OpenRouter · shared free-model connection", &rows, 0)? {
+            Some(0) => match crate::menu::select(
+                "OpenRouter API key",
+                &[
+                    "Enter or replace key".into(),
+                    "Remove key".into(),
+                    "Back".into(),
+                ],
+                0,
+            )? {
+                Some(0) => {
+                    let value = if crate::ui::active() {
+                        crate::ui::ask_secret("OpenRouter API key · input is masked")?
+                    } else {
+                        dialoguer::Password::new()
+                            .with_prompt("OpenRouter API key")
+                            .interact()?
+                    };
+                    crate::web_tools::save_key(&crate::groq::path("openrouter.key")?, &value)?;
+                }
+                Some(1) => {
+                    let path = crate::groq::path("openrouter.key")?;
+                    if path.exists() {
+                        fs::remove_file(path)?;
+                    }
+                }
+                _ => {}
+            },
+            Some(1) => {
+                let names = crate::ui::busy("Checking OpenRouter's free-model catalog", || {
+                    crate::cloud::models(crate::cloud::Provider::OpenRouter)
+                })?;
+                crate::ui::show(
+                    "OpenRouter · free models",
+                    &format!(
+                        "The catalog connection works. This check lists models; it does not generate a response or verify your inference allowance.\n\n{}",
+                        names.join("\n")
+                    ),
+                )?;
+            }
+            Some(2) => {
+                crate::ui::show(
+                    "Free cloud providers",
+                    "OpenCode Zen needs no account for the free models in its picker. Some entries are temporary previews and may disappear or reach capacity.\n\nOpenRouter requires your API key for inference. Its picker includes only tool-capable models with free pricing. Providers may restrict requests, daily usage, context, or simultaneous responses.\n\nChuggin keeps your selected model and retries capacity/rate errors with backoff. It never authorizes a paid fallback. Selecting a cloud model does not change your saved local context or response settings.",
+                )?;
+            }
+            _ => return Ok(()),
+        }
     }
 }
 pub fn groq_settings() -> Result<()> {

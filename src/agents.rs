@@ -301,7 +301,7 @@ pub fn investigate(
         } else {
             settings.model.trim().into()
         };
-        let url = crate::groq::url(&c.ollama_url, &model);
+        let url = crate::cloud::url(&c.ollama_url, &model);
         Job::create(job_id, input, model, url, settings.max_calls)
     };
     if job.status == Status::Completed || job.status == Status::BudgetExhausted {
@@ -962,7 +962,7 @@ mod tests {
         let name = std::env::var("CHUGGIN_LIVE_HELPER_MODEL")
             .expect("Set the live local model explicitly");
         assert!(
-            crate::groq::model_id(&name).is_none(),
+            crate::groq::model_id(&name).is_none() && crate::cloud::provider(&name).is_none(),
             "This smoke test is for an explicitly selected local Ollama model"
         );
         let project = tempfile::tempdir().unwrap();

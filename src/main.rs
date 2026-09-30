@@ -1,6 +1,7 @@
 mod action_watch;
 mod agents;
 mod chat;
+mod cloud;
 mod code_index;
 mod command_jobs;
 mod command_output;
@@ -18,6 +19,7 @@ mod menu;
 mod migration;
 mod model;
 mod nudge;
+mod openai;
 mod operator;
 mod project;
 mod prompts;

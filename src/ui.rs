@@ -1997,6 +1997,13 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         }
         f.render_widget(p(Text::from(history)), side[3]);
     }
+    let provider_model = d
+        .helper
+        .as_ref()
+        .map(|helper| helper.model.as_str())
+        .filter(|model| !model.is_empty())
+        .unwrap_or(&d.active_model);
+    let provider_label = crate::cloud::label(&c.ollama_url, provider_model);
     let health = if d.resources.total_gib > 0. {
         format!(
             " Local CPU {:>3.0}%  ·  RAM {:.0}% of {:.1} GiB  ·  Chuggin {:.0} MiB  │  Provider: {}",
@@ -2004,20 +2011,12 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             d.resources.memory,
             d.resources.total_gib,
             d.resources.rss_mib,
-            if crate::groq::model_id(&c.model).is_some() {
-                "Groq"
-            } else {
-                &c.ollama_url
-            }
+            provider_label
         )
     } else {
         format!(
             " Local resources unavailable  │  Provider: {}",
-            if crate::groq::model_id(&c.model).is_some() {
-                "Groq"
-            } else {
-                &c.ollama_url
-            }
+            provider_label
         )
     };
     f.render_widget(Paragraph::new(health).fg(MUTED), r[4]);
@@ -2228,6 +2227,7 @@ fn dashboard_session(
                         }
                         if stop.swap(true, Ordering::SeqCst) {
                             restore();
+                            crate::terminal_title::restore();
                             crate::engine::force_foreground();
                             std::process::exit(130);
                         }
@@ -2541,6 +2541,7 @@ pub fn busy<T: Send + 'static>(
                 && k.modifiers.contains(KeyModifiers::CONTROL)
             {
                 restore();
+                crate::terminal_title::restore();
                 std::process::exit(130);
             }
         }
@@ -2598,9 +2599,31 @@ mod tests {
         assert!(text.contains("Budget ready in 59s"));
         assert!(text.contains("Helper requests: 1"));
         assert!(text.contains("Helper · read_file example.txt"));
+        assert!(text.contains("Provider: Groq"));
         assert!(!text.contains("PRIVATE_HELPER_PROSE"));
         d.apply(Event::Phase("Work".into()));
         assert!(d.helper.is_none());
+    }
+    #[test]
+    fn cloud_provider_labels_follow_the_actual_request_and_helper() {
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::RequestModel("zen/free-preview".into()));
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        assert!(screen_text(&terminal).contains("Provider: OpenCode Zen"));
+        d.apply(Event::Phase("Investigate".into()));
+        d.apply_helper(
+            "agent/cloud-route",
+            Event::RequestModel("openrouter/free-model:free".into()),
+        );
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        assert!(screen_text(&terminal).contains("Provider: OpenRouter"));
+        assert_eq!(c.model, "example-model:latest");
     }
     #[test]
     fn helper_settings_remain_visible_at_small_terminal_sizes() {

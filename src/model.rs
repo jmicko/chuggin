@@ -75,7 +75,7 @@ impl Model {
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .build()?,
-            url: crate::groq::url(url, name),
+            url: crate::cloud::url(url, name),
             name: name.into(),
             context,
             output,
@@ -91,7 +91,7 @@ impl Model {
             context_pressure: Cell::new(false),
             run_controls: None,
             controls: Arc::new(crate::run_control::RunControl::default()),
-            request_target: RefCell::new((name.into(), crate::groq::url(url, name))),
+            request_target: RefCell::new((name.into(), crate::cloud::url(url, name))),
             pinned_target: None,
             vision_capabilities: RefCell::new(HashMap::new()),
         })
@@ -107,6 +107,11 @@ impl Model {
         let cache_key = (url.to_owned(), name.to_owned());
         if let Some(supported) = self.vision_capabilities.borrow().get(&cache_key) {
             return *supported;
+        }
+        if crate::cloud::provider(name).is_some() {
+            // Cloud catalog capabilities are validated before the request. If
+            // an endpoint rejects an image, the ordinary text recovery applies.
+            return true;
         }
         let Some(base) = url.strip_suffix("/api/chat") else {
             return true;
@@ -202,7 +207,7 @@ impl Model {
             let c = crate::runner::load(path)?;
             Ok((
                 self.selected_name(&c).into(),
-                crate::groq::url(&c.ollama_url, self.selected_name(&c)),
+                crate::cloud::url(&c.ollama_url, self.selected_name(&c)),
                 Some(
                     self.chat_settings
                         .clone()
@@ -574,7 +579,7 @@ impl Model {
             .unwrap_or(&self.name);
         let url = live
             .as_ref()
-            .map(|c| crate::groq::url(&c.ollama_url, self.selected_name(c)))
+            .map(|c| crate::cloud::url(&c.ollama_url, self.selected_name(c)))
             .unwrap_or_else(|| self.url.clone());
         let url = self
             .pinned_target
@@ -590,8 +595,24 @@ impl Model {
             timeout
         };
         let groq = crate::groq::model_id(name);
+        let cloud = crate::cloud::provider(name);
+        let openai = groq.is_some() || cloud.is_some();
+        // Metadata refresh errors belong to this target as well. Recording a
+        // previous model here would let a live switch bypass provider backoff.
+        *self.request_target.borrow_mut() = (name.to_owned(), url.clone());
         // Validate/read credentials before reserving capacity. Never include them in traces.
-        let key = groq.map(|_| crate::groq::key()).transpose()?;
+        let key = if groq.is_some() {
+            Some(crate::groq::key()?)
+        } else {
+            crate::cloud::key(name)?
+        };
+        if cloud.is_some() {
+            anyhow::ensure!(
+                cloud != Some(crate::cloud::Provider::OpenRouter) || key.is_some(),
+                "Add your OpenRouter API key in Shared settings → OpenRouter connection"
+            );
+            crate::cloud::validate(name)?;
+        }
         let output = live
             .as_ref()
             .map(|c| c.output_tokens)
@@ -631,7 +652,7 @@ impl Model {
         crate::events::send(crate::events::Event::RequestModel(name.to_owned()));
         crate::events::send(crate::events::Event::Request);
         anyhow::ensure!(!self.stop.load(Ordering::SeqCst), "Stopped by operator");
-        let wire_messages = if groq.is_none() {
+        let wire_messages = if !openai {
             crate::vision::ollama_messages(messages)?
         } else {
             messages.to_vec()
@@ -644,13 +665,34 @@ impl Model {
             body["format"] = schema;
             body["options"]["temperature"] = json!(0);
         }
-        if let Some(id) = groq {
+        if let Some(id) = groq.or_else(|| crate::cloud::model_id(name)) {
             let formatted = body.get("format").is_some();
-            let mut wire = json!({"model":id,"messages":crate::groq::messages(messages)?,"stream":true,"stream_options":{"include_usage":true},"max_completion_tokens":output,"temperature":if formatted{0.0}else{0.4}});
+            let wire_messages = if cloud.is_some() {
+                crate::openai::messages_for(messages, name)?
+            } else {
+                crate::openai::messages(messages)?
+            };
+            let mut wire = json!({"model":id,"messages":wire_messages,"stream":true,"stream_options":{"include_usage":true},"temperature":if formatted{0.0}else{0.4}});
+            if cloud.is_some() {
+                // Reasoning models can reject sampling overrides. Keep their
+                // provider defaults; Groq retains its existing request policy.
+                wire.as_object_mut().unwrap().remove("temperature");
+            }
+            wire[if groq.is_some() {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            }] = json!(output);
+            if cloud == Some(crate::cloud::Provider::OpenRouter) {
+                // Never route this free integration to a paid endpoint, even
+                // if a model's preview pricing changes between requests.
+                wire["provider"] =
+                    json!({"max_price":{"prompt":0,"completion":0,"request":0,"image":0}});
+            }
             if let Some(t) = body.get("tools") {
                 wire["tools"] = t.clone();
             }
-            if formatted {
+            if formatted && (groq.is_some() || crate::cloud::supports_json(name)?) {
                 wire["response_format"] = json!({"type":"json_object"});
             }
             body = wire;
@@ -674,12 +716,12 @@ impl Model {
         } else {
             None
         };
-        let groq_client = if groq.is_some() {
+        let cloud_client = if openai {
             Some(crate::groq::client()?)
         } else {
             None
         };
-        let request = groq_client
+        let request = cloud_client
             .as_ref()
             .unwrap_or(&self.client)
             .post(url)
@@ -689,12 +731,30 @@ impl Model {
         } else {
             request
         };
+        let request = if cloud.is_some() {
+            request.header(
+                reqwest::header::USER_AGENT,
+                concat!("chuggin/", env!("CARGO_PKG_VERSION")),
+            )
+        } else {
+            request
+        };
         let request = if timeout == 0 {
             request
         } else {
             request.timeout(Duration::from_secs(timeout))
         };
-        let response = request.send()?;
+        let response = request.send().map_err(|error| {
+            let error = anyhow::Error::from(error);
+            if cloud.is_some() {
+                error.context(crate::provider::Unavailable {
+                    reason: "Cloud provider connection failed or timed out",
+                    retry_after: None,
+                })
+            } else {
+                error
+            }
+        })?;
         if let Some(r) = &reservation {
             r.headers(response.headers())?;
         }
@@ -713,7 +773,20 @@ impl Model {
                 r.defer(retry_after.unwrap_or(Duration::from_secs(60)).as_secs())?;
             }
             let mut body = String::new();
-            response.take(16384).read_to_string(&mut body)?;
+            if let Err(error) = response.take(16384).read_to_string(&mut body) {
+                if cloud.is_some() {
+                    if let Some(provider) = crate::provider::classify(status, "", retry_after) {
+                        return Err(provider.into());
+                    }
+                    return Err(
+                        anyhow::Error::from(error).context(crate::provider::Unavailable {
+                            reason: "Cloud provider error response was interrupted",
+                            retry_after,
+                        }),
+                    );
+                }
+                return Err(error.into());
+            }
             if matches!(status, 400 | 422)
                 && crate::vision::has_images(messages)
                 && ["image", "vision", "multimodal"]
@@ -732,18 +805,28 @@ impl Model {
         let mut calls = Vec::new();
         let mut done = false;
         let started = Instant::now();
-        let mut stream = crate::groq::Stream::default();
+        let mut stream = crate::openai::Stream::default();
         let mut finish_reason = String::new();
         for line in BufReader::new(response).lines() {
             anyhow::ensure!(!self.stop.load(Ordering::SeqCst), "Stopped by operator");
-            let line = line?;
+            let line = line.map_err(|error| {
+                let error = anyhow::Error::from(error);
+                if cloud.is_some() {
+                    error.context(crate::provider::Unavailable {
+                        reason: "Cloud provider stream interrupted",
+                        retry_after: None,
+                    })
+                } else {
+                    error
+                }
+            })?;
             if let Some(file) = trace.as_mut() {
                 writeln!(file, "{line}")?;
             }
             if line.is_empty() {
                 continue;
             }
-            let d: Value = if groq.is_some() {
+            let d: Value = if openai {
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
@@ -751,7 +834,7 @@ impl Model {
                 if data == "[DONE]" {
                     anyhow::ensure!(
                         !finish_reason.is_empty(),
-                        "Groq stream ended without a finish reason"
+                        "Cloud stream ended without a finish reason"
                     );
                     if let Some((prompt, generated)) = stream.usage {
                         if let Some(r) = &reservation {
@@ -771,12 +854,12 @@ impl Model {
                     }
                     anyhow::ensure!(
                         matches!(finish_reason.as_str(), "stop" | "tool_calls"),
-                        "Groq response ended with {finish_reason}"
+                        "Cloud response ended with {finish_reason}"
                     );
                     calls = stream.calls()?;
                     anyhow::ensure!(
                         finish_reason != "tool_calls" || !calls.is_empty(),
-                        "Groq finished tool calls without a complete call"
+                        "Cloud finished tool calls without a complete call"
                     );
                     done = true;
                     break;
@@ -790,11 +873,15 @@ impl Model {
                 serde_json::from_str(&line).context("Invalid Ollama stream JSON")?
             };
             if let Some(e) = d.get("error") {
-                if let Some(provider) = crate::provider::classify(200, &e.to_string(), retry_after)
+                let code = e["code"]
+                    .as_u64()
+                    .and_then(|n| u16::try_from(n).ok())
+                    .unwrap_or(200);
+                if let Some(provider) = crate::provider::classify(code, &e.to_string(), retry_after)
                 {
                     return Err(provider.into());
                 }
-                bail!("Ollama: {e}")
+                bail!("Model provider stream error: {e}")
             }
             if let Some(s) = d["message"]["content"].as_str() {
                 content.push_str(s);
@@ -842,11 +929,23 @@ impl Model {
                 break;
             }
         }
+        if !done && cloud.is_some() {
+            return Err(crate::provider::Unavailable {
+                reason: "Cloud provider stream disconnected before completion",
+                retry_after: None,
+            }
+            .into());
+        }
         anyhow::ensure!(done, "Model stream disconnected before completion");
+        let mut reply = json!({"role":"assistant","content":content,"tool_calls":calls});
+        if cloud.is_some() && !self.watchdog_call.get() {
+            reply["_chuggin_reasoning"] =
+                json!({"model":name,"content":thinking,"details":stream.reasoning_details});
+        }
         if !self.watchdog_call.get() {
             *self.completed_reasoning.borrow_mut() = thinking;
         }
-        Ok(json!({"role":"assistant","content":content,"tool_calls":calls}))
+        Ok(reply)
     }
     pub fn structured<T: serde::de::DeserializeOwned + schemars::JsonSchema>(
         &self,
@@ -1593,5 +1692,261 @@ mod vision_transport_tests {
             &model.take_completed_messages().unwrap()
         ));
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cloud_transport_tests {
+    use super::*;
+
+    #[test]
+    fn free_cloud_transports_preserve_tools_reasoning_and_full_conversation() {
+        for provider in ["zen", "openrouter", "missing-key"] {
+            let home = tempfile::tempdir().unwrap();
+            let config = home.path().join("chuggin");
+            std::fs::create_dir_all(&config).unwrap();
+            if provider != "missing-key" {
+                std::fs::write(config.join("openrouter.key"), "fixture-cloud-secret").unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "model::cloud_transport_tests::cloud_worker",
+                    "--ignored",
+                ])
+                .env("XDG_CONFIG_HOME", home.path())
+                .env("CHUGGIN_CLOUD_FIXTURE", provider)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{provider}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "Isolated local mock launched by free_cloud_transports_preserve_tools_reasoning_and_full_conversation"]
+    fn cloud_worker() {
+        let provider = std::env::var("CHUGGIN_CLOUD_FIXTURE").unwrap();
+        if provider == "missing-key" {
+            assert!(
+                crate::cloud::key("openrouter/connection-check")
+                    .unwrap()
+                    .is_none()
+            );
+            let model = Model::new(
+                "http://unused",
+                "openrouter/stealth/space-bunny-alpha",
+                32768,
+                4096,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            let error = model.chat_format_once(&[], None, None).unwrap_err();
+            assert!(error.to_string().contains("Add your OpenRouter API key"));
+            return;
+        }
+        let zen = provider == "zen";
+        let name = if zen {
+            "zen/space-bunny-free"
+        } else {
+            "openrouter/stealth/space-bunny-alpha"
+        };
+        let id = crate::cloud::model_id(name).unwrap().to_owned();
+        let metadata = if zen {
+            json!({"id":id,"cost":{"input":0,"output":0},"tool_call":true,"modalities":{"input":["text","image"],"output":["text"]},"provider":{"npm":"@ai-sdk/openai-compatible"}})
+        } else {
+            json!({"id":id,"pricing":{"prompt":"0","completion":"0"},"architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},"supported_parameters":["tools"]})
+        };
+        crate::cloud::seed_catalog(
+            crate::cloud::provider(name).unwrap(),
+            &json!({"data":[metadata]}),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut model = Model::new(
+            "http://unused",
+            name,
+            128000,
+            4096,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        model.url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let trace = tempfile::tempdir().unwrap();
+        model.trace_to(trace.path());
+        let server = std::thread::spawn(move || {
+            for round in 0..5 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut length = 0;
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(size) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = size.trim().parse().unwrap();
+                    }
+                    headers.push_str(&line);
+                }
+                assert!(headers.to_lowercase().contains(if zen {
+                    "authorization: bearer public"
+                } else {
+                    "authorization: bearer fixture-cloud-secret"
+                }));
+                assert!(headers.to_lowercase().contains("user-agent: chuggin/"));
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["model"], id);
+                assert_eq!(body["max_tokens"], 4096);
+                for field in ["options", "think", "temperature", "max_completion_tokens"] {
+                    assert!(body.get(field).is_none(), "{field}");
+                }
+                assert_eq!(
+                    body["messages"][0]["content"].as_str().unwrap().len(),
+                    30000,
+                    "Cloud never uses Groq's token trimming"
+                );
+                if !zen {
+                    assert_eq!(
+                        body["provider"]["max_price"],
+                        json!({"prompt":0,"completion":0,"request":0,"image":0})
+                    );
+                }
+                if round == 1 {
+                    assert_eq!(
+                        body["messages"][1]["reasoning_content"],
+                        "Private cloud reasoning"
+                    );
+                    assert_eq!(
+                        body["messages"][1]["tool_calls"][0]["function"]["arguments"],
+                        "{\"path\":\"fixture.txt\"}"
+                    );
+                    assert_eq!(body["messages"][2]["tool_call_id"], "cloud-call");
+                    assert_eq!(body["messages"][2]["content"], "Tool evidence");
+                }
+                if round == 2 {
+                    write!(socket,"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 123\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                if round == 4 {
+                    write!(socket,"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 321\r\nContent-Length: 1\r\nConnection: close\r\n\r\n").unwrap();
+                    socket.write_all(&[0xff]).unwrap();
+                    continue;
+                }
+                let frames = match round {
+                    0 => vec![
+                        json!({"choices":[{"delta":{"reasoning_content":"Private cloud reasoning"}}]}),
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"cloud-call","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}),
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"fixture.txt\"}"}}]},"finish_reason":"tool_calls"}]}),
+                        json!({"choices":[],"usage":{"prompt_tokens":9000,"completion_tokens":50}}),
+                    ],
+                    1 => vec![
+                        json!({"choices":[{"delta":{"content":"{\"goal\":\"Complete\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9100,"completion_tokens":20}}),
+                    ],
+                    _ => vec![json!({"error":{"code":503,"message":"Upstream maintenance"}})],
+                };
+                let mut data: String = frames
+                    .iter()
+                    .map(|frame| format!("data: {frame}\n\n"))
+                    .collect();
+                data.push_str("data: [DONE]\n\n");
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",data.len()).unwrap();
+            }
+        });
+        let mut messages = vec![json!({"role":"user","content":"x".repeat(30000)})];
+        let first = model.chat(&messages, Some(tools()), false).unwrap();
+        assert_eq!(
+            first["tool_calls"][0]["function"]["arguments"],
+            json!({"path":"fixture.txt"})
+        );
+        assert_eq!(model.take_completed_reasoning(), "Private cloud reasoning");
+        assert!(model.take_completed_reasoning().is_empty());
+        messages.push(first);
+        messages.push(json!({"role":"tool","tool_call_id":"cloud-call","tool_name":"read_file","content":"Tool evidence"}));
+        let second = model.chat(&messages, None, true).unwrap();
+        assert_eq!(second["content"], "{\"goal\":\"Complete\"}");
+        let error = model.chat_format_once(&messages, None, None).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::provider::Unavailable>()
+                .unwrap()
+                .retry_after,
+            Some(Duration::from_secs(123))
+        );
+        assert!(
+            model
+                .chat_format_once(&messages, None, None)
+                .unwrap_err()
+                .downcast_ref::<crate::provider::Unavailable>()
+                .is_some()
+        );
+        let error = model.chat_format_once(&messages, None, None).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::provider::Unavailable>()
+                .unwrap()
+                .retry_after,
+            Some(Duration::from_secs(321))
+        );
+        server.join().unwrap();
+        for file in std::fs::read_dir(trace.path()).unwrap().flatten() {
+            assert!(
+                !std::fs::read_to_string(file.path())
+                    .unwrap()
+                    .contains("fixture-cloud-secret")
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod zen_live_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "Set CHUGGIN_LIVE_ZEN=1 to run two tiny public OpenCode Zen requests; never uses Ollama"]
+    fn public_zen_streaming_tool_round_trip() {
+        assert_eq!(std::env::var("CHUGGIN_LIVE_ZEN").as_deref(), Ok("1"));
+        let model = Model::new(
+            "http://unused",
+            "zen/space-bunny-free",
+            32768,
+            4096,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let trace = tempfile::tempdir().unwrap();
+        model.trace_to(trace.path());
+        let mut messages = vec![
+            json!({"role":"system","content":"Client integration check: call lookup_token exactly once to obtain a token, then return only a JSON object with that token. Do not invent the token or repeat the lookup."}),
+            json!({"role":"user","content":"Look up the token now."}),
+        ];
+        let tools = json!([{"type":"function","function":{"name":"lookup_token","description":"Obtain the integration fixture token.","parameters":{"type":"object","properties":{}}}}]);
+        let response = model.chat(&messages, Some(tools), false).unwrap();
+        assert_eq!(response["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            response["tool_calls"][0]["function"]["name"],
+            "lookup_token"
+        );
+        let id = response["tool_calls"][0]["id"].clone();
+        messages.push(response);
+        messages.push(json!({"role":"tool","tool_name":"lookup_token","tool_call_id":id,"content":"{\"token\":\"CHUGGIN_ZEN_ROUNDTRIP_OK\"}"}));
+        let response = model.chat(&messages, None, true).unwrap();
+        let reply: Value = parse_reply(response["content"].as_str().unwrap()).unwrap();
+        assert_eq!(reply["token"], "CHUGGIN_ZEN_ROUNDTRIP_OK");
+        println!(
+            "Public Zen tool request and JSON reply succeeded through Chuggin's production client."
+        );
     }
 }

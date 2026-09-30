@@ -143,8 +143,9 @@ commands, launch other helpers, or decide whether work is complete. Their report
 are advisory, and main work remains saved even when an investigation is inconclusive.
 
 Choose **Use project model** to use the project's connection, or explicitly
-select an Ollama or Groq model. Ollama uses the project's server; Groq uses the
-configured shared key and request/token budgets. Investigations run sequentially
+select a model from Ollama, Groq, OpenCode Zen, or OpenRouter. Ollama uses the
+project's server; cloud models use their provider's connection and limits.
+Groq keeps its shared request/token budgets. Investigations run sequentially
 with main work. Separate-provider parallel jobs are not enabled by this feature.
 Helper traffic passes through the same provider recovery and quota handling as
 other requests. It does not bypass Groq waits or silently switch providers.
@@ -804,9 +805,48 @@ setting off and resume to return to indefinite looping. Reports remain in the
 cycle artifacts. Turning the setting off also rejects outstanding completion
 calls; running commands must finish before the model can report completion.
 
-## License
+## Cloud inference
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+**Choose model** offers Ollama, Groq, OpenCode Zen, and OpenRouter. Selecting a
+provider loads its model catalog; it does not generate a response. Model choices
+are explicit: adding a connection does not change an existing project's model or
+the shared default. Chat and investigation helpers can select these providers too.
+
+### OpenCode Zen free models
+
+Choose **Choose model → OpenCode Zen**. No account or API key is needed for the
+free models offered by this connection. Saved model names start with `zen/`.
+The picker includes tool-capable models whose catalog lists free pricing.
+For Space Bunny, select `zen/space-bunny-free`.
+
+Some free models are temporary previews. Availability, capacity, and provider
+limits can change, so a free model is not a guarantee of unlimited throughput.
+Chuggin waits and retries rate/capacity errors while retaining your selected model.
+It never switches to a paid Zen model.
+Zen publishes its API for other coding agents. Its
+[service terms](https://opencode.ai/legal/terms-of-service) still apply, including
+restrictions on quota circumvention and broad wording about unattended processes.
+Free API access should not be taken as an assurance of unlimited 24/7 use.
+
+### OpenRouter free models
+
+Add your key under **Settings → Shared settings → OpenRouter**, then choose
+**Choose model → OpenRouter**. The key is masked during entry and stored privately
+as `openrouter.key` alongside the shared settings. It is excluded from project
+configuration and request artifacts. The catalog check lists models without
+generating a response; it does not verify your remaining inference allowance.
+
+Saved names start with `openrouter/`. The picker includes only tool-capable models
+whose catalog lists free input and output pricing. Requests retain this free-only
+policy and do not silently fall back to paid models. Free-tier requests may wait
+for rate limits or available capacity; retries use provider backoff.
+Space Bunny is listed as `openrouter/stealth/space-bunny-alpha`; its model page
+currently gives an October 5, 2026 preview end date. See the live
+[model page](https://openrouter.ai/stealth/space-bunny-alpha) for availability.
+
+Your context window and response limit remain project settings. Choosing a cloud
+model does not reduce local-model settings or expand them automatically. Provider
+context and output limits still apply to that model.
 
 ### Groq free-tier inference
 
@@ -854,3 +894,7 @@ usage, not a provider tokenizer guarantee. Other apps/machines using your Groq
 organization are only reflected in provider headers, so 429 recovery remains a
 fallback. Cached tokens are conservatively counted locally. The local limits are
 not an account-wide billing cap and do not automatically enable paid usage.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
