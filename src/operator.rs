@@ -460,6 +460,11 @@ impl Controller {
     fn execute(self: &Arc<Self>, session: &str, name: &str, args: &Value) -> Result<Value> {
         let c = self.config()?;
         match name {
+            "view_image" => crate::image_tools::inspect(&c.repo, &c.state_dir, args),
+            "capture_screenshot" => crate::image_tools::capture(&c.repo, &c.state_dir, args),
+            "request_tool" => {
+                crate::tool_requests::record(&c.state_dir, args, "operator chat / MCP")
+            }
             "acknowledge_controller_restart" => {
                 ensure!(
                     args["previous_commands_stopped"] == true,
@@ -915,6 +920,8 @@ pub fn is_mutation(name: &str) -> bool {
         "begin_edit",
         "command_status",
         "read_file",
+        "view_image",
+        "capture_screenshot",
         "search",
         "list_files",
         "project_map",
@@ -931,6 +938,9 @@ pub fn schemas() -> Value {
     let common = crate::model::tools();
     let allowed = [
         "read_file",
+        "view_image",
+        "capture_screenshot",
+        "request_tool",
         "search",
         "list_files",
         "project_map",

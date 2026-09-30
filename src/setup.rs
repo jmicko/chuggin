@@ -856,6 +856,7 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
                 "This project · Chat model".into(),
                 "This project · Investigation helpers".into(),
                 "This project · External AI access (MCP)".into(),
+                "This project · Tool requests".into(),
                 "Shared settings".into(),
                 "Back".into(),
             ],
@@ -892,7 +893,8 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
                     external_control_info(p)?;
                 }
             }
-            4 => settings_menu()?,
+            4 => crate::tool_requests::menu(path.context("No project selected")?)?,
+            5 => settings_menu()?,
             _ => return Ok(()),
         }
     }

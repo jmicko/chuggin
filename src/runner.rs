@@ -1549,6 +1549,23 @@ fn work(
                     );
                 }
                 match name {
+                    "view_image" => {
+                        Ok(crate::image_tools::inspect(&root, &c.state_dir, args)?.to_string())
+                    }
+                    "capture_screenshot" => {
+                        Ok(crate::image_tools::capture(&root, &c.state_dir, args)?.to_string())
+                    }
+                    "request_tool" => {
+                        let requested = crate::tool_requests::record(&c.state_dir, args, &c.model)?;
+                        if requested["duplicate"] == false {
+                            crate::events::log(format!(
+                                "Tool request #{}: {} · review in Settings → Tool requests",
+                                requested["request_id"],
+                                args["capability"].as_str().unwrap_or("missing capability")
+                            ));
+                        }
+                        Ok(requested.to_string())
+                    }
                     "set_task" => {
                         let task: Task = serde_json::from_value(args.clone())?;
                         anyhow::ensure!(!task.title.trim().is_empty(), "Task needs a title");
@@ -1713,6 +1730,10 @@ fn work(
                                 }
                                 "read_history" => {
                                     Ok(crate::history::read(&c.state_dir, args)?.to_string())
+                                }
+                                "view_image" => {
+                                    Ok(crate::image_tools::inspect(&root, &c.state_dir, args)?
+                                        .to_string())
                                 }
                                 _ => inspect_tool(&root, tool, args, &mut research),
                             },
@@ -1940,11 +1961,7 @@ fn work(
             } else {
                 value.clone()
             };
-            let mut reply =
-                json!({"role":"tool","tool_name":name,"content":reply_value.to_string()});
-            if let Some(id) = call.get("id") {
-                reply["tool_call_id"] = id.clone();
-            }
+            let reply = crate::vision::tool_reply(name, &reply_value, call.get("id"));
             session.messages.push(reply);
             if let Some(intervention) = session.action_watch.observe(name, args, &value) {
                 let reason = format!(

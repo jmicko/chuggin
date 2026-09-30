@@ -16,6 +16,17 @@ struct Server {
     client: crate::engine::Client,
     sessions: Arc<Mutex<BTreeSet<String>>>,
 }
+fn observation_content(value: &Value) -> Result<Vec<ContentBlock>> {
+    let reply = crate::vision::tool_reply("observation", value, None);
+    let mut content = vec![ContentBlock::text(reply["content"].as_str().unwrap_or(""))];
+    if let Some(images) = reply["_chuggin_images"].as_array() {
+        for attachment in images {
+            let (data, mime) = crate::vision::encoded_image(attachment)?;
+            content.push(ContentBlock::image(data, mime));
+        }
+    }
+    Ok(content)
+}
 fn tools() -> Vec<Tool> {
     let mut entries = Vec::new();
     entries.push(serde_json::from_value(json!({"name":"open_operator_session","description":"Open or resume a project operator session. Does not start the loop. Use the returned session_id on tools; retain editing control around any external native edits or commands.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}}}})).unwrap());
@@ -117,7 +128,12 @@ impl ServerHandler for Server {
         }).await;
         let response = match result {
             Ok(Ok(v)) if v["status"] != "failed" && v["status"] != "uncertain" => {
-                CallToolResult::success(vec![ContentBlock::text(v.to_string())])
+                match observation_content(&v) {
+                    Ok(content) => CallToolResult::success(content),
+                    Err(error) => CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Image observation unavailable: {error:#}"
+                    ))]),
+                }
             }
             Ok(Ok(v)) => CallToolResult::error(vec![ContentBlock::text(v.to_string())]),
             Ok(Err(e)) => CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]),
@@ -151,4 +167,40 @@ pub fn serve(path: &Path) -> Result<()> {
     });
     active.store(false, Ordering::SeqCst);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn image_observations_are_native_mcp_content_blocks() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(12, 8, image::Rgba([180, 35, 20, 255]))
+            .save(root.path().join("diagram.png"))
+            .unwrap();
+        let observation =
+            crate::image_tools::inspect(root.path(), state.path(), &json!({"path":"diagram.png"}))
+                .unwrap();
+        let contents =
+            observation_content(&json!({"status":"complete","result":observation})).unwrap();
+        assert_eq!(contents.len(), 2);
+        let image = contents[1]
+            .as_image()
+            .expect("MCP clients must receive actual image content");
+        assert_eq!(image.mime_type, "image/png");
+        use base64::Engine;
+        let pixels = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .unwrap();
+        assert_eq!(image::load_from_memory(&pixels).unwrap().width(), 12);
+        assert!(!contents[0].as_text().unwrap().text.contains(&image.data));
+        let names: Vec<_> = tools()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        for name in ["view_image", "capture_screenshot", "request_tool"] {
+            assert!(names.iter().any(|entry| entry == name));
+        }
+    }
 }

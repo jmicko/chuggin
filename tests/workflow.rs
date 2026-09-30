@@ -113,6 +113,10 @@ impl Server {
                 }
                 let data = if first.starts_with("GET") {
                     json!({"models":[{"name":"fake"}]}).to_string()
+                } else if first.starts_with("POST /api/show ") {
+                    let mut data = vec![0; length];
+                    reader.read_exact(&mut data).unwrap();
+                    json!({"capabilities":["completion","tools","vision"]}).to_string()
                 } else {
                     let mut data = vec![0; length];
                     reader.read_exact(&mut data).unwrap();
@@ -609,6 +613,77 @@ fn finish_task_records_completion_only_when_checks_pass_and_always_saves_edits()
         assert_eq!(saved["last_checks_passed_ref"].is_string(), pass);
         assert_eq!(server.requests.lock().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn image_observations_reach_the_model_and_tool_requests_survive_restart() {
+    let server = Server::custom(false, false, None, |_, request| {
+        if request == 0 {
+            (
+                String::new(),
+                json!([
+                    task_tool("Inspect a visual artifact"),
+                    {"function":{"name":"view_image","arguments":{"path":"fixture.png"}}},
+                    {"function":{"name":"request_tool","arguments":{"capability":"Interactive chart inspection","use_case":"Measure exact coordinates in a rendered chart","reason":"Current image tools provide pixels but no structured coordinates"}}}
+                ]),
+            )
+        } else if request == 1 {
+            (
+                String::new(),
+                json!([{"function":{"name":"finish_task","arguments":{"summary":"Inspected the visual fixture and recorded a missing capability for human review."}}}]),
+            )
+        } else {
+            (
+                "The saved request remains available for review.".into(),
+                json!([]),
+            )
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    image::RgbaImage::from_pixel(32, 16, image::Rgba([220, 35, 20, 255]))
+        .save(root.path().join("repo/fixture.png"))
+        .unwrap();
+    run_cycles(root.path(), 1);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let image_input = messages
+        .iter()
+        .find(|m| m["images"].is_array())
+        .expect("Actual image pixels must reach Ollama");
+    assert_eq!(image_input["role"], "user");
+    let encoded = image_input["images"][0].as_str().unwrap();
+    use base64::Engine;
+    let pixels = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap();
+    assert_eq!(image::load_from_memory(&pixels).unwrap().width(), 32);
+    let position = messages.iter().position(|m| m == image_input).unwrap();
+    assert_eq!(messages[position - 1]["role"], "tool");
+    assert_eq!(
+        messages[position - 1]["tool_name"],
+        "request_tool",
+        "Images must follow the entire tool batch"
+    );
+    let conversation = fs::read_to_string(root.path().join("state/conversation.json")).unwrap();
+    assert!(conversation.contains("_chuggin_images"));
+    assert!(
+        !conversation.contains(encoded),
+        "Saved history must use artifact references, not base64 payloads"
+    );
+    let inbox: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/tool-requests.json")).unwrap())
+            .unwrap();
+    assert_eq!(inbox["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox["requests"][0]["status"], "new");
+    assert!(state(root.path())["current_task"].is_null());
+    drop(requests);
+    run_cycles(root.path(), 1);
+    let restored: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/tool-requests.json")).unwrap())
+            .unwrap();
+    assert_eq!(restored["requests"], inbox["requests"]);
 }
 
 #[test]

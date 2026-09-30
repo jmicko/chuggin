@@ -86,6 +86,7 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             "Settings".into(),
             "Run duration".into(),
             "Chat with this project".into(),
+            "Tool requests".into(),
             "Quit".into(),
         ];
         let effective = project.as_ref().and_then(|p| runner::load(p).ok());
@@ -168,11 +169,18 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                         crate::ui::chat_home(path, stop.clone(), running.clone())?;
                     }
                 }
+                7 => {
+                    if let Some(path) = project.as_ref() {
+                        crate::tool_requests::menu(path)?;
+                    } else {
+                        crate::ui::show("Tool requests", "Set up this project first.")?;
+                    }
+                }
                 _ => {}
             }
             Ok(())
         })();
-        if choice == 7 {
+        if choice == 8 {
             return Ok(());
         }
         if let Err(e) = action {

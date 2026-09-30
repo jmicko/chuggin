@@ -3,6 +3,7 @@ use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -17,6 +18,22 @@ struct InterruptedResponse {
     reason: &'static str,
     prefix: String,
 }
+#[derive(Debug)]
+struct VisionRejected;
+impl std::fmt::Display for VisionRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Provider rejected image input for the selected model")
+    }
+}
+impl std::error::Error for VisionRejected {}
+#[derive(Debug)]
+struct ProviderTargetChanged;
+impl std::fmt::Display for ProviderTargetChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Selected provider changed while awaiting request admission")
+    }
+}
+impl std::error::Error for ProviderTargetChanged {}
 impl std::fmt::Display for InterruptedResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.reason)
@@ -43,6 +60,7 @@ pub struct Model {
     pub(crate) controls: Arc<crate::run_control::RunControl>,
     request_target: RefCell<(String, String)>,
     pinned_target: Option<(String, String, PathBuf)>,
+    vision_capabilities: RefCell<HashMap<(String, String), bool>>,
 }
 impl Model {
     pub fn new(
@@ -73,7 +91,48 @@ impl Model {
             controls: Arc::new(crate::run_control::RunControl::default()),
             request_target: RefCell::new((name.into(), crate::groq::url(url, name))),
             pinned_target: None,
+            vision_capabilities: RefCell::new(HashMap::new()),
         })
+    }
+    fn supports_vision(&self, name: &str, url: &str) -> bool {
+        if let Some(id) = crate::groq::model_id(name) {
+            // Groq documents this vision+tools model; other Groq models need a
+            // text fallback rather than a permanently rejected conversation.
+            return id == "qwen/qwen3.8-27b"
+                || id.contains("llama-4-scout")
+                || id.contains("llama-4-maverick");
+        }
+        let cache_key = (url.to_owned(), name.to_owned());
+        if let Some(supported) = self.vision_capabilities.borrow().get(&cache_key) {
+            return *supported;
+        }
+        let Some(base) = url.strip_suffix("/api/chat") else {
+            return true;
+        };
+        let response = self
+            .client
+            .post(format!("{base}/api/show"))
+            .json(&json!({"model":name}))
+            .timeout(Duration::from_secs(10))
+            .send();
+        if let Ok(response) = response
+            && response.status().is_success()
+            && let Ok(metadata) = response.json::<Value>()
+            && let Some(capabilities) = metadata["capabilities"].as_array()
+        {
+            let supported = capabilities.iter().any(|c| c == "vision");
+            self.vision_capabilities
+                .borrow_mut()
+                .insert(cache_key, supported);
+            supported
+        } else {
+            // Older servers may not advertise capabilities. The chat endpoint
+            // gets one chance; a vision-specific rejection recovers as text.
+            self.vision_capabilities
+                .borrow_mut()
+                .insert(cache_key, true);
+            true
+        }
     }
     pub fn take_completed_messages(&self) -> Option<Vec<Value>> {
         self.completed_messages.borrow_mut().take()
@@ -270,6 +329,7 @@ impl Model {
     ) -> Result<Value> {
         *self.completed_messages.borrow_mut() = None;
         let mut conversation = messages.to_vec();
+        let canonical_tools = tools;
         let mut transport_retries = 0;
         let mut generation_retries = 0;
         let mut provider_attempts = 0u32;
@@ -281,8 +341,34 @@ impl Model {
             self.wait_for_provider(&record)?;
         }
         loop {
-            let target = self.provider_target()?.0;
+            // Groq documentation compaction lasts one target attempt. A later
+            // local model always receives the original complete descriptions.
+            let mut tools = canonical_tools.clone();
+            let image_attempt = crate::vision::has_images(&conversation);
+            self.pause_point();
+            let (target, target_url, _) = self.provider_target()?;
+            if crate::vision::has_images(&conversation) {
+                let supported = self.supports_vision(&target, &target_url);
+                conversation = crate::vision::prepare(
+                    &conversation,
+                    supported,
+                    &format!("Model {target} does not support images"),
+                );
+                if !supported {
+                    crate::events::log(format!(
+                        "Model {target} cannot inspect images; returning an explicit image-tool failure and continuing with text."
+                    ));
+                }
+            }
             if crate::groq::model_id(&target).is_some() {
+                if crate::vision::has_images(&conversation)
+                    && let Err(error) =
+                        crate::vision::ensure_groq_payload(&conversation, tools.as_ref())
+                {
+                    conversation =
+                        crate::vision::prepare(&conversation, false, &format!("{error:#}"));
+                    crate::events::log("Image observation exceeds Groq's encoded request size; returning an explicit tool failure and continuing as text.".into());
+                }
                 let configured_output = self
                     .settings_path
                     .as_ref()
@@ -295,8 +381,45 @@ impl Model {
                     .unwrap_or(configured_output)
                     .min(configured_output)
                     .min(crate::groq::Limits::load()?.max_response_tokens);
-                let prepared =
-                    crate::groq::prepare(&target, &conversation, tools.as_ref(), output as u64)?;
+                let prepared = match crate::groq::prepare(
+                    &target,
+                    &conversation,
+                    tools.as_ref(),
+                    output as u64,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(_) if image_attempt => {
+                        if let Some(schema) = &tools {
+                            tools = Some(crate::groq::compact_descriptions(schema));
+                        }
+                        match crate::groq::prepare(
+                            &target,
+                            &conversation,
+                            tools.as_ref(),
+                            output as u64,
+                        ) {
+                            Ok(prepared) => {
+                                crate::events::log("Groq image budget: shortened tool documentation, preserving all tools and argument constraints.".into());
+                                prepared
+                            }
+                            Err(error) => {
+                                let reason = format!(
+                                    "Groq's request token allowance cannot fit the images plus the current goal/tools: {error:#}. Use a larger configured allowance only if your account supports it, or use a local vision model"
+                                );
+                                conversation =
+                                    crate::vision::prepare(&conversation, false, &reason);
+                                crate::events::log("Image observation could not fit Groq's request allowance; returning an explicit tool failure and continuing as text without sending the oversized request.".into());
+                                crate::groq::prepare(
+                                    &target,
+                                    &conversation,
+                                    tools.as_ref(),
+                                    output as u64,
+                                )?
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error),
+                };
                 if prepared != conversation
                     && let Some(path) = self.trace.borrow().as_ref()
                 {
@@ -313,6 +436,23 @@ impl Model {
             let result = self.chat_format_once(&conversation, tools.clone(), format.clone());
             if let Err(error) = &result {
                 crate::events::send(crate::events::Event::RequestFinished);
+                if error.downcast_ref::<ProviderTargetChanged>().is_some() {
+                    conversation = messages.to_vec();
+                    continue;
+                }
+                if error.downcast_ref::<VisionRejected>().is_some() {
+                    let (failed_name, failed_url) = self.request_target.borrow().clone();
+                    self.vision_capabilities
+                        .borrow_mut()
+                        .insert((failed_url, failed_name.clone()), false);
+                    conversation = crate::vision::prepare(
+                        &conversation,
+                        false,
+                        &format!("Provider rejected image input for {failed_name}"),
+                    );
+                    crate::events::log("Image input rejected: returning an explicit image-tool failure and continuing the same conversation as text. Select a vision-capable model and request the image again.".into());
+                    continue;
+                }
                 if let Some(provider) = error.downcast_ref::<crate::provider::Unavailable>() {
                     provider_attempts = provider_attempts.saturating_add(1);
                     let delay = provider
@@ -390,6 +530,7 @@ impl Model {
                 crate::events::log("Model response recovered; continuing the current task.".into());
             }
             if result.is_ok() {
+                crate::vision::mark_observed(&mut conversation);
                 *self.completed_messages.borrow_mut() = Some(conversation);
             }
             return result;
@@ -466,7 +607,7 @@ impl Model {
                     let record = json!({"reason":"Groq budget: waiting before sending a request", "model":name,"url":url,"until":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()+seconds});
                     self.wait_for_provider(&record)?;
                     if self.provider_target()?.0 != name {
-                        return self.chat_format_once(messages, tools, format);
+                        return Err(ProviderTargetChanged.into());
                     }
                 }
             }
@@ -478,7 +619,12 @@ impl Model {
         crate::events::send(crate::events::Event::RequestModel(name.to_owned()));
         crate::events::send(crate::events::Event::Request);
         anyhow::ensure!(!self.stop.load(Ordering::SeqCst), "Stopped by operator");
-        let mut body = json!({"model":name,"messages":messages,"stream":true,"think":false,"options":{"num_ctx":self.context,"num_predict":output,"temperature":0.4}});
+        let wire_messages = if groq.is_none() {
+            crate::vision::ollama_messages(messages)?
+        } else {
+            messages.to_vec()
+        };
+        let mut body = json!({"model":name,"messages":wire_messages,"stream":true,"think":false,"options":{"num_ctx":self.context,"num_predict":output,"temperature":0.4}});
         if let Some(t) = tools {
             body["tools"] = t;
         }
@@ -508,7 +654,7 @@ impl Model {
             )?;
             std::fs::write(
                 path.join(format!("request-{sequence:03}.json")),
-                serde_json::to_vec_pretty(&body)?,
+                serde_json::to_vec_pretty(&crate::vision::trace_body(&body, messages))?,
             )?;
             Some(std::fs::File::create(
                 path.join(format!("response-{sequence:03}.ndjson")),
@@ -556,6 +702,14 @@ impl Model {
             }
             let mut body = String::new();
             response.take(16384).read_to_string(&mut body)?;
+            if matches!(status, 400 | 422)
+                && crate::vision::has_images(messages)
+                && ["image", "vision", "multimodal"]
+                    .iter()
+                    .any(|word| body.to_lowercase().contains(word))
+            {
+                return Err(VisionRejected.into());
+            }
             if let Some(provider) = crate::provider::classify(status, &body, retry_after) {
                 return Err(provider.into());
             }
@@ -785,6 +939,14 @@ pub fn tools() -> Value {
         .as_array_mut()
         .unwrap()
         .extend(crate::dev_tools::schemas());
+    tools
+        .as_array_mut()
+        .unwrap()
+        .extend(crate::image_tools::schemas());
+    tools
+        .as_array_mut()
+        .unwrap()
+        .extend(crate::tool_requests::schemas());
     tools.as_array_mut().unwrap().push(crate::symbols::schema());
     tools.as_array_mut().unwrap().push(crate::search::schema());
     tools
@@ -1090,5 +1252,213 @@ mod groq_transport_tests {
             let s = std::fs::read_to_string(entry.path()).unwrap();
             assert!(!s.contains("fixture-secret-not-real"));
         }
+    }
+}
+
+#[cfg(test)]
+mod vision_transport_tests {
+    use super::*;
+    fn request(socket: &std::net::TcpStream) -> (String, Value) {
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        let mut size = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(length) = line.to_lowercase().strip_prefix("content-length:") {
+                size = length.trim().parse().unwrap();
+            }
+        }
+        let mut bytes = vec![0; size];
+        reader.read_exact(&mut bytes).unwrap();
+        (first, serde_json::from_slice(&bytes).unwrap())
+    }
+    fn respond(socket: &mut std::net::TcpStream, status: &str, value: Value) {
+        let text = format!("{value}\n");
+        write!(socket,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",text.len()).unwrap();
+    }
+    #[test]
+    fn native_vision_capability_is_cached_and_traces_hold_only_artifact_refs() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for index in 0..3 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (path, body) = request(&socket);
+                if index == 0 {
+                    assert!(path.contains("/api/show"));
+                    respond(
+                        &mut socket,
+                        "200 OK",
+                        json!({"capabilities":["completion","tools","vision"]}),
+                    );
+                } else {
+                    assert!(path.contains("/api/chat"));
+                    assert_eq!(body["messages"][3]["role"], "user");
+                    assert!(body["messages"][3]["images"][0].as_str().is_some());
+                    respond(
+                        &mut socket,
+                        "200 OK",
+                        json!({"message":{"role":"assistant","content":"Observed red"},"done":true,"done_reason":"stop"}),
+                    );
+                }
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let picture = directory.path().join("image.png");
+        image::RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0]))
+            .save(&picture)
+            .unwrap();
+        let model = Model::new(
+            &url,
+            "vision-fixture",
+            4096,
+            256,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        model.trace_to(directory.path());
+        let mut conversation = vec![
+            json!({"role":"user","content":"Inspect the image"}),
+            json!({"role":"assistant","tool_calls":[{"id":"img","function":{"name":"view_image","arguments":{"path":"image.png"}}}],"content":""}),
+            crate::vision::tool_reply(
+                "view_image",
+                &json!({"_chuggin_images":[{"path":picture,"mime_type":"image/png","width":2,"height":2}]}),
+                Some(&json!("img")),
+            ),
+        ];
+        model.chat(&conversation, None, false).unwrap();
+        conversation = model.take_completed_messages().unwrap();
+        assert_eq!(conversation[2]["_chuggin_images_observed"], true);
+        model.chat(&conversation, None, false).unwrap();
+        server.join().unwrap();
+        for name in ["request-000.json", "request-001.json"] {
+            let trace: Value =
+                serde_json::from_slice(&std::fs::read(directory.path().join(name)).unwrap())
+                    .unwrap();
+            assert!(trace.get("_chuggin_image_artifacts").is_some());
+            assert!(trace["messages"][3].is_null());
+        }
+    }
+    #[test]
+    #[ignore = "Requires user-authorized live Ollama vision server"]
+    fn live_ollama_image_observation() {
+        let url = std::env::var("CHUGGIN_VISION_URL").expect("Set CHUGGIN_VISION_URL");
+        let name = std::env::var("CHUGGIN_VISION_MODEL").expect("Set CHUGGIN_VISION_MODEL");
+        let directory = tempfile::tempdir().unwrap();
+        let picture = directory.path().join("shapes.png");
+        let mut pixels = image::RgbImage::from_pixel(320, 160, image::Rgb([255, 255, 255]));
+        // Two shapes: red square left, green circle right; no labels reveal colors.
+        for x in 25..125 {
+            for y in 30..130 {
+                pixels.put_pixel(x, y, image::Rgb([255, 0, 0]));
+            }
+        }
+        for x in 180i32..300 {
+            for y in 20i32..140 {
+                if (x - 240).pow(2) + (y - 80).pow(2) <= 2500 {
+                    pixels.put_pixel(x as u32, y as u32, image::Rgb([0, 180, 0]));
+                }
+            }
+        }
+        pixels.save(&picture).unwrap();
+        let model = Model::new(&url, &name, 8192, 512, Arc::new(AtomicBool::new(false))).unwrap();
+        model.trace_to(directory.path());
+        let conversation = vec![
+            json!({"role":"user","content":"Describe the shapes in the tool's image: color, shape, and left/right location. Answer briefly from the actual pixels."}),
+            json!({"role":"assistant","tool_calls":[{"id":"img","function":{"name":"view_image","arguments":{"path":"shapes.png"}}}],"content":""}),
+            crate::vision::tool_reply(
+                "view_image",
+                &json!({"_chuggin_images":[{"path":picture,"mime_type":"image/png","width":320,"height":160}]}),
+                Some(&json!("img")),
+            ),
+        ];
+        let response = model.chat(&conversation, None, false).unwrap();
+        let text = response["content"].as_str().unwrap_or("").to_lowercase();
+        println!("Live vision observation: {text}");
+        assert!(
+            text.contains("red")
+                && text.contains("green")
+                && text.contains("left")
+                && text.contains("right")
+                && text.contains("square")
+                && text.contains("circle")
+        );
+        let saved = model.take_completed_messages().unwrap();
+        let (encoded, _) = crate::vision::encoded_image(&saved[2]["_chuggin_images"][0]).unwrap();
+        assert!(!serde_json::to_string(&saved).unwrap().contains(&encoded));
+        let trace = std::fs::read_to_string(directory.path().join("request-000.json")).unwrap();
+        assert!(!trace.contains(&encoded));
+    }
+    #[test]
+    fn image_rejection_recovers_once_as_explicit_text_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for index in 0..3 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (_, body) = request(&socket);
+                match index {
+                    0 => respond(&mut socket, "200 OK", json!({})), // old server: capability unknown
+                    1 => respond(
+                        &mut socket,
+                        "400 Bad Request",
+                        json!({"error":"model does not support images"}),
+                    ),
+                    _ => {
+                        assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+                        assert!(
+                            body["messages"][2]["content"]
+                                .as_str()
+                                .unwrap()
+                                .contains("Image observation failed")
+                        );
+                        respond(
+                            &mut socket,
+                            "200 OK",
+                            json!({"message":{"role":"assistant","content":"I cannot see it"},"done":true,"done_reason":"stop"}),
+                        );
+                    }
+                }
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let picture = directory.path().join("image.png");
+        image::RgbImage::new(2, 2).save(&picture).unwrap();
+        let model = Model::new(
+            &url,
+            "text-fixture",
+            4096,
+            256,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let conversation = vec![
+            json!({"role":"user","content":"Inspect the image"}),
+            json!({"role":"assistant","tool_calls":[{"id":"img","function":{"name":"view_image","arguments":{"path":"image.png"}}}],"content":""}),
+            crate::vision::tool_reply(
+                "view_image",
+                &json!({"_chuggin_images":[{"path":picture,"mime_type":"image/png","width":2,"height":2}]}),
+                Some(&json!("img")),
+            ),
+        ];
+        assert_eq!(
+            model.chat(&conversation, None, false).unwrap()["content"],
+            "I cannot see it"
+        );
+        assert!(!crate::vision::has_images(
+            &model.take_completed_messages().unwrap()
+        ));
+        server.join().unwrap();
     }
 }

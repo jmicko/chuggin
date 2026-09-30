@@ -231,6 +231,9 @@ fn splash(
                 Line::from(item.clone()).bold(),
                 Line::from(match item.as_str() {
                     "Run duration" => "Finish the current cycle when time is up",
+                    "Chat with this project" => "Discuss the project and control its loop",
+                    "Tool requests" => "Review missing capabilities suggested by models",
+                    "Settings" => "Project options and shared connections",
                     "Quit" => "Return to your shell",
                     _ => descriptions.get(i).copied().unwrap_or(""),
                 })
@@ -1409,6 +1412,7 @@ fn setting_value(c: &runner::Config, field: usize) -> String {
             .map(|s| s.description)
             .unwrap_or_else(|e| e.to_string()),
         6 => "Choose model…".into(),
+        9 => "Review saved suggestions…".into(),
         7 => "Connect another AI app…".into(),
         8 => format!(
             "{} · {} · {} responses",
@@ -1440,6 +1444,7 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
         "Chat model",
         "External AI access (MCP)",
         "Investigation helpers",
+        "Tool requests",
     ]
     .iter()
     .enumerate()
@@ -2317,11 +2322,11 @@ fn dashboard_session(
                         }
                         match k.code {
                             KeyCode::Up => {
-                                d.settings_selected = (d.settings_selected + 8) % 9;
+                                d.settings_selected = (d.settings_selected + 9) % 10;
                                 continue;
                             }
                             KeyCode::Down => {
-                                d.settings_selected = (d.settings_selected + 1) % 9;
+                                d.settings_selected = (d.settings_selected + 1) % 10;
                                 continue;
                             }
                             KeyCode::Enter => {
@@ -2330,6 +2335,7 @@ fn dashboard_session(
                                     6 => crate::setup::project_settings_menu(Some(path))?,
                                     7 => crate::setup::external_control_info(path)?,
                                     8 => crate::setup::helpers_menu(Some(path))?,
+                                    9 => crate::tool_requests::menu(path)?,
                                     _ => {
                                         d.settings_edit =
                                             Some(setting_value(&config, d.settings_selected))
@@ -2615,6 +2621,20 @@ mod tests {
             assert!(text.contains("Investigation helpers"));
             assert!(text.contains("on · groq/example-model · 24 responses"));
         }
+    }
+    #[test]
+    fn tool_request_review_remains_visible_on_a_small_settings_tab() {
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        d.tab = 4;
+        d.settings_selected = 9;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.contains("Tool requests"));
+        assert!(text.contains("Review saved suggestions"));
     }
     #[test]
     fn cold_start_restores_visible_history_without_session_activity() {

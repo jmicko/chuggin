@@ -11,6 +11,7 @@ mod engine;
 mod events;
 mod groq;
 mod history;
+mod image_tools;
 mod inference;
 mod mcp;
 mod menu;
@@ -30,7 +31,9 @@ mod setup;
 mod stall_diagnostic;
 mod symbols;
 mod terminal_title;
+mod tool_requests;
 mod ui;
+mod vision;
 mod web_tools;
 mod workspace;
 

@@ -161,9 +161,49 @@ fn ledger<T>(f: impl FnOnce(&mut Ledger) -> Result<T>) -> Result<T> {
 }
 fn estimate(messages: &[Value], tools: Option<&Value>, ratio: f64) -> u64 {
     // Include framing and tools; calibrate upward using actual prompt usage. Never assume cache hits.
-    let bytes =
-        serde_json::to_vec(messages).unwrap().len() + tools.map_or(0, |t| t.to_string().len());
-    (bytes as f64 / 4.0 * ratio.max(1.2)).ceil() as u64 + 128
+    let (text_bytes, _) = crate::vision::estimate_parts(messages);
+    // Current Groq vision docs charge exactly 2048 tokens per image, regardless
+    // of base64 size or dimensions. Generic/local models may use patch counts.
+    let image_tokens = messages
+        .iter()
+        .filter_map(|m| m["_chuggin_images"].as_array())
+        .flatten()
+        .count() as u64
+        * 2048;
+    let bytes = text_bytes + tools.map_or(0, |t| t.to_string().len());
+    (bytes as f64 / 4.0 * ratio.max(1.2)).ceil() as u64 + 128 + image_tokens
+}
+
+/// Preserve every tool and schema constraint while reducing documentation only.
+/// This is used solely when Groq image tokens cannot fit its request allowance.
+pub fn compact_descriptions(tools: &Value) -> Value {
+    fn compact(value: &mut Value, limit: usize, parameters: bool) {
+        match value {
+            Value::Object(object) => {
+                if parameters {
+                    object.remove("description");
+                } else if let Some(Value::String(description)) = object.get_mut("description") {
+                    *description = crate::project::excerpt(description, limit);
+                }
+                for (key, child) in object {
+                    compact(
+                        child,
+                        if key == "function" { 120 } else { 80 },
+                        parameters || key == "parameters",
+                    );
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    compact(value, limit, parameters);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut result = tools.clone();
+    compact(&mut result, 80, false);
+    result
 }
 fn delay(s: &Ledger, l: &Limits, model: &str, input: u64, output: u64, at: u64) -> Result<u64> {
     let total = input.saturating_add(output);
@@ -357,8 +397,9 @@ fn duration_seconds(s: &str) -> Option<u64> {
 pub fn messages(input: &[Value]) -> Result<Vec<Value>> {
     let mut pending = std::collections::VecDeque::new();
     let mut result = Vec::new();
-    for (i, m) in input.iter().enumerate() {
-        let mut out = json!({"role":m["role"],"content":m["content"].as_str().unwrap_or("")});
+    let multimodal = crate::vision::openai_messages(input)?;
+    for (i, m) in multimodal.iter().enumerate() {
+        let mut out = json!({"role":m["role"],"content":m["content"].clone()});
         if let Some(calls) = m["tool_calls"].as_array().filter(|c| !c.is_empty()) {
             let mut translated = Vec::new();
             for (n, c) in calls.iter().enumerate() {
@@ -378,10 +419,18 @@ pub fn messages(input: &[Value]) -> Result<Vec<Value>> {
             out["tool_calls"] = json!(translated);
         }
         if m["role"] == "tool" {
-            let fallback = pending
-                .pop_front()
+            let index = if let Some(id) = m["tool_call_id"].as_str() {
+                pending
+                    .iter()
+                    .position(|p| p == id)
+                    .context("Tool result has no matching Groq call ID")?
+            } else {
+                0
+            };
+            let id = pending
+                .remove(index)
                 .context("Tool result has no matching Groq call")?;
-            out["tool_call_id"] = json!(m["tool_call_id"].as_str().unwrap_or(&fallback));
+            out["tool_call_id"] = json!(id);
         }
         result.push(out);
     }
@@ -531,6 +580,53 @@ fn fit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_budget_compacts_documentation_without_losing_tools_or_constraints() {
+        let tools = crate::model::tools();
+        let compact = compact_descriptions(&tools);
+        fn remove_docs(value: &mut Value) {
+            match value {
+                Value::Object(object) => {
+                    object.remove("description");
+                    for child in object.values_mut() {
+                        remove_docs(child);
+                    }
+                }
+                Value::Array(values) => {
+                    for child in values {
+                        remove_docs(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut original_shape = tools.clone();
+        let mut compact_shape = compact.clone();
+        remove_docs(&mut original_shape);
+        remove_docs(&mut compact_shape);
+        assert_eq!(original_shape, compact_shape);
+        let input = vec![
+            json!({"role":"system","content":crate::prompts::WORK}),
+            json!({"role":"user","content":"Improve this project"}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"image","function":{"name":"view_image","arguments":{"path":"app.png"}}}]}),
+            json!({"role":"tool","tool_call_id":"image","content":"Image snapshot","_chuggin_images":[{"path":"/artifact/image.png","width":4096,"height":4096,"mime_type":"image/png"}]}),
+        ];
+        let full_estimate = estimate(&input, Some(&tools), 1.2);
+        let compact_estimate = estimate(&input, Some(&compact), 1.2);
+        assert!(compact_estimate < full_estimate);
+        assert!(
+            fit(&input, Some(&compact), 512, 1.2, 7200).is_ok(),
+            "Compact image request estimate: {compact_estimate}"
+        );
+        let mut smaller = input.clone();
+        smaller[3]["_chuggin_images"][0]["width"] = json!(64);
+        smaller[3]["_chuggin_images"][0]["height"] = json!(64);
+        assert_eq!(
+            estimate(&smaller, Some(&compact), 1.2),
+            compact_estimate,
+            "Groq charges fixed image tokens, not base64 or dimensions"
+        );
+    }
     #[test]
     fn duration_headers() {
         assert_eq!(duration_seconds("2m59.56s"), Some(180));

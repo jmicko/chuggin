@@ -156,7 +156,11 @@ fn turn(
             }
             let context = context_messages(&history);
             let response = model.chat(&context, Some(crate::operator::schemas()), false)?;
-            let _ = model.take_completed_messages();
+            if let Some(sent) = model.take_completed_messages()
+                && let Some(stored) = history["messages"].as_array_mut()
+            {
+                crate::vision::merge_observation_marks(stored, &sent);
+            }
             pressure = model.context_pressure();
             let messages = history["messages"]
                 .as_array_mut()
@@ -207,11 +211,7 @@ fn turn(
                     .call(session, name, args, &op)
                     .unwrap_or_else(|e| json!({"status":"failed","error":format!("{e:#}")}));
                 let mut history = read_json(path)?;
-                let mut reply =
-                    json!({"role":"tool","tool_name":name,"content":result.to_string()});
-                if let Some(id) = call.get("id") {
-                    reply["tool_call_id"] = id.clone();
-                }
+                let reply = crate::vision::tool_reply(name, &result, call.get("id"));
                 history["messages"].as_array_mut().unwrap().push(reply);
                 crate::setup::save(path, &history)?;
             }
