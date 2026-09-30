@@ -21,6 +21,7 @@ mod nudge;
 mod operator;
 mod project;
 mod prompts;
+mod prose_watch;
 mod provider;
 mod repetition;
 mod run_control;

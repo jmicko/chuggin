@@ -426,16 +426,35 @@ responses are regenerated whole. Generation-limit interruptions also request a
 shorter complete response. Each failure and continuation request is logged.
 Goal-drafting failures preserve the pitch and offer Retry, Settings, or Back.
 
-A separate action detector catches repetition across responses and restarts:
-identical no-op edits, reads, searches, and invalid completions. Four repetitions
-of the same action or a short repeating sequence trigger feedback. If that same
-pattern persists, Chuggin archives the conversation and resumes with the goal,
-current task, completed-task information, notes, and check feedback, excluding
-the repetitive history. It neither pauses the run nor rolls back files.
-Distinct investigative reads and changed results are allowed. Commands reset this
-exact-action detector because identical output does not establish identical side effects.
-Recovery events appear in live output and `action-recovery-N.json` cycle artifacts;
-the detector's observations and cumulative intervention count persist in the conversation.
+A separate reasoning detector compares substantial prose and separate provider
+thinking across responses and restarts. It scans the entire prose, normalizes punctuation and case, and compares
+five-word patterns to catch small variations. Four matching responses trigger
+feedback; four more matching responses trigger recovery. Short progress labels,
+fenced code, JSON tool arguments, and genuine file changes do not count as a
+reasoning loop. Existing transcripts are checked on cold resume, so restarting
+does not blindly continue an already-repetitive conversation.
+
+The action detector recognizes repeating sequences of up to 2,048 actions and
+tracks previously read content by line or byte range. It can detect whole-file
+rereads even if their order or page boundaries change. First-time inspections,
+changed contents, and genuinely new evidence are allowed; a sustained sequence
+of already-seen evidence triggers feedback before recovery. Command side effects
+are not inferred from identical stdout.
+
+Recovery archives the conversation and retains the current goal, active nudge,
+task, checkpoints, observed check results, failures, log IDs, and running command
+IDs. Repeated narration and old model notes remain retrievable in history but do
+not seed the fresh prompt or later capacity handoffs. New progress notes can be
+used normally. Recovery neither pauses the run, stops a command, nor rolls back
+files. Healthy conversations continue unchanged until recovery is warranted.
+
+Recovery events appear in live output and `prose-recovery-N.json`, `thinking-recovery-N.json`,
+`action-recovery-N.json`, and `repetition-context-reset-N.json` cycle artifacts.
+Bounded detector observations and cumulative intervention counts persist across
+restarts; fingerprints and content coverage stay out of the model's context.
+Asynchronous commands count once when they actually finish, including completion
+through monitoring, status polling, or end-of-cycle draining. Polls do not count
+as new command executions.
 
 Version 0.7.1 adds a separate **command repetition assessment**. It tracks model-issued
 commands, configured-check requests, and compiler diagnostics against the observed

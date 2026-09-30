@@ -114,6 +114,9 @@ struct Conversation {
     observed_tree: String,
     reread: std::collections::BTreeSet<String>,
     action_watch: crate::action_watch::ActionWatch,
+    prose_watch: crate::prose_watch::ProseWatch,
+    thinking_watch: crate::prose_watch::ProseWatch,
+    feedback_narration_archived: bool,
     command_watch: crate::command_watch::CommandWatch,
     nudge_revision: Option<u64>,
     delivered_nudge_id: Option<u64>,
@@ -129,6 +132,7 @@ struct Conversation {
 #[serde(default)]
 struct RepairNote {
     model_note: String,
+    model_note_archived: bool,
     /// The task which authored the model's note; distinct from the active evidence task.
     task_id: Option<u64>,
     active_task_id: Option<u64>,
@@ -196,8 +200,17 @@ impl RepairNote {
     }
     fn set_note(&mut self, note: &str) -> Result<()> {
         self.model_note = note.trim().into();
+        self.model_note_archived = false;
         self.task_id = None;
         Ok(())
+    }
+    fn append_note(&mut self, note: &str) -> Result<()> {
+        let note = if self.model_note_archived {
+            note.to_owned()
+        } else {
+            format!("{}\n{}", self.model_note, note)
+        };
+        self.set_note(&note)
     }
     #[cfg(test)]
     fn context(&self) -> Value {
@@ -219,7 +232,7 @@ impl RepairNote {
             }
         }
         let previous:Vec<Value> = self.previous_tasks.iter().map(|t|json!({"task_id":t["task_id"],"validation_status":t["validation"]["status"],"checked_tree":t["validation"]["checked_tree"],"history_available":true})).collect();
-        json!({"active_task_id":task_id,"current_tree":tree,"model_note_excerpt":project::excerpt(&self.model_note,4000),"model_note_bytes":self.model_note.len(),"note_task_id":self.task_id,"note_scope":if note_current {"current task; model claims require verification"} else {"earlier task or unscoped project notes; not current task evidence"},"instruction":"Use read_progress_note for full notes, search_history/read_history for older observations. Validation and tool errors are separate. Check file-state labels before relying on a result; previous task evidence is historical.","recent_actions":self.recent_actions,"validation":validation,"last_tool_error":self.last_failure,"previous_tasks":previous})
+        json!({"active_task_id":task_id,"current_tree":tree,"model_note_excerpt":if self.model_note_archived {None} else {Some(project::excerpt(&self.model_note,4000))},"model_note_bytes":self.model_note.len(),"model_note_archived":self.model_note_archived,"note_task_id":self.task_id,"note_scope":if note_current {"current task; model claims require verification"} else {"earlier task or unscoped project notes; not current task evidence"},"instruction":"Use read_progress_note for full notes, search_history/read_history for older observations. Validation and tool errors are separate. Check file-state labels before relying on a result; previous task evidence is historical.","recent_actions":self.recent_actions,"validation":validation,"last_tool_error":self.last_failure,"previous_tasks":previous})
     }
     fn page(&self, offset: usize) -> Result<Value> {
         let text = &self.model_note;
@@ -232,7 +245,7 @@ impl RepairNote {
             end -= 1;
         }
         Ok(
-            json!({"text":&text[offset..end],"note_task_id":self.task_id,"offset":offset,"total_bytes":text.len(),"next_offset":if end < text.len() {Some(end)} else {None}}),
+            json!({"text":&text[offset..end],"note_task_id":self.task_id,"archived":self.model_note_archived,"instruction":if self.model_note_archived {"Historical model note archived during repetition recovery; verify claims against current files and observed evidence."} else {"Model-authored progress note; verify claims against current files and observed evidence."},"offset":offset,"total_bytes":text.len(),"next_offset":if end < text.len() {Some(end)} else {None}}),
         )
     }
 }
@@ -926,6 +939,19 @@ fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
         .select_task(s.current_task.as_ref().map(|_| s.task_serial));
     repair_helper_results(c, &mut session)?;
     repair_pending_tools(&mut session.messages);
+    // Upgrade existing transcripts before making the first provider request.
+    // A human's file changes invalidate the old repetition evidence.
+    let tree = working_tree(&s.working_workspace, &c.state_dir).ok();
+    if tree
+        .as_ref()
+        .is_some_and(|tree| !session.observed_tree.is_empty() && tree != &session.observed_tree)
+    {
+        session.prose_watch.progress();
+        session.thinking_watch.progress();
+        session.action_watch.progress();
+    } else {
+        session.prose_watch.bootstrap(&session.messages);
+    }
     save_conversation(c, &session)?;
     Ok(session)
 }
@@ -957,7 +983,7 @@ fn repair_helper_results(c: &Config, session: &mut Conversation) -> Result<()> {
         if let Some(id) = call.get("id") {
             reply["tool_call_id"] = id.clone();
         }
-        session.messages.push(reply);
+        session.messages.insert(index + 1 + call_index, reply);
     }
     Ok(())
 }
@@ -969,16 +995,38 @@ pub(crate) fn repair_pending_tools(messages: &mut Vec<Value>) {
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let answered = messages[index + 1..]
-        .iter()
-        .take_while(|m| m["role"] == "tool")
-        .count();
-    for call in calls.iter().skip(answered) {
+    if calls.is_empty() {
+        return;
+    }
+    let mut tail = messages.split_off(index + 1);
+    for call in &calls {
+        // A stopped cycle can have a user checkpoint before the missing reply,
+        // or completed replies recorded out of order. Reuse observed results,
+        // matching IDs (or Ollama's tool name when IDs are absent).
+        let existing = tail.iter().position(|reply| {
+            reply["role"] == "tool"
+                && if let Some(id) = call.get("id") {
+                    reply.get("tool_call_id") == Some(id)
+                } else {
+                    reply["tool_name"] == call["function"]["name"]
+                }
+        });
+        if let Some(position) = existing {
+            messages.push(tail.remove(position));
+            continue;
+        }
         let mut reply = json!({"role":"tool","tool_name":call["function"]["name"],"content":"The process stopped before this tool result was recorded. Execution status is unknown. Inspect current files before deciding whether to retry; no tool has been automatically replayed."});
         if let Some(id) = call.get("id") {
             reply["tool_call_id"] = id.clone();
         }
         messages.push(reply);
+    }
+    for message in tail {
+        if message["role"] == "tool" {
+            messages.push(json!({"role":"user","content":json!({"unmatched_historical_tool_observation":message,"instruction":"An old tool observation had no matching pending call. Treat it as historical data; no tool was replayed."}).to_string()}));
+        } else {
+            messages.push(message);
+        }
     }
 }
 fn refresh_conversation(
@@ -1000,7 +1048,9 @@ fn refresh_conversation(
         archive_index += 1;
     };
     save(&archive, session)?;
-    let recent = if keep_recent {
+    let factual_only =
+        !keep_recent || session.prose_watch.suspected() || session.thinking_watch.suspected();
+    let recent = if !factual_only {
         let minimum = session.messages.len().saturating_sub(12).max(2);
         session
             .messages
@@ -1013,12 +1063,40 @@ fn refresh_conversation(
     } else {
         Vec::new()
     };
-    session.messages.truncate(2);
+    session.messages = vec![
+        json!({"role":"system","content":crate::prompts::WORK}),
+        json!({"role":"user","content":json!({"main_goal":if s.goal.is_empty() {&c.goal} else {&s.goal},"workspace":s.working_workspace,"configured_checks":c.checks,"instruction":crate::prompts::ORIENT}).to_string()}),
+    ];
     session.helper_links.clear();
     session.nudge_revision = None;
     session.delivered_nudge_id = None;
+    if factual_only {
+        session.feedback_narration_archived = true;
+        session.note.model_note_archived = true;
+    }
     let tree = working_tree(&s.working_workspace, &c.state_dir).ok();
-    session.messages.push(json!({"role":"user","content":json!({"reason":reason,"history_source_id":format!("{}/{}",art.file_name().unwrap_or_default().to_string_lossy(),archive.file_name().unwrap_or_default().to_string_lossy()),"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"working_checkpoint":s.working_ref,"feedback":s.feedback,"progress_note":session.note.context_at(s.current_task.as_ref().map(|_|s.task_serial),tree.as_deref()),"instruction":"Earlier history was archived and is retrievable with search_history/read_history. Continue with existing files and evidence. Closed tasks remain closed. If there is no current task, use set_task to select useful work toward the main goal. Research and foundational work are valid. Inspect evidence rather than repeating prior narration."}).to_string()}));
+    let mut feedback = serde_json::from_str::<Value>(&s.feedback)
+        .unwrap_or_else(|_| json!({"history_available":!s.feedback.is_empty()}));
+    let mut evidence = session.note.context_at(
+        s.current_task.as_ref().map(|_| s.task_serial),
+        tree.as_deref(),
+    );
+    if session.feedback_narration_archived
+        && let Some(feedback) = feedback.as_object_mut()
+    {
+        feedback.remove("summary");
+    }
+    if factual_only {
+        // Old model narration is precisely what can seed the same loop again.
+        // Archive it, while keeping observed validation, failures and log IDs.
+        if let Some(evidence) = evidence.as_object_mut() {
+            evidence.remove("model_note_excerpt");
+            evidence.remove("recent_actions");
+            evidence.insert("model_notes_archived".into(), json!(true));
+        }
+    }
+    let completed = s.completed_tasks.last().map(|task| json!({"id":task.id,"title":task.title,"checkpoint":task.checkpoint,"summary_available_in_history":true}));
+    session.messages.push(json!({"role":"user","content":json!({"reason":reason,"history_source_id":format!("{}/{}",art.file_name().unwrap_or_default().to_string_lossy(),archive.file_name().unwrap_or_default().to_string_lossy()),"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":completed,"working_checkpoint":s.working_ref,"feedback":feedback,"progress_note":evidence,"instruction":"Earlier history was archived and is retrievable with search_history/read_history. Continue with existing files and observed evidence. Closed tasks remain closed. If there is no current task, use set_task to select useful work toward the main goal. Research and foundational work are valid. Do not restart an already-completed inspection or repeat prior narration; use its evidence to choose the next action. Model notes in the archive are fallible claims, not current results."}).to_string()}));
     session.messages.extend(recent);
     if let Some(note) = &session.migration_handoff {
         let content = note.to_string();
@@ -1178,6 +1256,9 @@ fn sync_operator(c: &Config, s: &mut State, session: &mut Conversation) -> Resul
                 });
             }
             session.messages.push(json!({"role":"user","content":json!({"operator_update":record,"instruction":"Operator intervention: inspect changed files and reconsider the current task. Continue ordinary refinement, without repeatedly reviewing this update."}).to_string()}));
+            session.prose_watch.progress();
+            session.thinking_watch.progress();
+            session.action_watch.progress();
             session.operator_revision = revision;
             if let Ok(goal) = crate::operator::read_json(&c.state_dir.join("operator-goal.json"))
                 && let Some(goal) = goal["goal"].as_str()
@@ -1196,6 +1277,11 @@ fn sync_nudge(c: &Config, session: &mut Conversation) -> Result<()> {
     if session.nudge_revision == Some(store.revision) {
         return Ok(());
     }
+    if session.nudge_revision.is_some() {
+        session.prose_watch.progress();
+        session.thinking_watch.progress();
+        session.action_watch.progress();
+    }
     session.nudge_revision = Some(store.revision);
     session.delivered_nudge_id = store.active.as_ref().map(|n| n.id);
     if store.revision > 0 {
@@ -1205,6 +1291,36 @@ fn sync_nudge(c: &Config, session: &mut Conversation) -> Result<()> {
             .push(json!({"role":"user","content":content.to_string()}));
     }
     save_conversation(c, session)
+}
+
+fn observe_prose(
+    session: &mut Conversation,
+    art: &Path,
+    prose: &str,
+    changed: bool,
+    thinking: bool,
+) -> Result<()> {
+    let watch = if thinking {
+        &mut session.thinking_watch
+    } else {
+        &mut session.prose_watch
+    };
+    if let Some(intervention) = watch.observe(prose, changed) {
+        let reason = "Repeated substantial reasoning across responses. The model is restating the same investigation rather than advancing it. Preserve existing work and choose a concrete next action using already-observed evidence.";
+        emit(
+            art,
+            &format!(
+                "{}-recovery-{}",
+                if thinking { "thinking" } else { "prose" },
+                watch.interventions
+            ),
+            &json!({"intervention":format!("{intervention:?}"),"source":if thinking {"thinking"} else {"content"},"reason":reason}),
+        )?;
+        crate::events::log(format!(
+            "Reasoning-loop recovery: {intervention:?}. {reason}"
+        ));
+    }
+    Ok(())
 }
 
 struct WorkResult {
@@ -1227,10 +1343,29 @@ fn observe_command_validation(
     let Some(id) = update["command_id"].as_str() else {
         return Ok(());
     };
+    let command_key = format!(
+        "{}/{id}",
+        art.file_name().unwrap_or_default().to_string_lossy()
+    );
+    if !session.command_watch.has_pending(&command_key) && !tickets.contains_key(id) {
+        return Ok(());
+    }
+    let current = working_tree(&s.working_workspace, &c.state_dir)?;
+    if session
+        .command_watch
+        .completed(&command_key, update, Some(&current), s.task_serial)
+        && matches!(session.command_watch.count, 8 | 16)
+    {
+        emit(
+            art,
+            &format!("command-repetition-{id}"),
+            &session.command_watch,
+        )?;
+        crate::events::log(session.command_watch.notice());
+    }
     let Some((task_id, checked_tree)) = tickets.remove(id) else {
         return Ok(());
     };
-    let current = working_tree(&s.working_workspace, &c.state_dir)?;
     let results = update["checks"].clone();
     let logs = if let Some(rows) = results.as_array() {
         (0..rows.len())
@@ -1267,7 +1402,10 @@ fn work(
     session
         .note
         .select_task(s.current_task.as_ref().map(|_| s.task_serial));
-    session.messages.push(json!({"role":"user","content":json!({"cycle":s.cycle,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"working_checkpoint":s.working_ref,"instruction":if s.current_task.is_some() {"Continue the active task from existing files and the latest check feedback. Investigate and repair unresolved failures. All work is retained."} else {"There is no active task. Previous completions are already saved. Inspect what is needed toward the main goal and use set_task for the next useful task, then work on it. Research and foundational work count; do not report an old task complete again."}}).to_string()}));
+    let completed = s.completed_tasks.last().map(|task| if session.feedback_narration_archived {
+        json!({"id":task.id,"title":task.title,"checkpoint":task.checkpoint,"summary_available_in_history":true})
+    } else { serde_json::to_value(task).unwrap_or_default() });
+    session.messages.push(json!({"role":"user","content":json!({"cycle":s.cycle,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":completed,"working_checkpoint":s.working_ref,"instruction":if s.current_task.is_some() {"Continue the active task from existing files and the latest check feedback. Investigate and repair unresolved failures. All work is retained."} else {"There is no active task. Previous completions are already saved. Inspect what is needed toward the main goal and use set_task for the next useful task, then work on it. Research and foundational work count; do not report an old task complete again."}}).to_string()}));
     save_conversation(c, session)?;
     let mut research = crate::web_tools::Research::default();
     let mut jobs = crate::command_jobs::Jobs::with_controls(m.controls.clone());
@@ -1287,7 +1425,13 @@ fn work(
         crate::workspace::check(&s.working_workspace, &s.working_branch)?;
         let command_updates = jobs.monitor(c, s.current_task.as_ref(), m, stop)?;
         if !command_updates.is_empty() {
-            session.observed_tree = working_tree(&s.working_workspace, &c.state_dir)?;
+            let tree = working_tree(&s.working_workspace, &c.state_dir)?;
+            if tree != session.observed_tree {
+                session.prose_watch.progress();
+                session.thinking_watch.progress();
+                session.action_watch.progress();
+            }
+            session.observed_tree = tree;
         }
         for update in command_updates {
             observe_command_validation(c, s, session, &update, &mut validation_tickets, art)?;
@@ -1304,21 +1448,42 @@ fn work(
                 .push(json!({"role":"user","content":session.command_watch.notice()}));
             save_conversation(c, session)?;
         }
-        if session.action_watch.pending_refresh {
+        if session.action_watch.pending_refresh
+            || session.prose_watch.pending_refresh
+            || session.thinking_watch.pending_refresh
+        {
             session.note.recent_actions.clear();
-            refresh_conversation(
-                c,
-                s,
-                session,
+            let reason = if session.prose_watch.pending_refresh
+                || session.thinking_watch.pending_refresh
+            {
+                "Repeated reasoning across responses continued after feedback; repetitive history was archived"
+            } else {
+                "Repeated inspection of unchanged evidence continued after feedback; repetitive history was archived"
+            };
+            emit(
                 art,
-                "Repeated identical tool actions continued after feedback; repetitive history was archived",
-                false,
+                &format!(
+                    "repetition-context-reset-{}",
+                    session.action_watch.interventions
+                        + session.prose_watch.interventions
+                        + session.thinking_watch.interventions
+                ),
+                &json!({"reason":reason,"action_interventions":session.action_watch.interventions,"prose_interventions":session.prose_watch.interventions,"thinking_interventions":session.thinking_watch.interventions,"running_commands":jobs.running_snapshots()?}),
             )?;
+            refresh_conversation(c, s, session, art, reason, false)?;
             session.action_watch.recovered();
+            session.prose_watch.progress();
+            session.thinking_watch.progress();
+            summary.clear();
+            session.messages.push(json!({"role":"user","content":json!({"running_commands":jobs.running_snapshots()?,"instruction":"These commands remain alive across the conversation recovery. Use command_status or read_command_log for their existing IDs; do not launch duplicates. No command or file was rolled back."}).to_string()}));
             save_conversation(c, session)?;
         }
         if session.action_watch.take_notice() {
-            session.messages.push(json!({"role":"user","content":"Action-loop recovery: identical tool actions and results repeated without new evidence. Choose a different diagnostic or approach. If no task is active, select new work instead of repeating an old completion. Existing files and results remain available."}));
+            session.messages.push(json!({"role":"user","content":"Action-loop recovery: already-seen, unchanged inspection results are being revisited without new evidence. Use the evidence you have to choose a concrete next action. If another read or trial is necessary, identify the specific uncertainty it resolves. Existing files and results remain available."}));
+            save_conversation(c, session)?;
+        }
+        if session.prose_watch.take_notice() | session.thinking_watch.take_notice() {
+            session.messages.push(json!({"role":"user","content":"Reasoning-loop recovery: substantial reasoning has repeated across several responses. You have already described this investigation. Use its observed evidence to take the next concrete action, or investigate a specific unresolved question. Do not repeat the same explanation or start reading the same unchanged file from the beginning. Research and checks are valid when they add evidence. All existing work, the main goal, and the nudge remain in effect."}));
             save_conversation(c, session)?;
         }
         if session.context_pressure {
@@ -1330,6 +1495,7 @@ fn work(
                 "Reported token usage is approaching the configured context capacity",
                 true,
             )?;
+            session.messages.push(json!({"role":"user","content":json!({"running_commands":jobs.running_snapshots()?}).to_string()}));
         }
         sync_operator(c, s, session)?;
         sync_nudge(c, session)?;
@@ -1357,6 +1523,9 @@ fn work(
             && session.observed_tree != proposal_tree
             && !proposal_has_commands
         {
+            session.prose_watch.progress();
+            session.thinking_watch.progress();
+            session.action_watch.progress();
             session.reread.extend(
                 crate::workspace::changed_paths(
                     &s.working_workspace,
@@ -1404,6 +1573,7 @@ fn work(
             }
         };
         session.response_errors = 0;
+        let response_thinking = m.take_completed_reasoning();
         // Preserve any recovery instructions actually sent, keeping the next
         // request's prefix and conversational state consistent with the model.
         if let Some(used) = m.take_completed_messages() {
@@ -1418,6 +1588,7 @@ fn work(
         if let Some(content) = response["content"].as_str() {
             summary = content.to_owned();
         }
+        let response_prose = response["content"].as_str().unwrap_or("").to_owned();
         // Only the pending response needs a delivery link. Context fitting may
         // change message indices, so never reuse an old response's positional key.
         session.helper_links.clear();
@@ -1431,6 +1602,9 @@ fn work(
             .into());
         }
         if calls.is_empty() {
+            observe_prose(session, art, &response_prose, false, false)?;
+            observe_prose(session, art, &response_thinking, false, true)?;
+            save_conversation(c, session)?;
             break;
         }
         let mut completed_commands = Vec::new();
@@ -1643,12 +1817,11 @@ fn work(
                     }
                     "save_progress_note" => {
                         let note = args["note"].as_str().context("Missing note")?;
-                        let note = if args["append"] == true {
-                            format!("{}\n{}", session.note.model_note, note)
+                        if args["append"] == true {
+                            session.note.append_note(note)?;
                         } else {
-                            note.to_owned()
-                        };
-                        session.note.set_note(&note)?;
+                            session.note.set_note(note)?;
+                        }
                         session.note.task_id = s.current_task.as_ref().map(|_| s.task_serial);
                         Ok("Complete progress note saved. Use read_progress_note to retrieve it; context handoffs carry an excerpt. Verify notes against current files and checks.".into())
                     }
@@ -1890,6 +2063,27 @@ fn work(
                 }
                 Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
             };
+            if command
+                && value["ok"] == true
+                && let Some(id) = value["result"]["command_id"].as_str()
+            {
+                let observed_args = if name == "run_checks" {
+                    json!({"checks":c.checks})
+                } else {
+                    args.clone()
+                };
+                let command_key = format!(
+                    "{}/{id}",
+                    art.file_name().unwrap_or_default().to_string_lossy()
+                );
+                session.command_watch.started(
+                    &command_key,
+                    name,
+                    &observed_args,
+                    before_command.as_deref(),
+                    previous_task,
+                );
+            }
             if value["ok"] == true {
                 observe_command_validation(
                     c,
@@ -1900,9 +2094,7 @@ fn work(
                     art,
                 )?;
             }
-            if command && value["result"]["running"] == true {
-                session.command_watch.reset_streak();
-            } else if command {
+            if command && value["ok"] == false {
                 let after_command = working_tree(&root, &c.state_dir).ok();
                 let observed_args = if name == "run_checks" {
                     json!({"checks":c.checks})
@@ -1917,7 +2109,7 @@ fn work(
                     after_command.as_deref(),
                     s.task_serial,
                 );
-                if session.command_watch.count == 8 || session.command_watch.count == 16 {
+                if matches!(session.command_watch.count, 8 | 16) {
                     emit(
                         art,
                         &format!("command-repetition-{step}-{index}"),
@@ -1965,7 +2157,7 @@ fn work(
             session.messages.push(reply);
             if let Some(intervention) = session.action_watch.observe(name, args, &value) {
                 let reason = format!(
-                    "Repeated tool action: {name}. Identical actions and results have repeated without new evidence. Inspect a different relevant source, change the approach, or select new work if the previous task is closed. Files and completed actions are retained."
+                    "Repeated inspection pattern: {name}. Already-seen unchanged evidence is being revisited. Use existing observations to advance the investigation, change the approach, or select new work if the previous task is closed. Files and completed actions are retained."
                 );
                 emit(
                     art,
@@ -1982,9 +2174,24 @@ fn work(
                 json!({"role":"user","content":json!({"command_update":update}).to_string()}),
             );
         }
+        observe_prose(
+            session,
+            art,
+            &response_prose,
+            proposal_tree != observed_tree,
+            false,
+        )?;
+        observe_prose(
+            session,
+            art,
+            &response_thinking,
+            proposal_tree != observed_tree,
+            true,
+        )?;
+        save_conversation(c, session)?;
         // Append feedback only after every tool reply, preserving tool protocol order.
         if !session.action_watch.pending_refresh && session.action_watch.take_notice() {
-            session.messages.push(json!({"role":"user","content":"Action-loop recovery: the same tool actions returned identical results repeatedly. No new information was obtained. Use a different diagnostic or approach; if no task is active, select new work with set_task. Do not repeat the same completion or no-op edit. Existing files and results remain available."}));
+            session.messages.push(json!({"role":"user","content":"Action-loop recovery: already-seen inspection results are repeating without new information. Use the evidence already obtained to advance the investigation or take a different approach; if no task is active, select new work with set_task. Do not repeat the same completion or no-op edit. Existing files and results remain available."}));
             save_conversation(c, session)?;
         }
         if finish_requested.is_some() || project_completion.is_some() {
@@ -1998,7 +2205,13 @@ fn work(
             json!({"role":"user","content":json!({"command_final_result":update}).to_string()}),
         );
     }
-    session.observed_tree = working_tree(&s.working_workspace, &c.state_dir)?;
+    let tree = working_tree(&s.working_workspace, &c.state_dir)?;
+    if tree != session.observed_tree {
+        session.prose_watch.progress();
+        session.thinking_watch.progress();
+        session.action_watch.progress();
+    }
+    session.observed_tree = tree;
     save_conversation(c, session)?;
     Ok(WorkResult {
         finish_requested,
@@ -2279,6 +2492,9 @@ pub fn run_controlled(
             });
         }
         let finished = finished && passed;
+        if changed || finished {
+            session.feedback_narration_archived = false;
+        }
         session.note.validation(
             (
                 state.current_task.as_ref().map(|_| state.task_serial),
@@ -2299,6 +2515,9 @@ pub fn run_controlled(
         );
         emit(&art, "repair-note", &session.note)?;
         if finished {
+            session.prose_watch.progress();
+            session.thinking_watch.progress();
+            session.action_watch.progress();
             let task = state
                 .current_task
                 .take()
@@ -2342,7 +2561,7 @@ pub fn run_controlled(
         emit(
             &art,
             "checkpoint",
-            &json!({"commit":state.working_ref,"changed":changed,"checks_passed":passed,"checked_tree":before_check,"saved_tree":saved_tree,"task_complete":finished,"completed_task":if finished {state.completed_tasks.last()} else {None},"action_recovery_interventions":session.action_watch.interventions,"command_diagnostics":session.command_watch.diagnoses,"last_checks_passed_ref":state.last_checks_passed_ref}),
+            &json!({"commit":state.working_ref,"changed":changed,"checks_passed":passed,"checked_tree":before_check,"saved_tree":saved_tree,"task_complete":finished,"completed_task":if finished {state.completed_tasks.last()} else {None},"action_recovery_interventions":session.action_watch.interventions,"prose_recovery_interventions":session.prose_watch.interventions,"thinking_recovery_interventions":session.thinking_watch.interventions,"command_diagnostics":session.command_watch.diagnoses,"last_checks_passed_ref":state.last_checks_passed_ref}),
         )?;
         session.messages.push(json!({"role":"user","content":json!({"checkpoint":state.working_ref,"task_complete":finished,"feedback":feedback,"instruction":"This checkpoint is saved, including unfinished changes. Continue from these files. If checks failed, inspect and repair the actual failure; do not recreate the feature from scratch. If the task is complete, select the next useful improvement toward the main goal."}).to_string()}));
         finish_migration_handoff(&mut session);
@@ -2423,6 +2642,186 @@ pub fn run_controlled(
 mod conversation_tests {
     use super::*;
     #[test]
+    fn repetition_recovery_keeps_goal_nudge_and_facts_without_reseeding_narration() {
+        let dir = tempfile::tempdir().unwrap();
+        let c: Config = serde_json::from_value(json!({"repo":dir.path(),"state_dir":dir.path(),"goal":"Earlier goal","ollama_url":"http://unused","model":"unused","context_tokens":4096,"output_tokens":1024,"implementation_calls":4,"checks":[],"retry_seconds":0})).unwrap();
+        let s = State {
+            goal: "Current operator goal".into(),
+            cycle: 7,
+            working_workspace: dir.path().into(),
+            working_ref: "retained-checkpoint".into(),
+            task_serial: 2,
+            current_task: Some(Task { title: "Current task".into(), ..Task::default() }),
+            feedback: json!({"summary":"PRIVATE_REPEATED_NARRATION","checks_passed":false,"check_error":"Observed failure","check_results":[{"log_id":"cycle-6/check.log"}]}).to_string(),
+            ..State::default()
+        };
+        let mut session = load_conversation(&c, &s).unwrap();
+        session.note.select_task(Some(2));
+        session.note.set_note("PRIVATE_MODEL_NOTE").unwrap();
+        session.note.validation(
+            (Some(2), 7),
+            "checked-tree",
+            json!([{"argv":["validate"],"passed":false,"output":"Observed mismatch"}]),
+            vec!["cycle-7/check.log".into()],
+            true,
+        );
+        session
+            .messages
+            .push(json!({"role":"assistant","content":"PRIVATE_REPEATED_NARRATION"}));
+        crate::nudge::set(dir.path(), "Temporary user priority", None).unwrap();
+        refresh_conversation(&c, &s, &mut session, dir.path(), "Repetition", false).unwrap();
+        sync_nudge(&c, &mut session).unwrap();
+        let prompt = serde_json::to_string(&session.messages).unwrap();
+        for expected in [
+            "Current operator goal",
+            "Temporary user priority",
+            "Current task",
+            "retained-checkpoint",
+            "Observed mismatch",
+            "Observed failure",
+            "cycle-7/check.log",
+        ] {
+            assert!(prompt.contains(expected), "Missing {expected}");
+        }
+        assert!(!prompt.contains("PRIVATE_REPEATED_NARRATION"));
+        assert!(!prompt.contains("PRIVATE_MODEL_NOTE"));
+        let original: Value = serde_json::from_slice(
+            &fs::read(dir.path().join("conversation-before-refresh-0.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(original.to_string().contains("PRIVATE_MODEL_NOTE"));
+        assert!(original.to_string().contains("PRIVATE_REPEATED_NARRATION"));
+        // A subsequent ordinary capacity handoff must not silently reintroduce
+        // the quarantined summary/note. New model notes are explicitly usable.
+        refresh_conversation(&c, &s, &mut session, dir.path(), "Context pressure", true).unwrap();
+        assert!(
+            !serde_json::to_string(&session.messages)
+                .unwrap()
+                .contains("PRIVATE_MODEL_NOTE")
+        );
+        assert!(
+            !serde_json::to_string(&session.messages)
+                .unwrap()
+                .contains("PRIVATE_REPEATED_NARRATION")
+        );
+        session
+            .note
+            .append_note("New observation after recovery")
+            .unwrap();
+        assert!(
+            !session
+                .note
+                .context()
+                .to_string()
+                .contains("PRIVATE_MODEL_NOTE")
+        );
+        assert!(
+            session
+                .note
+                .context()
+                .to_string()
+                .contains("New observation after recovery")
+        );
+    }
+
+    #[test]
+    #[ignore = "Read-only overnight replay; set CHUGGIN_REPLAY_DIR to a saved run state directory"]
+    fn replay_overnight_repetition() {
+        let dir = PathBuf::from(std::env::var("CHUGGIN_REPLAY_DIR").unwrap());
+        let mut prose = crate::prose_watch::ProseWatch::default();
+        let mut actions = crate::action_watch::ActionWatch::default();
+        let mut cycles: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("cycle-"))
+            .collect();
+        let first_cycle = std::env::var("CHUGGIN_REPLAY_FIRST_CYCLE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        cycles.retain(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .strip_prefix("cycle-")
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|cycle| cycle >= first_cycle)
+        });
+        cycles.sort_by_key(|entry| entry.file_name());
+        let (mut frames, mut prose_notices, mut prose_resets, mut action_interventions) =
+            (0, 0, 0, 0);
+        let mut first_prose_notice = None;
+        for cycle in cycles {
+            let mut replies: Vec<_> = fs::read_dir(cycle.path())
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let step = name
+                        .strip_prefix("implementation-")?
+                        .strip_suffix(".json")?
+                        .parse::<usize>()
+                        .ok()?;
+                    Some((step, entry.path()))
+                })
+                .collect();
+            replies.sort_by_key(|(step, _)| *step);
+            for (step, path) in replies {
+                let response: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                let mut changed = false;
+                for (index, call) in response["tool_calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    let tool_file = cycle.path().join(format!("tool-{step}-{index}.json"));
+                    let Ok(bytes) = fs::read(tool_file) else {
+                        continue;
+                    };
+                    let result: Value = serde_json::from_slice(&bytes).unwrap();
+                    let name = call["function"]["name"].as_str().unwrap_or("");
+                    if matches!(name, "edit_file" | "write_file")
+                        && result["ok"] == true
+                        && result["result"]["changed"] != false
+                    {
+                        changed = true;
+                    }
+                    if actions
+                        .observe(name, &call["function"]["arguments"], &result)
+                        .is_some()
+                    {
+                        action_interventions += 1;
+                        if actions.pending_refresh {
+                            actions.recovered();
+                        }
+                    }
+                }
+                if let Some(intervention) =
+                    prose.observe(response["content"].as_str().unwrap_or(""), changed)
+                {
+                    match intervention {
+                        crate::prose_watch::Intervention::Notice => {
+                            prose_notices += 1;
+                            first_prose_notice.get_or_insert(frames + 1);
+                        }
+                        crate::prose_watch::Intervention::Refresh => {
+                            prose_resets += 1;
+                            prose.progress();
+                        }
+                    }
+                }
+                frames += 1;
+            }
+        }
+        assert!(prose_resets > 0);
+        assert!(action_interventions > 0);
+        eprintln!(
+            "Read-only replay: {frames} responses, first prose notice at response {first_prose_notice:?}, {prose_notices} prose notices, {prose_resets} prose resets, {action_interventions} action interventions"
+        );
+    }
+
+    #[test]
     fn migration_notice_survives_restart_and_context_recovery_but_retires_once() {
         let dir = tempfile::tempdir().unwrap();
         let c: Config = serde_json::from_value(json!({"repo":dir.path(),"state_dir":dir.path(),"goal":"Research a topic","ollama_url":"http://unused","model":"unused","context_tokens":4096,"output_tokens":1024,"implementation_calls":4,"checks":[],"retry_seconds":0})).unwrap();
@@ -2462,6 +2861,32 @@ mod conversation_tests {
         assert_eq!(active_notes(&session), 0);
         assert!(session.migration_handoff.is_none());
     }
+    #[test]
+    fn cold_repair_orders_existing_tool_results_before_checkpoint_messages() {
+        let mut messages = vec![
+            json!({"role":"assistant","tool_calls":[{"id":"a","function":{"name":"read_file"}},{"id":"b","function":{"name":"search"}}]}),
+            json!({"role":"tool","tool_call_id":"b","content":"Observed search result"}),
+            json!({"role":"user","content":"Saved checkpoint"}),
+            json!({"role":"tool","tool_call_id":"a","content":"Observed file result"}),
+            json!({"role":"tool","tool_call_id":"old","content":"Unmatched old observation"}),
+        ];
+        repair_pending_tools(&mut messages);
+        assert_eq!(messages[1]["tool_call_id"], "a");
+        assert_eq!(messages[1]["content"], "Observed file result");
+        assert_eq!(messages[2]["tool_call_id"], "b");
+        assert_eq!(messages[3]["content"], "Saved checkpoint");
+        assert_eq!(messages[4]["role"], "user");
+        assert!(
+            messages[4]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Unmatched old observation")
+        );
+        let original = messages.clone();
+        repair_pending_tools(&mut messages);
+        assert_eq!(messages, original);
+    }
+
     #[test]
     fn interrupted_tool_batches_are_not_replayed() {
         let mut messages = vec![

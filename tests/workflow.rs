@@ -152,7 +152,8 @@ impl Server {
                         } else if content == "__STREAM_LIMIT__" {
                             json!({"error":"weekly usage limit reached"}).to_string() + "\n"
                         } else {
-                            json!({"message":{"role":"assistant","content":content,"tool_calls":tools},"done":true,"done_reason":"stop"}).to_string()+"\n"
+                            let thinking = content.strip_prefix("__REASONING_FRAME__");
+                            json!({"message":{"role":"assistant","content":if thinking.is_some() {""} else {&content},"thinking":thinking.unwrap_or(""),"tool_calls":tools},"done":true,"done_reason":"stop"}).to_string()+"\n"
                         }
                     }
                 };
@@ -190,6 +191,142 @@ impl Drop for Server {
         let _ = self.handle.take().unwrap().join();
     }
 }
+const CROSS_RESPONSE_LOOP: &str = "I've now read through the entire editor. Let me analyze the key usability concerns for the active nudge. The most important one I can identify is a concrete bug in the render loop. The document body is rendered inside a ScrollArea, but the caret is drawn at absolute paragraph positions. Let me verify the actual typing and rendering path works by checking the keyboard integration test and confirming the render produces visible text.";
+
+#[test]
+fn cross_response_reasoning_recovery_preserves_nudge_and_advances_after_feedback() {
+    exercise_cross_response_recovery(false);
+}
+
+#[test]
+fn separate_thinking_repetition_recovers_without_adding_thinking_to_prompts() {
+    exercise_cross_response_recovery(true);
+}
+
+fn exercise_cross_response_recovery(thinking: bool) {
+    let server = Server::custom(false, false, None, move |body, n| {
+        if n == 5 {
+            assert!(
+                body["messages"]
+                    .to_string()
+                    .contains("Reasoning-loop recovery")
+            );
+        }
+        if n == 9 {
+            let messages = body["messages"].to_string();
+            assert!(messages.contains("repetitive history was archived"));
+            assert!(messages.contains("Temporary user priority"));
+            assert!(messages.contains("Improve value incrementally"));
+            assert!(!messages.contains("I've now read through the entire editor"));
+            assert!(body["messages"].as_array().unwrap().len() < 10);
+        }
+        match n {
+            0 => (
+                String::new(),
+                json!([task_tool("Investigate"),{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"1"}}}]),
+            ),
+            1..=8 => (
+                if thinking {
+                    format!("__REASONING_FRAME__{CROSS_RESPONSE_LOOP}")
+                } else {
+                    CROSS_RESPONSE_LOOP.into()
+                },
+                json!([{"function":{"name":"read_file","arguments":{"path":"paper.txt","start_line":(n-1)*80+1}}}]),
+            ),
+            _ => (
+                "Applied the change using the inspected evidence.".into(),
+                json!([{"function":{"name":"write_file","arguments":{"path":"value.txt","content":"2"}}},{"function":{"name":"finish_task","arguments":{"task_id":1,"summary":"Investigation advanced and the change is checked"}}}]),
+            ),
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    fs::write(
+        root.path().join("repo/paper.txt"),
+        (0..800)
+            .map(|i| format!("Evidence line {i}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    fs::create_dir_all(root.path().join("state")).unwrap();
+    fs::write(root.path().join("state/nudges.json"),json!({"revision":1,"serial":1,"active":{"id":1,"request":"Temporary user priority","created_unix":1,"status":"active"},"history":[]}).to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    assert_eq!(server.requests.lock().unwrap().len(), 10);
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/value.txt")).unwrap(),
+        "2"
+    );
+    assert_eq!(
+        state(root.path())["completed_tasks"][0]["title"],
+        "Investigate"
+    );
+    assert!(
+        root.path()
+            .join(format!(
+                "state/cycle-000001/{}-recovery-2.json",
+                if thinking { "thinking" } else { "prose" }
+            ))
+            .exists()
+    );
+    let nudges: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/nudges.json")).unwrap()).unwrap();
+    assert_eq!(nudges["active"]["status"], "active");
+}
+
+#[test]
+fn cold_resume_quarantines_old_loop_before_first_provider_call() {
+    let server = Server::custom(false, false, None, |body, n| {
+        if n == 1 {
+            let messages = body["messages"].to_string();
+            assert!(messages.contains("repetitive history was archived"));
+            assert!(!messages.contains("I've now read through the entire editor"));
+            assert!(!messages.contains("POISONED_MODEL_NOTE"));
+            assert!(!messages.contains("POISONED_FEEDBACK"));
+        }
+        (
+            "Progress made".into(),
+            json!([task_tool(&format!("Work {}",n+1)),{"function":{"name":"write_file","arguments":{"path":"value.txt","content":format!("{}",n+1)}}},{"function":{"name":"finish_task","arguments":{"task_id":n+1,"summary":"Value updated"}}}]),
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles(root.path(), 1);
+    let path = root.path().join("state/conversation.json");
+    let mut session: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    session.as_object_mut().unwrap().remove("prose_watch");
+    session
+        .as_object_mut()
+        .unwrap()
+        .remove("feedback_narration_archived");
+    session["note"]["model_note"] = json!("POISONED_MODEL_NOTE");
+    session["note"]
+        .as_object_mut()
+        .unwrap()
+        .remove("model_note_archived");
+    let messages = session["messages"].as_array_mut().unwrap();
+    messages.truncate(2);
+    for i in 0..12 {
+        messages.push(json!({"role":"assistant","content":CROSS_RESPONSE_LOOP,"tool_calls":[{"id":format!("old-{i}"),"function":{"name":"read_file","arguments":{"path":"value.txt","start_line":i*80+1}}}]}));
+        messages.push(json!({"role":"tool","tool_call_id":format!("old-{i}"),"tool_name":"read_file","content":"Historical inspection result"}));
+    }
+    fs::write(&path, session.to_string()).unwrap();
+    let mut saved = state(root.path());
+    saved["feedback"] =
+        json!(json!({"summary":"POISONED_FEEDBACK","checks_passed":true}).to_string());
+    fs::write(root.path().join("state/state.json"), saved.to_string()).unwrap();
+    run_cycles(root.path(), 1);
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/value.txt")).unwrap(),
+        "2"
+    );
+    assert!(
+        root.path()
+            .join("state/cycle-000002/conversation-before-refresh-0.json")
+            .exists()
+    );
+}
+
 fn is_work(body: &Value) -> bool {
     body["tools"].as_array().is_some_and(|tools| {
         tools
@@ -3400,6 +3537,125 @@ fn diagnostic_reply(verdict: &str) -> Value {
         "next_action":"Inspect the remaining task criteria and update the project only if needed.",
         "expected_new_evidence":"Whether the current artifact satisfies the outstanding requirement."
     }}}])
+}
+
+#[test]
+fn asynchronous_command_repetition_survives_cycles_without_counting_status_polls() {
+    let mut work = 0;
+    let server = Server::custom(false, false, None, move |body, _| {
+        if is_diagnostic(body) {
+            let input: Value =
+                serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(input["repetitions"], 16);
+            assert_eq!(input["command"]["tool"], "run_command");
+            assert_eq!(
+                input["command"]["arguments"]["argv"][2],
+                "read value; printf stable-evidence"
+            );
+            return (String::new(), diagnostic_reply("productive"));
+        }
+        let step = work;
+        work += 1;
+        if step == 32 {
+            assert!(body["messages"].to_string().contains("command_diagnostic"));
+            return (
+                String::new(),
+                json!([{"function":{"name":"finish_task","arguments":{"summary":"Completed sixteen observations"}}}]),
+            );
+        }
+        if step % 2 == 1 {
+            let starts = named_tool_results(body, "run_command");
+            let started = &starts.last().unwrap()["result"];
+            assert_eq!(
+                started["running"], true,
+                "The command must outlive its initial reply"
+            );
+            let id = started["command_id"].clone();
+            return (
+                String::new(),
+                json!([
+                    {"function":{"name":"command_input","arguments":{"command_id":id,"text":"finish\n","close_stdin":true}}},
+                    {"function":{"name":"command_status","arguments":{"command_id":id,"wait_ms":1000}}},
+                    {"function":{"name":"command_status","arguments":{"command_id":id,"wait_ms":1000}}},
+                    {"function":{"name":"command_status","arguments":{"command_id":id,"wait_ms":0}}}
+                ]),
+            );
+        }
+        if step > 0 {
+            let statuses = named_tool_results(body, "command_status");
+            assert_eq!(statuses.last().unwrap()["result"]["running"], false);
+        }
+        let mut calls = Vec::new();
+        if step == 0 {
+            calls.push(task_tool("Collect command observations"));
+        }
+        calls.push(json!({"function":{"name":"run_command","arguments":{"argv":["sh","-c","read value; printf stable-evidence"]}}}));
+        (String::new(), json!(calls))
+    });
+    let root = tempfile::tempdir().unwrap();
+    let config = fixture(root.path(), &server.url, true);
+    let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    settings["implementation_calls"] = json!(16);
+    fs::write(config, settings.to_string()).unwrap();
+    for expected in [8, 16] {
+        run_cycles(root.path(), 1);
+        let session: Value =
+            serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            session["command_watch"]["count"], expected,
+            "Completed executions, not polls, must be counted"
+        );
+        assert_eq!(
+            session["command_watch"]["pending_diagnosis"],
+            expected == 16
+        );
+    }
+    run_cycles(root.path(), 1);
+    assert!(
+        root.path()
+            .join("state/cycle-000003/command-diagnostic-1-report.json")
+            .is_file()
+    );
+    assert!(state(root.path())["current_task"].is_null());
+    assert_eq!(server.requests.lock().unwrap().len(), 34);
+}
+
+#[test]
+fn final_command_drain_counts_completed_executions() {
+    let server = Server::custom(false, false, None, |_, step| {
+        let mut calls = Vec::new();
+        if step == 0 {
+            calls.push(task_tool("Observe delayed command results"));
+        }
+        calls.push(json!({"function":{"name":"run_command","arguments":{"argv":["sh","-c","sleep 1.2; printf stable-evidence"]}}}));
+        (String::new(), json!(calls))
+    });
+    let root = tempfile::tempdir().unwrap();
+    let config = fixture(root.path(), &server.url, true);
+    let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    settings["implementation_calls"] = json!(1);
+    fs::write(config, settings.to_string()).unwrap();
+    for expected in [1, 2] {
+        run_cycles(root.path(), 1);
+        let started: Value = serde_json::from_slice(
+            &fs::read(root.path().join(format!(
+                "state/cycle-{expected:06}/tool-0-{}.json",
+                if expected == 1 { 1 } else { 0 }
+            )))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(started["result"]["running"], true);
+        let session: Value =
+            serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
+                .unwrap();
+        assert_eq!(session["command_watch"]["count"], expected);
+        assert_eq!(
+            session["command_watch"]["recent"][0]["status"]["passed"],
+            true
+        );
+    }
 }
 fn is_diagnostic(body: &Value) -> bool {
     body["tools"]

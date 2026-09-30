@@ -55,6 +55,7 @@ pub struct Model {
     settings_path: Option<PathBuf>,
     chat_settings: Option<PathBuf>,
     completed_messages: RefCell<Option<Vec<Value>>>,
+    completed_reasoning: RefCell<String>,
     context_pressure: Cell<bool>,
     run_controls: Option<(Arc<AtomicBool>, Instant)>,
     pub(crate) controls: Arc<crate::run_control::RunControl>,
@@ -86,6 +87,7 @@ impl Model {
             settings_path: None,
             chat_settings: None,
             completed_messages: RefCell::new(None),
+            completed_reasoning: RefCell::new(String::new()),
             context_pressure: Cell::new(false),
             run_controls: None,
             controls: Arc::new(crate::run_control::RunControl::default()),
@@ -136,6 +138,11 @@ impl Model {
     }
     pub fn take_completed_messages(&self) -> Option<Vec<Value>> {
         self.completed_messages.borrow_mut().take()
+    }
+    /// Drain reasoning from the latest successful request without adding it to
+    /// returned assistant messages or the provider's future conversation.
+    pub fn take_completed_reasoning(&self) -> String {
+        std::mem::take(&mut *self.completed_reasoning.borrow_mut())
     }
     pub fn command_review_seconds(&self, fallback: u64) -> u64 {
         self.settings_path
@@ -312,10 +319,12 @@ impl Model {
         let previous = self.output_cap.replace(Some(2048));
         let mode = self.watchdog_call.replace(true);
         *self.completed_messages.borrow_mut() = None;
+        self.completed_reasoning.borrow_mut().clear();
         // Observers must not disappear into an indefinite provider quota retry.
         let result = self.chat_format_once(messages, Some(tools), None);
         self.output_cap.set(previous);
         self.watchdog_call.set(mode);
+        self.completed_reasoning.borrow_mut().clear();
         if result.is_err() {
             crate::events::send(crate::events::Event::RequestFinished);
         }
@@ -328,6 +337,7 @@ impl Model {
         format: Option<Value>,
     ) -> Result<Value> {
         *self.completed_messages.borrow_mut() = None;
+        self.completed_reasoning.borrow_mut().clear();
         let mut conversation = messages.to_vec();
         let canonical_tools = tools;
         let mut transport_retries = 0;
@@ -543,6 +553,8 @@ impl Model {
         tools: Option<Value>,
         format: Option<Value>,
     ) -> Result<Value> {
+        // Retries and early failures must not expose a prior completed request.
+        self.completed_reasoning.borrow_mut().clear();
         self.pause_point();
         if self.controls.stopped_while_held() {
             return Err(crate::provider::Stopped(
@@ -831,6 +843,9 @@ impl Model {
             }
         }
         anyhow::ensure!(done, "Model stream disconnected before completion");
+        if !self.watchdog_call.get() {
+            *self.completed_reasoning.borrow_mut() = thinking;
+        }
         Ok(json!({"role":"assistant","content":content,"tool_calls":calls}))
     }
     pub fn structured<T: serde::de::DeserializeOwned + schemars::JsonSchema>(
@@ -1252,6 +1267,124 @@ mod groq_transport_tests {
             let s = std::fs::read_to_string(entry.path()).unwrap();
             assert!(!s.contains("fixture-secret-not-real"));
         }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_transport_tests {
+    use super::*;
+
+    fn fixture(responses: Vec<Vec<Value>>) -> (Model, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for frames in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(size) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = size.trim().parse().unwrap();
+                    }
+                }
+                let mut request = vec![0; length];
+                reader.read_exact(&mut request).unwrap();
+                let request: Value = serde_json::from_slice(&request).unwrap();
+                assert!(!request.to_string().contains("PRIVATE_REASONING"));
+                let response: String = frames.iter().map(|frame| format!("{frame}\n")).collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            }
+        });
+        let model = Model::new(
+            &url,
+            "reasoning-fixture",
+            4096,
+            256,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        (model, server)
+    }
+
+    fn completed(content: &str, thinking: &str) -> Vec<Value> {
+        vec![
+            json!({"message":{"thinking":thinking},"done":false}),
+            json!({"message":{"content":content},"done":true,"done_reason":"stop"}),
+        ]
+    }
+
+    #[test]
+    fn reasoning_is_drained_once_and_is_not_sent_in_later_requests() {
+        let (model, server) = fixture(vec![
+            vec![
+                json!({"message":{"thinking":"PRIVATE_REASONING first "},"done":false}),
+                json!({"message":{"thinking":"continuation","content":"first reply","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"fixture.rs"}}}]},"done":true,"done_reason":"stop"}),
+            ],
+            completed("second reply", "PRIVATE_REASONING second"),
+            completed("third reply", ""),
+        ]);
+        let mut messages = vec![json!({"role":"user","content":"fixture"})];
+        let first = model.chat(&messages, None, false).unwrap();
+        assert!(first.get("thinking").is_none());
+        assert_eq!(first["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            model.take_completed_reasoning(),
+            "PRIVATE_REASONING first continuation"
+        );
+        assert!(model.take_completed_reasoning().is_empty());
+        assert!(
+            !serde_json::to_string(&model.take_completed_messages())
+                .unwrap()
+                .contains("PRIVATE_REASONING")
+        );
+        messages.push(first);
+        let second = model.chat(&messages, None, false).unwrap();
+        assert_eq!(
+            &*model.completed_reasoning.borrow(),
+            "PRIVATE_REASONING second"
+        );
+        // An unconsumed prior thought disappears even when the next reply has none.
+        messages.push(second);
+        model.chat(&messages, None, false).unwrap();
+        assert!(model.take_completed_reasoning().is_empty());
+        server.join().unwrap();
+        *model.completed_reasoning.borrow_mut() = "PRIVATE_REASONING stale".into();
+        model.stop.store(true, Ordering::SeqCst);
+        assert!(model.chat(&messages, None, false).is_err());
+        assert!(model.take_completed_reasoning().is_empty());
+    }
+
+    #[test]
+    fn watchdog_and_incomplete_responses_do_not_leave_reasoning() {
+        let (model, server) = fixture(vec![
+            completed("before watchdog", "PRIVATE_REASONING previous main"),
+            completed("watchdog reply", "PRIVATE_REASONING watchdog"),
+            vec![
+                json!({"message":{"thinking":"PRIVATE_REASONING unfinished","content":"draft"},"done":false}),
+            ],
+            completed("after failure", "PRIVATE_REASONING new main"),
+        ]);
+        let messages = vec![json!({"role":"user","content":"fixture"})];
+        model.chat(&messages, None, false).unwrap();
+        assert!(!model.completed_reasoning.borrow().is_empty());
+        model.watchdog_chat(&messages, json!([])).unwrap();
+        assert!(model.take_completed_reasoning().is_empty());
+        assert!(model.chat(&messages, None, false).is_err());
+        assert!(model.take_completed_reasoning().is_empty());
+        model.chat(&messages, None, false).unwrap();
+        assert_eq!(
+            model.take_completed_reasoning(),
+            "PRIVATE_REASONING new main"
+        );
+        server.join().unwrap();
     }
 }
 
