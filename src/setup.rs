@@ -119,64 +119,28 @@ pub fn configure(show: bool) -> Result<()> {
         "Chuggin · Shared settings\nThese defaults apply to every project unless overridden."
             .to_string(),
     );
-    loop {
+    if io::stdin().is_terminal() {
+        let names = select_provider_models(&s)?;
+        let selected = names.iter().position(|n| n == &s.model).unwrap_or(0);
+        let Some(index) = crate::menu::select("Default model", &names, selected)? else {
+            anyhow::bail!("Setup cancelled");
+        };
+        s.model = names[index].clone();
+        s.ollama_url = settings()?.ollama_url;
+    } else {
         s.ollama_url = ask("Ollama server", &s.ollama_url)?
             .trim_end_matches('/')
             .into();
-        let url = s.ollama_url.clone();
-        let models = crate::ui::busy("Connecting to Ollama", move || {
-            Ok(reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .build()?
-                .get(format!("{}/api/tags", url))
-                .send()
-                .and_then(|r| r.error_for_status())
-                .and_then(|r| r.json::<Value>())?)
-        });
-        match models {
-            Ok(v) => {
-                let names: Vec<String> = v["models"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|m| m["name"].as_str().map(str::to_owned))
-                    .collect();
-                anyhow::ensure!(
-                    !names.is_empty(),
-                    "No models are installed on this Ollama server."
-                );
-                if io::stdin().is_terminal() {
-                    let index = names.iter().position(|n| n == &s.model).unwrap_or(0);
-                    let Some(index) = crate::menu::select("Choose model", &names, index)? else {
-                        anyhow::bail!("Setup cancelled. Your progress is saved.");
-                    };
-                    s.model = names[index].clone();
-                    break;
-                }
-                for (i, name) in names.iter().enumerate() {
-                    crate::ui::notice(format!("  {}. {name}", i + 1));
-                }
-                let chosen = ask("Model name or number", &s.model)?;
-                s.model = chosen
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|n| n.checked_sub(1))
-                    .and_then(|n| names.get(n))
-                    .cloned()
-                    .unwrap_or(chosen);
-                if !names.contains(&s.model) {
-                    crate::ui::notice(
-                        "That model is not installed on this server. Choose an installed model."
-                            .to_string(),
-                    );
-                    continue;
-                }
-                break;
-            }
-            Err(e) => crate::ui::notice(format!(
-                "Could not reach Ollama: {e}\nEnter the server address again, or Ctrl-C to cancel."
-            )),
-        }
+        let names = available_models(&s)?;
+        let chosen = ask("Model name or number", &s.model)?;
+        s.model = chosen
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|n| names.get(n))
+            .cloned()
+            .unwrap_or(chosen);
+        anyhow::ensure!(names.contains(&s.model), "Choose an installed Ollama model");
     }
     s.context_tokens = number("Context window (tokens)", s.context_tokens, 4096, 262144)?;
     s.output_tokens = number(
@@ -488,11 +452,7 @@ pub fn choose_model(project: Option<&Path>) -> Result<()> {
         s.ollama_url = effective.ollama_url;
         s.model = effective.model;
     }
-    crate::ui::notice(format!("\nLoading models from {}…", s.ollama_url));
-    let connection = s.clone();
-    let names = crate::ui::busy("Loading available models", move || {
-        available_models(&connection)
-    })?;
+    let names = select_provider_models(&s)?;
     let selected = names.iter().position(|n| n == &s.model).unwrap_or(0);
     let title = if project.is_some() {
         "Choose model for this project"
@@ -547,6 +507,7 @@ pub fn settings_menu() -> Result<()> {
             ),
             "Test Brave connection".into(),
             "Shared active hours".into(),
+            "Groq connection and limits".into(),
             "Back".into(),
         ];
         let Some(index) = crate::menu::select("Shared settings", &items, 0)? else {
@@ -639,6 +600,10 @@ pub fn settings_menu() -> Result<()> {
             }
             9 => {
                 active_hours_menu(None)?;
+                continue;
+            }
+            10 => {
+                groq_settings()?;
                 continue;
             }
             _ => return Ok(()),
@@ -768,6 +733,30 @@ pub fn active_hours_menu(project: Option<&Path>) -> Result<()> {
     } else {
         settings()?.active_hours
     };
+    crate::ui::clear_notes();
+    let current_description = match &current {
+        Schedule::Always => "Always allowed".to_owned(),
+        Schedule::Shared => "Use shared active hours".to_owned(),
+        Schedule::Custom { window } => format!(
+            "{}–{} · {} · {}",
+            window.start,
+            window.end,
+            window.timezone,
+            if window.closing == Closing::Cycle {
+                "finish current cycle"
+            } else {
+                "finish current call"
+            },
+        ),
+    };
+    crate::ui::notice(format!(
+        "Current setting: {current_description}\n\nActive hours control the loop. Chat remains available, and you can manually resume outside the schedule."
+    ));
+    let selected = match &current {
+        Schedule::Always => 0,
+        Schedule::Custom { .. } => 1,
+        Schedule::Shared => 2,
+    };
     let mut choices = vec!["Always allowed".into(), "Set active hours…".into()];
     if project.is_some() {
         choices.push("Use shared active hours".into());
@@ -775,7 +764,7 @@ pub fn active_hours_menu(project: Option<&Path>) -> Result<()> {
     let Some(choice) = crate::ui::select(
         "Active hours · controls the loop; chat remains available",
         &choices,
-        0,
+        selected,
     )?
     else {
         return Ok(());
@@ -893,6 +882,90 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
                 }
             }
             3 => settings_menu()?,
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn select_provider_models(s: &Settings) -> Result<Vec<String>> {
+    let selected = usize::from(crate::groq::model_id(&s.model).is_some());
+    let choice = crate::menu::select(
+        "Inference provider",
+        &[
+            format!("Ollama · {}", s.ollama_url),
+            "Groq · cloud API".into(),
+        ],
+        selected,
+    )?;
+    match choice {
+        Some(0) => {
+            let mut connection = s.clone();
+            if s.model.is_empty() {
+                connection.ollama_url = ask("Ollama server", &s.ollama_url)?;
+                let mut defaults = settings()?;
+                defaults.ollama_url = connection.ollama_url.clone();
+                save(&settings_path()?, &defaults)?;
+            }
+            crate::ui::busy("Loading Ollama models", move || {
+                available_models(&connection)
+            })
+        }
+        Some(1) => {
+            if crate::groq::key().is_err() {
+                groq_settings()?;
+            }
+            crate::ui::busy("Loading Groq models", crate::groq::models)
+        }
+        _ => anyhow::bail!("Model selection cancelled; settings unchanged"),
+    }
+}
+pub fn groq_settings() -> Result<()> {
+    loop {
+        let mut limits = crate::groq::Limits::load()?;
+        let key_set = crate::groq::key().is_ok();
+        let rows = vec![
+            format!(
+                "API key · {}",
+                if key_set {
+                    "Configured"
+                } else {
+                    "Not configured"
+                }
+            ),
+            "Test connection / list models".into(),
+            format!("Requests per minute · {}", limits.requests_per_minute),
+            format!("Requests per day · {}", limits.requests_per_day),
+            format!("Tokens per minute · {}", limits.tokens_per_minute),
+            format!("Tokens per day · {}", limits.tokens_per_day),
+            format!(
+                "Input tokens per minute · {} (0 = combined limit only)",
+                limits.input_tokens_per_minute
+            ),
+            format!(
+                "Output tokens per minute · {} (0 = combined limit only)",
+                limits.output_tokens_per_minute
+            ),
+            "Explain budgets".into(),
+            format!("Maximum response tokens · {}", limits.max_response_tokens),
+            "Back".into(),
+        ];
+        match crate::menu::select("Groq · shared connection and budgets", &rows, 0)? {
+            Some(0) => {
+                let value = if crate::ui::active() { crate::ui::ask_secret("Groq API key · input is masked")? } else { dialoguer::Password::new().with_prompt("Groq API key").interact()? };
+                crate::web_tools::save_key(&crate::groq::path("groq.key")?, &value)?;
+            }
+            Some(1) => {
+                let models = crate::ui::busy("Testing Groq connection", crate::groq::models)?;
+                crate::ui::notice(format!("Groq connection works. Available chat models:\n{}", models.join("\n")));
+            }
+            Some(i @ 2..=7) => {
+                let fields = [&mut limits.requests_per_minute, &mut limits.requests_per_day, &mut limits.tokens_per_minute, &mut limits.tokens_per_day, &mut limits.input_tokens_per_minute, &mut limits.output_tokens_per_minute];
+                let value = fields.into_iter().nth(i-2).unwrap();
+                *value = number("Shared Groq limit", *value as u32, if i>=6 {0}else{1}, 1_000_000_000)? as u64;
+                save(&crate::groq::path("groq-limits.json")?, &limits)?;
+            }
+            Some(9) => { limits.max_response_tokens = number("Maximum Groq response tokens", limits.max_response_tokens, 128, 32768)?; save(&crate::groq::path("groq-limits.json")?, &limits)?; }
+            Some(8) => crate::ui::notice("Free-tier defaults leave headroom: 24 requests/minute, 900/day, 7,200 tokens/minute, 180,000/day. All Chuggin projects and chats on this machine share this budget. Usage survives restarts and model changes. Each request reserves estimated input plus maximum output; final usage replaces that reservation. Interrupted requests keep their reservation. Daily limits use a conservative rolling 24-hour window. Groq headers can impose stricter waits. Other apps using the account are only visible through those headers. Manual retry rechecks budgets and never bypasses them. Raise limits only to match your Groq account. Requests use a smaller working context when necessary; full request logs remain available. Groq responses default to a 1,024-token cap, adjustable here.".into()),
             _ => return Ok(()),
         }
     }

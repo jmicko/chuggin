@@ -55,7 +55,7 @@ impl Model {
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .build()?,
-            url: format!("{}/api/chat", url.trim_end_matches('/')),
+            url: crate::groq::url(url, name),
             name: name.into(),
             context,
             output,
@@ -70,10 +70,7 @@ impl Model {
             context_pressure: Cell::new(false),
             run_controls: None,
             controls: Arc::new(crate::run_control::RunControl::default()),
-            request_target: RefCell::new((
-                name.into(),
-                format!("{}/api/chat", url.trim_end_matches('/')),
-            )),
+            request_target: RefCell::new((name.into(), crate::groq::url(url, name))),
         })
     }
     pub fn take_completed_messages(&self) -> Option<Vec<Value>> {
@@ -115,7 +112,7 @@ impl Model {
             let c = crate::runner::load(path)?;
             Ok((
                 self.selected_name(&c).into(),
-                format!("{}/api/chat", c.ollama_url.trim_end_matches('/')),
+                crate::groq::url(&c.ollama_url, self.selected_name(&c)),
                 Some(
                     self.chat_settings
                         .clone()
@@ -182,7 +179,17 @@ impl Model {
                     let _ = std::fs::remove_file(path);
                 }
                 if manual {
-                    crate::events::log("Manual retry: trying the provider now.".into());
+                    crate::events::log(
+                        if record["reason"]
+                            .as_str()
+                            .is_some_and(|s| s.starts_with("Groq budget:"))
+                        {
+                            "Manual retry: rechecking Groq budget."
+                        } else {
+                            "Manual retry: trying the provider now."
+                        }
+                        .into(),
+                    );
                 }
                 return Ok(());
             }
@@ -250,6 +257,35 @@ impl Model {
             self.wait_for_provider(&record)?;
         }
         loop {
+            let target = self.provider_target()?.0;
+            if crate::groq::model_id(&target).is_some() {
+                let configured_output = self
+                    .settings_path
+                    .as_ref()
+                    .map(|p| crate::runner::load(p).map(|c| c.output_tokens))
+                    .transpose()?
+                    .unwrap_or(self.output);
+                let output = self
+                    .output_cap
+                    .get()
+                    .unwrap_or(configured_output)
+                    .min(configured_output)
+                    .min(crate::groq::Limits::load()?.max_response_tokens);
+                let prepared =
+                    crate::groq::prepare(&target, &conversation, tools.as_ref(), output as u64)?;
+                if prepared != conversation
+                    && let Some(path) = self.trace.borrow().as_ref()
+                {
+                    std::fs::write(
+                        path.join(format!(
+                            "groq-context-before-{:03}.json",
+                            self.sequence.get()
+                        )),
+                        serde_json::to_vec_pretty(&conversation)?,
+                    )?;
+                }
+                conversation = prepared;
+            }
             let result = self.chat_format_once(&conversation, tools.clone(), format.clone());
             if let Err(error) = &result {
                 crate::events::send(crate::events::Event::RequestFinished);
@@ -361,7 +397,7 @@ impl Model {
             .unwrap_or(&self.name);
         let url = live
             .as_ref()
-            .map(|c| format!("{}/api/chat", c.ollama_url.trim_end_matches('/')))
+            .map(|c| crate::groq::url(&c.ollama_url, self.selected_name(c)))
             .unwrap_or_else(|| self.url.clone());
         let timeout = live
             .as_ref()
@@ -372,7 +408,41 @@ impl Model {
         } else {
             timeout
         };
-        let _permit = crate::inference::acquire(&url, &self.controls, &self.stop)?;
+        let groq = crate::groq::model_id(name);
+        // Validate/read credentials before reserving capacity. Never include them in traces.
+        let key = groq.map(|_| crate::groq::key()).transpose()?;
+        let output = live
+            .as_ref()
+            .map(|c| c.output_tokens)
+            .unwrap_or(self.output);
+        let output = self.output_cap.get().map_or(output, |cap| output.min(cap));
+        let output = if groq.is_some() {
+            output.min(crate::groq::Limits::load()?.max_response_tokens)
+        } else {
+            output
+        };
+        let (_permit, reservation) = loop {
+            let permit = crate::inference::acquire(&url, &self.controls, &self.stop)?;
+            if groq.is_none() {
+                break (permit, None);
+            }
+            match crate::groq::admit(name, messages, tools.as_ref(), output as u64)? {
+                crate::groq::Admission::Ready(r) => break (permit, Some(r)),
+                crate::groq::Admission::Wait(seconds) => {
+                    drop(permit);
+                    if self.watchdog_call.get() {
+                        anyhow::bail!(
+                            "Groq budget unavailable for watchdog; command remains running"
+                        );
+                    }
+                    let record = json!({"reason":"Groq budget: waiting before sending a request", "model":name,"url":url,"until":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()+seconds});
+                    self.wait_for_provider(&record)?;
+                    if self.provider_target()?.0 != name {
+                        return self.chat_format_once(messages, tools, format);
+                    }
+                }
+            }
+        };
         if self.controls.stopped_while_held() {
             return Err(crate::provider::Stopped("Stopped while awaiting inference".into()).into());
         }
@@ -380,10 +450,6 @@ impl Model {
         crate::events::send(crate::events::Event::RequestModel(name.to_owned()));
         crate::events::send(crate::events::Event::Request);
         anyhow::ensure!(!self.stop.load(Ordering::SeqCst), "Stopped by operator");
-        let output = self
-            .output_cap
-            .get()
-            .map_or(self.output, |cap| self.output.min(cap));
         let mut body = json!({"model":name,"messages":messages,"stream":true,"think":false,"options":{"num_ctx":self.context,"num_predict":output,"temperature":0.4}});
         if let Some(t) = tools {
             body["tools"] = t;
@@ -391,6 +457,17 @@ impl Model {
         if let Some(schema) = format {
             body["format"] = schema;
             body["options"]["temperature"] = json!(0);
+        }
+        if let Some(id) = groq {
+            let formatted = body.get("format").is_some();
+            let mut wire = json!({"model":id,"messages":crate::groq::messages(messages)?,"stream":true,"stream_options":{"include_usage":true},"max_completion_tokens":output,"temperature":if formatted{0.0}else{0.4}});
+            if let Some(t) = body.get("tools") {
+                wire["tools"] = t.clone();
+            }
+            if formatted {
+                wire["response_format"] = json!({"type":"json_object"});
+            }
+            body = wire;
         }
         let sequence = self.sequence.get();
         self.sequence.set(sequence + 1);
@@ -411,13 +488,30 @@ impl Model {
         } else {
             None
         };
-        let request = self.client.post(url).json(&body);
+        let groq_client = if groq.is_some() {
+            Some(crate::groq::client()?)
+        } else {
+            None
+        };
+        let request = groq_client
+            .as_ref()
+            .unwrap_or(&self.client)
+            .post(url)
+            .json(&body);
+        let request = if let Some(key) = key {
+            request.bearer_auth(key)
+        } else {
+            request
+        };
         let request = if timeout == 0 {
             request
         } else {
             request.timeout(Duration::from_secs(timeout))
         };
         let response = request.send()?;
+        if let Some(r) = &reservation {
+            r.headers(response.headers())?;
+        }
         let retry_after = crate::provider::retry_after(
             response
                 .headers()
@@ -427,17 +521,25 @@ impl Model {
         );
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            if status == 429
+                && let Some(r) = &reservation
+            {
+                r.defer(retry_after.unwrap_or(Duration::from_secs(60)).as_secs())?;
+            }
             let mut body = String::new();
             response.take(16384).read_to_string(&mut body)?;
             if let Some(provider) = crate::provider::classify(status, &body, retry_after) {
                 return Err(provider.into());
             }
-            bail!("Ollama HTTP {status}: request rejected");
+            bail!("Model provider HTTP {status}: request rejected");
         }
         let mut content = String::new();
         let mut thinking = String::new();
         let mut calls = Vec::new();
         let mut done = false;
+        let started = Instant::now();
+        let mut stream = crate::groq::Stream::default();
+        let mut finish_reason = String::new();
         for line in BufReader::new(response).lines() {
             anyhow::ensure!(!self.stop.load(Ordering::SeqCst), "Stopped by operator");
             let line = line?;
@@ -447,7 +549,52 @@ impl Model {
             if line.is_empty() {
                 continue;
             }
-            let d: Value = serde_json::from_str(&line).context("Invalid Ollama stream JSON")?;
+            let d: Value = if groq.is_some() {
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    anyhow::ensure!(
+                        !finish_reason.is_empty(),
+                        "Groq stream ended without a finish reason"
+                    );
+                    if let Some((prompt, generated)) = stream.usage {
+                        if let Some(r) = &reservation {
+                            r.settle(prompt, generated)?;
+                        }
+                        self.context_pressure.set(
+                            prompt + generated >= self.context.saturating_sub(output + 1024) as u64,
+                        );
+                        crate::events::send(crate::events::Event::Metrics {
+                            prompt,
+                            generated,
+                            seconds: started.elapsed().as_secs_f64(),
+                        });
+                    }
+                    if finish_reason == "length" {
+                        return Err(InterruptedResponse { reason:"Model reached its generation limit; produce a shorter complete response", prefix:String::new() }.into());
+                    }
+                    anyhow::ensure!(
+                        matches!(finish_reason.as_str(), "stop" | "tool_calls"),
+                        "Groq response ended with {finish_reason}"
+                    );
+                    calls = stream.calls()?;
+                    anyhow::ensure!(
+                        finish_reason != "tool_calls" || !calls.is_empty(),
+                        "Groq finished tool calls without a complete call"
+                    );
+                    done = true;
+                    break;
+                }
+                let frame = stream.frame(data)?;
+                if let Some(reason) = frame["done_reason"].as_str() {
+                    finish_reason = reason.into();
+                }
+                frame
+            } else {
+                serde_json::from_str(&line).context("Invalid Ollama stream JSON")?
+            };
             if let Some(e) = d.get("error") {
                 if let Some(provider) = crate::provider::classify(200, &e.to_string(), retry_after)
                 {
@@ -501,7 +648,7 @@ impl Model {
                 break;
             }
         }
-        anyhow::ensure!(done, "Ollama stream disconnected before completion");
+        anyhow::ensure!(done, "Model stream disconnected before completion");
         Ok(json!({"role":"assistant","content":content,"tool_calls":calls}))
     }
     pub fn structured<T: serde::de::DeserializeOwned + schemars::JsonSchema>(
@@ -772,4 +919,126 @@ mod formatting_tests {
 
 pub fn goal_completion_tool() -> Value {
     json!({"type":"function","function":{"name":"finish_project","description":"Mark the overall project goal complete when it has been fully achieved and verified. Completing an individual task or nudge does not complete the project. This saves work and stops the loop.","parameters":{"type":"object","properties":{"summary":{"type":"string"},"evidence":{"type":"string"}},"required":["summary","evidence"]}}})
+}
+
+#[cfg(test)]
+mod groq_transport_tests {
+    use super::*;
+    #[test]
+    fn groq_transport_and_quota_controls() {
+        for case in ["stream", "wait"] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("chuggin");
+            std::fs::create_dir_all(&base).unwrap();
+            std::fs::write(base.join("groq.key"), "fixture-secret-not-real").unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "model::groq_transport_tests::groq_worker",
+                    "--ignored",
+                ])
+                .env("XDG_CONFIG_HOME", dir.path())
+                .env("CHUGGIN_GROQ_FIXTURE", case)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    #[test]
+    #[ignore = "Isolated mock fixture launched by groq_transport_and_quota_controls"]
+    fn groq_worker() {
+        let case = std::env::var("CHUGGIN_GROQ_FIXTURE").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut model =
+            Model::new("http://unused", "groq/fixture", 8192, 512, stop.clone()).unwrap();
+        model.url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let messages = vec![json!({"role":"user","content":"fixture"})];
+        if case == "wait" {
+            let limits = crate::groq::Limits {
+                requests_per_minute: 1,
+                ..Default::default()
+            };
+            crate::setup::save(&crate::groq::path("groq-limits.json").unwrap(), &limits).unwrap();
+            assert!(matches!(
+                crate::groq::admit("groq/fixture", &messages, None, 512).unwrap(),
+                crate::groq::Admission::Ready(_)
+            ));
+            let controls = model.controls.clone();
+            let thread = std::thread::spawn(move || {
+                for _ in 0..3 {
+                    std::thread::sleep(Duration::from_millis(120));
+                    controls.retry_now();
+                }
+                controls.toggle_pause();
+                std::thread::sleep(Duration::from_millis(120));
+                controls.resume();
+                stop.store(true, Ordering::SeqCst);
+            });
+            let error = model.chat(&messages, None, false).unwrap_err();
+            assert!(error.downcast_ref::<crate::provider::Stopped>().is_some());
+            thread.join().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            return;
+        }
+        let thread = std::thread::spawn(move || {
+            for interrupted in [false, true] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut size = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(n) = line.to_lowercase().strip_prefix("content-length:") {
+                        size = n.trim().parse().unwrap();
+                    }
+                }
+                let mut bytes = vec![0; size];
+                reader.read_exact(&mut bytes).unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["model"], "fixture");
+                assert!(body.get("options").is_none());
+                assert!(body.get("think").is_none());
+                let mut data = format!(
+                    "data: {}\n\n",
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]})
+                );
+                if !interrupted {
+                    data += &format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"file\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"completion_tokens":20}})
+                    );
+                }
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",data.len(),data).unwrap();
+            }
+        });
+        let trace = tempfile::tempdir().unwrap();
+        model.trace_to(trace.path());
+        let result = model.chat_format_once(&messages, None, None).unwrap();
+        assert_eq!(
+            result["tool_calls"][0]["function"]["arguments"],
+            json!({"path":"file"})
+        );
+        assert!(model.chat_format_once(&messages, None, None).is_err());
+        thread.join().unwrap();
+        for entry in std::fs::read_dir(trace.path()).unwrap().flatten() {
+            let s = std::fs::read_to_string(entry.path()).unwrap();
+            assert!(!s.contains("fixture-secret-not-real"));
+        }
+    }
 }

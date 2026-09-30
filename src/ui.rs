@@ -291,46 +291,126 @@ pub fn home_select(
         }
     }
 }
+fn render_selection(
+    f: &mut Frame,
+    title: &str,
+    items: &[String],
+    selected: usize,
+    offset: u16,
+    detail: &str,
+) {
+    base(f);
+    let outer = f.area().inner(Margin::new(3, 1));
+    let has_detail = !detail.trim().is_empty();
+    // Short forms use a centered card. Long previews retain the full screen width.
+    let compact = !has_detail || detail.lines().count() <= 6;
+    let width = if compact {
+        outer.width.min(96)
+    } else {
+        outer.width
+    };
+    let item_width = width.saturating_sub(7).max(1) as usize;
+    let choices: Vec<Text<'static>> = items
+        .iter()
+        .map(|item| {
+            Text::from(
+                textwrap::wrap(item, item_width)
+                    .into_iter()
+                    .map(|s| Line::from(s.into_owned()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let menu_height = choices
+        .iter()
+        .map(Text::height)
+        .sum::<usize>()
+        .saturating_add(2)
+        .min(u16::MAX as usize) as u16;
+    let details: Vec<Line<'static>> = if has_detail {
+        detail
+            .lines()
+            .flat_map(|line| {
+                if line.is_empty() {
+                    vec![Line::from("")]
+                } else {
+                    textwrap::wrap(line, width.saturating_sub(4).max(1) as usize)
+                        .into_iter()
+                        .map(|s| Line::from(s.into_owned()))
+                        .collect()
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let header = textwrap::wrap(&format!("CHUGGIN  /  {title}"), width.max(1) as usize)
+        .into_iter()
+        .map(|s| Line::from(s.into_owned()))
+        .collect::<Vec<_>>();
+    let header_height = (header.len() as u16).saturating_add(1);
+    let details_height = if has_detail {
+        details.len().saturating_add(3)
+    } else {
+        0
+    }
+    .min(u16::MAX as usize) as u16;
+    let height = header_height
+        .saturating_add(details_height)
+        .saturating_add(menu_height)
+        .saturating_add(2)
+        .min(outer.height);
+    let area = Rect::new(
+        outer.x + outer.width.saturating_sub(width) / 2,
+        outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let rows = Layout::vertical([
+        Constraint::Length(header_height),
+        Constraint::Min(0),
+        Constraint::Length(
+            menu_height
+                .min(area.height.saturating_sub(header_height + 2))
+                .max(3),
+        ),
+        Constraint::Length(2),
+    ])
+    .split(area);
+    f.render_widget(Paragraph::new(header).fg(ACCENT).bold(), rows[0]);
+    if has_detail {
+        // Leave a row between context and choices when the terminal has room.
+        let context = Rect {
+            height: rows[1].height.saturating_sub(1),
+            ..rows[1]
+        };
+        f.render_widget(
+            Paragraph::new(details)
+                .scroll((offset, 0))
+                .block(panel("Details · PgUp / PgDn scroll")),
+            context,
+        );
+    }
+    let mut state = ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(
+        List::new(choices.into_iter().map(ListItem::new))
+            .block(panel("Choose an option"))
+            .highlight_symbol(" › ")
+            .highlight_style(Style::default().bg(Color::Rgb(47, 42, 70)).fg(ACCENT)),
+        rows[2],
+        &mut state,
+    );
+    f.render_widget(
+        p("↑ ↓ select · Enter confirm · Esc back").fg(MUTED),
+        rows[3],
+    );
+}
+
 pub fn select(title: &str, items: &[String], default: usize) -> Result<Option<usize>> {
     let mut index = default.min(items.len().saturating_sub(1));
     let mut offset = 0u16;
     loop {
-        draw(|f| {
-            base(f);
-            let a = f.area().inner(Margin::new(3, 1));
-            let r = Layout::vertical([
-                Constraint::Length(2),
-                Constraint::Min(3),
-                Constraint::Length((items.len() as u16 + 2).min(12)),
-                Constraint::Length(1),
-            ])
-            .split(a);
-            f.render_widget(
-                Paragraph::new("CHUGGIN  /  ".to_owned() + title)
-                    .fg(ACCENT)
-                    .bold(),
-                r[0],
-            );
-            f.render_widget(
-                p(notes())
-                    .scroll((offset, 0))
-                    .block(panel("Details · PgUp / PgDn to scroll")),
-                r[1],
-            );
-            let mut s = ListState::default().with_selected(Some(index));
-            f.render_stateful_widget(
-                List::new(items.iter().map(|s| ListItem::new(s.clone())))
-                    .block(panel(title))
-                    .highlight_symbol(" › ")
-                    .highlight_style(Style::default().bg(Color::Rgb(47, 42, 70)).fg(ACCENT)),
-                r[2],
-                &mut s,
-            );
-            f.render_widget(
-                Paragraph::new("↑ ↓ select · Enter confirm · Esc back").fg(MUTED),
-                r[3],
-            );
-        })?;
+        draw(|f| render_selection(f, title, items, index, offset, &notes()))?;
         if let Some(e) = input()?
             && let Some(k) = pressed(&e)
         {
@@ -420,20 +500,57 @@ fn ask_field(label: &str, default: &str, secret: bool) -> Result<String> {
     loop {
         draw(|f| {
             base(f);
+            let detail = notes();
+            let outer = f.area().inner(Margin::new(3, 1));
+            let width = if detail.lines().count() <= 6 {
+                outer.width.min(96)
+            } else {
+                outer.width
+            };
+            let header = textwrap::wrap(&format!("CHUGGIN  /  {label}"), width.max(1) as usize)
+                .into_iter()
+                .map(|s| Line::from(s.into_owned()))
+                .collect::<Vec<_>>();
+            let header_height = (header.len() as u16).saturating_add(1);
+            let context_height = if detail.trim().is_empty() {
+                0
+            } else {
+                detail
+                    .lines()
+                    .map(|line| {
+                        textwrap::wrap(line, width.saturating_sub(4).max(1) as usize)
+                            .len()
+                            .max(1)
+                    })
+                    .sum::<usize>()
+                    .saturating_add(3)
+                    .min(u16::MAX as usize) as u16
+            };
+            let height = header_height
+                .saturating_add(context_height)
+                .saturating_add(9)
+                .min(outer.height);
+            let area = Rect::new(
+                outer.x + outer.width.saturating_sub(width) / 2,
+                outer.y + outer.height.saturating_sub(height) / 2,
+                width,
+                height,
+            );
             let r = Layout::vertical([
-                Constraint::Length(3),
-                Constraint::Min(3),
+                Constraint::Length(header_height),
+                Constraint::Min(0),
                 Constraint::Length(7),
                 Constraint::Length(2),
             ])
-            .split(f.area().inner(Margin::new(3, 1)));
-            f.render_widget(
-                Paragraph::new("CHUGGIN  /  ".to_owned() + label)
-                    .fg(ACCENT)
-                    .bold(),
-                r[0],
-            );
-            f.render_widget(p(notes()).block(panel("Context")), r[1]);
+            .split(area);
+            f.render_widget(Paragraph::new(header).fg(ACCENT).bold(), r[0]);
+            if context_height > 0 {
+                let context = Rect {
+                    height: r[1].height.saturating_sub(1),
+                    ..r[1]
+                };
+                f.render_widget(p(detail).block(panel("Context")), context);
+            }
             let mut visible = if secret {
                 "•".repeat(edit.value.chars().count())
             } else {
@@ -858,6 +975,9 @@ impl Dashboard {
         }
         let message = if self.controls.pause_requested() {
             "Finishing current operation to pause"
+        } else if self.provider_wait.is_some() && self.phase.starts_with("Waiting for Groq budget")
+        {
+            "Waiting for Groq budget"
         } else if self.provider_wait.is_some() {
             "Waiting for provider"
         } else if self.request_active {
@@ -925,7 +1045,12 @@ impl Dashboard {
             Event::ProviderWait { reason, seconds } => {
                 self.request_active = false;
                 self.provider_wait = Some(seconds);
-                self.phase = format!("Waiting for provider · {seconds}s · {reason}");
+                let label = if reason.starts_with("Groq budget:") {
+                    "Waiting for Groq budget"
+                } else {
+                    "Waiting for provider"
+                };
+                self.phase = format!("{label} · {seconds}s · {reason}");
             }
             Event::Log(s) => self.push(Kind::Activity, concise_activity(&s)),
             Event::Phase(s) => {
@@ -1263,6 +1388,121 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
     ]);
     lines
 }
+fn dashboard_footer(
+    d: &Dashboard,
+    c: &runner::Config,
+    stopping: bool,
+    paused: bool,
+    pausing: bool,
+    width: u16,
+) -> (Paragraph<'static>, u16) {
+    let controls = if d.tab == 5 {
+        "Enter send · Esc cancel · Ctrl+N new chat · F2 tool details · Tab views".into()
+    } else if d.finished.is_some() {
+        "R resume work  ·  N nudge  ·  Enter / Q return home".into()
+    } else if paused {
+        if d.provider_wait.is_some() {
+            "P resume current cycle · T retry on resume · Ctrl+C finish cycle".into()
+        } else {
+            "P resume current cycle · Ctrl+C finish cycle".into()
+        }
+    } else if pausing {
+        "Pause requested · P cancel pause\nFinishing current response/tool before pausing".into()
+    } else if c.run_duration_seconds > 0 && d.active_elapsed().as_secs() >= c.run_duration_seconds {
+        "Time limit reached · Finishing this cycle, then saving".into()
+    } else if stopping {
+        "Finishing this cycle · R resume · Ctrl+C again force-stops".into()
+    } else if d.provider_wait.is_some() {
+        "Waiting for provider · T retry now · P pause\nCtrl+C finish cycle · N nudge · ? help"
+            .into()
+    } else if c.run_duration_seconds > 0 {
+        format!(
+            "Time left {} · P pause · Ctrl+C finish cycle · N nudge · ? help",
+            duration(
+                c.run_duration_seconds
+                    .saturating_sub(d.active_elapsed().as_secs())
+            )
+        )
+    } else {
+        "P pause · Ctrl+C finish cycle · N nudge · 1–6 views · ? help".into()
+    };
+    let (lines, minimum_height) = if let Some(reason) = &d.finished {
+        (
+            vec![
+                Line::from("WORK PAUSED").bold(),
+                Line::from(if d.chat.busy {
+                    "Chat is working; the loop is stopped."
+                } else {
+                    "Loop stopped. Chat available."
+                }),
+                Line::from(reason.clone()),
+                Line::from(controls),
+            ],
+            6,
+        )
+    } else if paused {
+        let timer = if c.run_duration_seconds > 0 {
+            format!(
+                "Timer held · {} left",
+                duration(
+                    c.run_duration_seconds
+                        .saturating_sub(d.active_elapsed().as_secs())
+                )
+            )
+        } else {
+            "Timer held · Started commands may still finish".into()
+        };
+        let reasons = d.controls.reasons();
+        let detail = if reasons.is_empty() {
+            timer
+        } else {
+            format!("{timer} · {}", reasons.join(" · "))
+        };
+        (
+            vec![
+                Line::from("CYCLE PAUSED").bold(),
+                Line::from(detail),
+                Line::from(controls),
+            ],
+            4,
+        )
+    } else {
+        (Text::from(controls).lines, 1)
+    };
+    // Wrap once and use those same physical lines for both layout and rendering.
+    // Finished banners have a border that takes one column and row on each side.
+    let borders = if d.finished.is_some() { 2 } else { 0 };
+    let inner_width = width.saturating_sub(borders).max(1) as usize;
+    let wrapped: Vec<Line<'static>> = lines
+        .into_iter()
+        .flat_map(|line| {
+            textwrap::wrap(&line.to_string(), inner_width)
+                .into_iter()
+                .map(|text| Line::from(text.into_owned()).style(line.style))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let height = (wrapped.len().min(u16::MAX as usize) as u16)
+        .saturating_add(borders)
+        .max(minimum_height);
+    let mut paragraph = Paragraph::new(wrapped);
+    if d.finished.is_some() {
+        paragraph = paragraph
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(GOLD).bg(Color::Rgb(42, 34, 20)))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(GOLD)),
+            );
+    } else if paused {
+        paragraph = paragraph.style(Style::default().fg(GOLD).bg(Color::Rgb(42, 34, 20)));
+    } else {
+        paragraph = paragraph.fg(if stopping || pausing { GOLD } else { MUTED });
+    }
+    (paragraph, height)
+}
+
 fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stopping: bool) {
     base(f);
     let a = f.area().inner(Margin::new(1, 0));
@@ -1291,21 +1531,14 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         f.render_widget(p(format!("CHUGGIN\n\nResize to at least 46 × 14 to view the dashboard.\n{state}\nT retry provider now\nCtrl+C: finish cycle; again: force stop")).fg(ACCENT),a);
         return;
     }
+    let (footer, footer_height) = dashboard_footer(d, c, stopping, paused, pausing, a.width);
     let r = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(3),
         Constraint::Length(if d.nudges.active.is_some() { 5 } else { 3 }),
         Constraint::Min(4),
         Constraint::Length(2),
-        Constraint::Length(if d.finished.is_some() {
-            6
-        } else if paused {
-            4
-        } else if pausing || d.provider_wait.is_some() {
-            2
-        } else {
-            1
-        }),
+        Constraint::Length(footer_height),
     ])
     .split(a);
     let state = if d.finished.is_some() {
@@ -1533,7 +1766,11 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             } else if paused {
                 "Ⅱ Paused in current cycle".to_owned()
             } else if let Some(seconds) = d.provider_wait {
-                format!("◷ Provider retry in {seconds}s")
+                if d.phase.starts_with("Waiting for Groq budget") {
+                    format!("◷ Budget ready in {seconds}s")
+                } else {
+                    format!("◷ Provider retry in {seconds}s")
+                }
             } else if d.request_active {
                 "● Receiving response".to_owned()
             } else {
@@ -1611,15 +1848,26 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     }
     let health = if d.resources.total_gib > 0. {
         format!(
-            " Local CPU {:>3.0}%  ·  RAM {:.0}% of {:.1} GiB  ·  Chuggin {:.0} MiB  │  Ollama: {}",
+            " Local CPU {:>3.0}%  ·  RAM {:.0}% of {:.1} GiB  ·  Chuggin {:.0} MiB  │  Provider: {}",
             d.resources.cpu,
             d.resources.memory,
             d.resources.total_gib,
             d.resources.rss_mib,
-            c.ollama_url
+            if crate::groq::model_id(&c.model).is_some() {
+                "Groq"
+            } else {
+                &c.ollama_url
+            }
         )
     } else {
-        format!(" Local resources unavailable  │  Ollama: {}", c.ollama_url)
+        format!(
+            " Local resources unavailable  │  Provider: {}",
+            if crate::groq::model_id(&c.model).is_some() {
+                "Groq"
+            } else {
+                &c.ollama_url
+            }
+        )
     };
     f.render_widget(Paragraph::new(health).fg(MUTED), r[4]);
     if r[4].height > 1 && d.resources.total_gib > 0. {
@@ -1643,84 +1891,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             bars[1],
         );
     }
-    let footer = if d.tab == 5 {
-        "Enter send · Esc cancel · Ctrl+N new chat · F2 tool details · Tab views".into()
-    } else if let Some(s) = &d.finished {
-        format!("{s} · R resume · Enter / q returns home")
-    } else if paused {
-        if d.provider_wait.is_some() {
-            "P resume current cycle · T retry on resume · Ctrl+C finish cycle".into()
-        } else {
-            "P resume current cycle · Ctrl+C finish cycle".into()
-        }
-    } else if pausing {
-        "Pause requested · P cancel pause\nFinishing current response/tool before pausing".into()
-    } else if c.run_duration_seconds > 0 && d.active_elapsed().as_secs() >= c.run_duration_seconds {
-        "Time limit reached · Finishing this cycle, then saving".into()
-    } else if stopping {
-        "Finishing this cycle · R resume · Ctrl+C again force-stops".into()
-    } else if d.provider_wait.is_some() {
-        "Waiting for provider · T retry now · P pause\nCtrl+C finish cycle · N nudge · ? help"
-            .into()
-    } else if c.run_duration_seconds > 0 {
-        format!(
-            "Time left {} · P pause · Ctrl+C finish cycle · N nudge · ? help",
-            duration(
-                c.run_duration_seconds
-                    .saturating_sub(d.active_elapsed().as_secs())
-            )
-        )
-    } else {
-        "P pause · Ctrl+C finish cycle · N nudge · 1–6 views · ? help".into()
-    };
-    if let Some(reason) = &d.finished {
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::from("WORK PAUSED").bold(),
-                Line::from(if d.chat.busy {
-                    "Chat is working; the loop is stopped."
-                } else {
-                    "Loop stopped. Chat available."
-                }),
-                Line::from(reason.clone()),
-                Line::from("R resume work  ·  N nudge  ·  Enter / Q return home"),
-            ])
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(GOLD).bg(Color::Rgb(42, 34, 20)))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(GOLD)),
-            ),
-            r[5],
-        );
-    } else if paused {
-        let timer = if c.run_duration_seconds > 0 {
-            format!(
-                "Timer held · {} left",
-                duration(
-                    c.run_duration_seconds
-                        .saturating_sub(d.active_elapsed().as_secs())
-                )
-            )
-        } else {
-            "Timer held · Started commands may still finish".into()
-        };
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::from("CYCLE PAUSED").bold(),
-                Line::from(format!("{} · {}", timer, d.controls.reasons().join(" · "))),
-                Line::from(footer),
-            ])
-            .style(Style::default().fg(GOLD).bg(Color::Rgb(42, 34, 20))),
-            r[5],
-        );
-    } else {
-        f.render_widget(
-            Paragraph::new(footer).fg(if stopping || pausing { GOLD } else { MUTED }),
-            r[5],
-        );
-    }
+    f.render_widget(footer, r[5]);
     if let Some(draft) = &d.nudge_edit {
         let area = Rect::new(
             a.x + 2,
@@ -1739,13 +1910,55 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
 }
 
 pub fn dashboard(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
-    while dashboard_session(path, stop.clone(), running.clone(), true, false)? {}
-    Ok(())
+    dashboard_with_recovery(path, stop, running, true, false)
 }
 
 pub fn chat_home(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
-    dashboard_session(path, stop, running, false, true)?;
-    Ok(())
+    dashboard_with_recovery(path, stop, running, false, true)
+}
+
+fn dashboard_with_recovery(
+    path: &Path,
+    stop: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    mut start: bool,
+    chat: bool,
+) -> Result<()> {
+    loop {
+        match dashboard_session(path, stop.clone(), running.clone(), start, chat) {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(error) => {
+                let Some(disconnected) = error.downcast_ref::<crate::engine::Disconnected>() else {
+                    return Err(error);
+                };
+                running.store(false, Ordering::SeqCst);
+                clear_notes();
+                notice(format!(
+                    "The terminal interface lost its connection to Chuggin's background controller.\n\n\
+                    Saved checkpoints and files remain on disk. The last operation may have been interrupted.\n\n\
+                    Reconnect opens the observation view without starting new work. Review saved work and any surviving commands before resuming.\n\n\
+                    Controller log: {}\n\nDetails: {error}",
+                    disconnected.socket.with_extension("log").display()
+                ));
+                if select(
+                    "Background controller disconnected",
+                    &[
+                        "Reconnect — inspect saved work".into(),
+                        "Return home".into(),
+                    ],
+                    0,
+                )? != Some(0)
+                {
+                    return Ok(());
+                }
+                // Reconnection must not replay the original start/resume request.
+                // A restarted controller preserves its existing recovery holds.
+                start = false;
+                stop.store(false, Ordering::SeqCst);
+            }
+        }
+    }
 }
 fn dashboard_session(
     path: &Path,
@@ -1758,12 +1971,12 @@ fn dashboard_session(
     // Identity setup can prompt, so complete it on the thread that owns the terminal.
     crate::setup::ensure_git_identity(&config.repo)?;
     let mut d = Dashboard::new(&config);
-    let rx = events::subscribe();
     let client = crate::engine::Client::connect(path)?;
-    crate::engine::foreground(Some(client.clone()));
     if start {
         resume_client(&client)?;
     }
+    let rx = events::subscribe();
+    crate::engine::foreground(Some(client.clone()));
     if chat {
         d.tab = 5;
     }
@@ -2337,6 +2550,45 @@ mod tests {
                 }
             }
         }
+        let choices = vec![
+            "Always allowed".into(),
+            "Set active hours…".into(),
+            "Use shared active hours".into(),
+        ];
+        for (width, height) in [(110, 36), (80, 24), (46, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| render_selection(f, "Active hours", &choices, 0, 0, ""))
+                .unwrap();
+            let text = screen_text(&terminal);
+            assert!(
+                !text.contains("Details"),
+                "An empty detail box must not be rendered"
+            );
+            assert!(text.contains("Use shared active hours"));
+            terminal.draw(|f| render_selection(f, "Active hours", &choices, 0, 0, "Current setting: Always allowed\n\nOnly the loop follows this schedule. Chat remains available.")).unwrap();
+            let text = screen_text(&terminal);
+            assert!(text.contains("Current setting: Always allowed"));
+            assert!(text.contains("Use shared active hours"));
+            if let Ok(dir) = std::env::var("CHUGGIN_UI_SNAPSHOTS") {
+                fs::write(Path::new(&dir).join(format!("settings-{width}.txt")), text).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn proactive_budget_wait_is_not_presented_as_provider_failure() {
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::ProviderWait {
+            reason: "Groq budget: waiting before sending a request".into(),
+            seconds: 23,
+        });
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| render_dashboard(f, &mut d, &c, false)).unwrap();
+        let text = screen_text(&t);
+        assert!(text.contains("Waiting for Groq budget"));
+        assert!(text.contains("Budget ready in 23s"));
+        assert!(!text.contains("Provider retry"));
     }
     #[test]
     fn provider_wait_is_visible_and_clears_when_requests_resume() {
@@ -2444,6 +2696,27 @@ mod tests {
                 >= Duration::from_millis(5)
         );
         assert!(d.finished.is_none());
+        let reason = "Controller ended unexpectedly. Review saved work and any surviving commands before resuming; Chat can help recover.";
+        d.controls
+            .observe_remote(serde_json::json!({"paused":true,"holds":[reason]}));
+        c.run_duration_seconds = 0;
+        for (width, height) in [(110, 36), (80, 24), (46, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| render_dashboard(f, &mut d, &c, false))
+                .unwrap();
+            let text = screen_text(&terminal);
+            let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                normalized.contains(reason),
+                "Recovery message was clipped at {width}x{height}:\n{text}"
+            );
+            assert!(normalized.contains("Ctrl+C finish cycle"));
+            if let Ok(dir) = std::env::var("CHUGGIN_UI_SNAPSHOTS") {
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(Path::new(&dir).join(format!("paused-{width}.txt")), text).unwrap();
+            }
+        }
     }
     #[test]
     fn observation_controls_and_help_fit_a_standard_terminal() {
@@ -2903,6 +3176,39 @@ impl ChatPanel {
 }
 fn resume_client(client: &crate::engine::Client) -> Result<()> {
     let state = client.request(serde_json::json!({"action":"status"}))?;
+    if state["interrupted_controller"].is_object() {
+        clear_notes();
+        notice(format!(
+            "Chuggin's background controller was interrupted. Your files and saved conversation remain available.\n\n\
+            Before resuming, confirm that commands from the previous run have stopped. Resuming will keep the current files and give the model a one-time recovery note to re-read them.\n\n\
+            Project: {}\nPrevious controller PID: {}\n\n\
+            If you need help reviewing the project, keep it paused and open Chat (tab 6).",
+            state["project"].as_str().unwrap_or("—"),
+            state["interrupted_controller"]["pid"],
+        ));
+        if select(
+            "Resume after controller interruption",
+            &[
+                "Previous commands have stopped — resume work".into(),
+                "Keep paused — review in Chat".into(),
+            ],
+            1,
+        )? != Some(0)
+        {
+            return Ok(());
+        }
+        let session = client.open_session(None)?;
+        let result = client.call(
+            &session,
+            "acknowledge_controller_restart",
+            serde_json::json!({
+                "previous_commands_stopped":true,
+                "summary":"User confirmed the previous commands have stopped and requested resume from saved work in the terminal interface.",
+            }),
+            &crate::operator::id(),
+        )?;
+        anyhow::ensure!(result["status"] == "complete", "{}", result["error"]);
+    }
     let mode = if state["schedule"]["open"] == false {
         match select(
             "Outside active hours · resume loop",

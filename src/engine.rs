@@ -24,6 +24,28 @@ pub struct Record {
 pub struct Client {
     pub socket: PathBuf,
 }
+
+/// A failed local transport is distinct from an error returned by the controller
+/// (including inference provider errors). The UI can offer reconnection only here.
+#[derive(Debug)]
+pub struct Disconnected {
+    pub socket: PathBuf,
+    source: std::io::Error,
+}
+impl std::fmt::Display for Disconnected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Lost connection to Chuggin's background controller: {}",
+            self.source
+        )
+    }
+}
+impl std::error::Error for Disconnected {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 fn socket_path(path: &Path) -> Result<PathBuf> {
     use std::hash::{Hash, Hasher};
     let c = crate::runner::load(path)?;
@@ -50,14 +72,37 @@ impl Client {
         };
         if let Ok(status) = client.request(json!({"action":"status"})) {
             ensure!(
-                status["version"] == env!("CARGO_PKG_VERSION"),
-                "A different Chuggin version owns this project. Stop that run and close its controller before upgrading."
-            );
-            ensure!(
                 status["config"].as_str() == path.to_str(),
                 "This checkout is already controlled with a different project configuration"
             );
-            return Ok(client);
+            if status["version"] == env!("CARGO_PKG_VERSION") {
+                return Ok(client);
+            }
+            ensure!(
+                status["running"] == false,
+                "The previous Chuggin version ({}) still has a running or paused loop. Stop that loop in its original window before opening this version. Saved files remain available.",
+                status["version"].as_str().unwrap_or("unknown"),
+            );
+            // The old owner must agree it is idle: shutdown also refuses active
+            // chats, editing ownership and commands. Never force an upgrade.
+            client.request(json!({"action":"shutdown"})).context(
+                "The previous Chuggin controller still has active work. Finish its chat, editing session or commands in the original window before upgrading",
+            )?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while client.socket.exists() {
+                // Another new-version viewer may complete the upgrade first.
+                if let Ok(updated) = client.request(json!({"action":"status"}))
+                    && updated["version"] == env!("CARGO_PKG_VERSION")
+                    && updated["config"].as_str() == path.to_str()
+                {
+                    return Ok(client);
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "The previous controller is still closing. Return home and try Resume project again shortly."
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
         let log = fs::OpenOptions::new()
             .create(true)
@@ -99,17 +144,33 @@ impl Client {
     pub fn request(&self, value: Value) -> Result<Value> {
         #[cfg(unix)]
         {
-            let mut stream = std::os::unix::net::UnixStream::connect(&self.socket)?;
+            let disconnected = |source| Disconnected {
+                socket: self.socket.clone(),
+                source,
+            };
+            let mut stream =
+                std::os::unix::net::UnixStream::connect(&self.socket).map_err(disconnected)?;
             stream.set_read_timeout(Some(Duration::from_secs(120)))?;
             stream.set_write_timeout(Some(Duration::from_secs(10)))?;
             let bytes = serde_json::to_vec(&value)?;
             ensure!(bytes.len() < 2_000_000, "Request too large");
-            stream.write_all(&bytes)?;
-            stream.write_all(b"\n")?;
+            stream.write_all(&bytes).map_err(disconnected)?;
+            stream.write_all(b"\n").map_err(disconnected)?;
             let mut line = String::new();
             BufReader::new(stream)
                 .take(4_000_000)
-                .read_line(&mut line)?;
+                .read_line(&mut line)
+                .map_err(disconnected)?;
+            ensure!(
+                !line.is_empty(),
+                Disconnected {
+                    socket: self.socket.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "Controller closed the connection without replying",
+                    ),
+                }
+            );
             let reply: Value = serde_json::from_str(&line)?;
             if reply["ok"] == true {
                 Ok(reply["result"].clone())
@@ -459,4 +520,63 @@ pub fn close_idle(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn request_with_reply(reply: &'static str) -> anyhow::Error {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("controller.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        let error = Client { socket }
+            .request(json!({"action":"status"}))
+            .unwrap_err();
+        worker.join().unwrap();
+        error
+    }
+
+    #[test]
+    fn missing_local_controller_is_a_distinct_transport_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("missing.sock");
+        let error = Client {
+            socket: socket.clone(),
+        }
+        .request(json!({"action":"status"}))
+        .unwrap_err();
+        let disconnected = error.downcast_ref::<Disconnected>().unwrap();
+        assert_eq!(disconnected.socket, socket);
+        assert!(error.to_string().contains("background controller"));
+    }
+
+    #[test]
+    fn controller_exiting_without_a_reply_offers_transport_recovery() {
+        let error = request_with_reply("");
+        assert_eq!(
+            error.downcast_ref::<Disconnected>().unwrap().source.kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn provider_failure_returned_by_controller_is_not_a_disconnect() {
+        let error = request_with_reply(
+            "{\"ok\":false,\"error\":\"Connection refused by inference provider\"}\n",
+        );
+        assert!(error.downcast_ref::<Disconnected>().is_none());
+        assert_eq!(
+            error.to_string(),
+            "Connection refused by inference provider"
+        );
+    }
 }

@@ -1982,6 +1982,227 @@ mod terminal_ui {
         ui.restored();
     }
     #[test]
+    fn upgrade_replaces_only_an_idle_old_controller() {
+        use std::hash::{Hash, Hasher};
+        use std::os::unix::net::UnixListener;
+        for mode in 0..3 {
+            let server = Server::new(false, true);
+            let root = tempfile::tempdir().unwrap();
+            fixture(root.path(), &server.url, true);
+            let config = fs::canonicalize(root.path().join("chuggin.json")).unwrap();
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            fs::canonicalize(root.path().join("repo/.git"))
+                .unwrap()
+                .hash(&mut hash);
+            let runtime = root.path().join(".chuggin/global/chuggin/runtime");
+            fs::create_dir_all(&runtime).unwrap();
+            let socket = runtime.join(format!("{:016x}.sock", hash.finish()));
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let done = Arc::new(AtomicBool::new(false));
+            let finished = done.clone();
+            let actions = Arc::new(Mutex::new(Vec::new()));
+            let recorded = actions.clone();
+            let socket_copy = socket.clone();
+            let owner = thread::spawn(move || {
+                let until = std::time::Instant::now() + Duration::from_secs(20);
+                while !finished.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    recorded.lock().unwrap().push(request["action"].clone());
+                    let reply = if request["action"] == "shutdown" {
+                        if mode == 2 {
+                            json!({"ok":false,"error":"A chat is still running"})
+                        } else {
+                            json!({"ok":true,"result":{"closing":true}})
+                        }
+                    } else {
+                        json!({"ok":true,"result":{"version":"older-test-version","config":config,"running":mode == 1}})
+                    };
+                    writeln!(stream, "{reply}").unwrap();
+                    if request["action"] == "shutdown" && mode == 0 {
+                        break;
+                    }
+                }
+                drop(listener);
+                fs::remove_file(socket_copy).unwrap();
+            });
+            let mut ui = TerminalProcess::start(root.path());
+            ui.wait("Resume project");
+            ui.send(b"\r");
+            if mode == 0 {
+                ui.wait("Overall cycle: #1");
+                ui.send(b"\x03");
+                ui.wait("Run saved");
+                assert!(!server.requests.lock().unwrap().is_empty());
+                ui.send(b"q");
+                ui.wait("Resume project");
+            } else {
+                ui.wait(if mode == 1 {
+                    "still has a running or paused loop"
+                } else {
+                    "still has active work"
+                });
+                assert!(
+                    socket.exists(),
+                    "An active old owner must retain its socket"
+                );
+                assert!(server.requests.lock().unwrap().is_empty());
+                assert!(!root.path().join("state/state.json").exists());
+                ui.send(b"\r");
+                ui.wait("Resume project");
+            }
+            ui.send(b"q");
+            ui.restored();
+            done.store(true, Ordering::SeqCst);
+            owner.join().unwrap();
+            assert_eq!(
+                actions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|action| *action == "shutdown")
+                    .count(),
+                usize::from(mode != 1)
+            );
+        }
+    }
+    #[test]
+    fn disconnected_controller_can_reconnect_without_resuming_or_losing_recovery() {
+        let server = Server::new(false, true);
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let marker = root.path().join("state/operator/controller-running.json");
+        let read_pid = || {
+            serde_json::from_slice::<Value>(&fs::read(&marker).unwrap()).unwrap()["pid"]
+                .as_u64()
+                .unwrap() as i32
+        };
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"\r");
+        ui.wait("Overall cycle: #1");
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        let saved = state(root.path());
+        let saved_file = fs::read(root.path().join("repo/value.txt")).unwrap();
+        let calls = server.requests.lock().unwrap().len();
+        let controls_path = root.path().join("state/operator/control.jsonl");
+        let controls = fs::read(&controls_path).unwrap();
+        let old_pid = read_pid();
+        assert!(old_pid > 0 && old_pid != ui.child.id() as i32);
+        assert_eq!(unsafe { libc::kill(old_pid, libc::SIGKILL) }, 0);
+        ui.wait("Background controller disconnected");
+        ui.wait("Reconnect — inspect saved work");
+        ui.wait("Return home");
+        assert!(
+            !ui.parser
+                .screen()
+                .contents()
+                .contains("CHUGGIN  /  Continue")
+        );
+
+        // Reconnect inspects the saved run; it does not repeat the original resume.
+        ui.send(b"\r");
+        ui.wait_until("restarted background controller", || {
+            fs::read(&marker)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|value| value["pid"].as_u64() != Some(old_pid as u64))
+        });
+        ui.wait("WORK PAUSED");
+        let restarted_pid = read_pid();
+        let runtime = root.path().join(".chuggin/global/chuggin/runtime");
+        let socket = fs::read_dir(runtime)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "sock")
+            })
+            .unwrap();
+        let mut connection = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        connection
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        writeln!(connection, "{}", json!({"action":"status"})).unwrap();
+        let mut reply = String::new();
+        BufReader::new(connection).read_line(&mut reply).unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["result"]["running"], false);
+        assert!(
+            reply["result"]["holds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason
+                    .as_str()
+                    .unwrap()
+                    .contains("Controller ended unexpectedly")),
+            "Reconnecting must retain the interrupted-controller recovery hold"
+        );
+        assert!(
+            root.path()
+                .join("state/operator/interrupted-controller.json")
+                .exists()
+        );
+        thread::sleep(Duration::from_millis(300));
+        ui.read();
+        assert_eq!(server.requests.lock().unwrap().len(), calls);
+        assert_eq!(fs::read(&controls_path).unwrap(), controls);
+        assert_eq!(state(root.path()), saved);
+        assert_eq!(
+            fs::read(root.path().join("repo/value.txt")).unwrap(),
+            saved_file
+        );
+
+        // Recovery is visible in the terminal, and cancelling leaves work paused.
+        ui.send(b"r");
+        ui.wait("Resume after controller interruption");
+        ui.send(b"\x1b");
+        ui.wait("WORK PAUSED");
+        assert_eq!(server.requests.lock().unwrap().len(), calls);
+        assert!(
+            root.path()
+                .join("state/operator/interrupted-controller.json")
+                .exists()
+        );
+        ui.send(b"r");
+        ui.wait("Resume after controller interruption");
+        ui.send(b"\x1b[A\r");
+        ui.wait("Overall cycle: #2");
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        assert!(
+            !root
+                .path()
+                .join("state/operator/interrupted-controller.json")
+                .exists()
+        );
+        let calls_after_recovery = server.requests.lock().unwrap().len();
+        assert!(calls_after_recovery > calls);
+
+        assert_eq!(unsafe { libc::kill(restarted_pid, libc::SIGKILL) }, 0);
+        ui.wait("Background controller disconnected");
+        ui.send(b"\x1b[B\r");
+        ui.wait("Resume project");
+        assert_eq!(server.requests.lock().unwrap().len(), calls_after_recovery);
+        ui.send(b"q");
+        ui.restored();
+    }
+    #[test]
     fn pause_finishes_the_response_then_resumes_its_tools_in_the_same_cycle() {
         let release_response = Arc::new(AtomicBool::new(false));
         let release = release_response.clone();
@@ -2278,7 +2499,9 @@ mod terminal_ui {
             ui.send(b"\r");
             if conflict {
                 ui.wait("Keep an old commit selection?");
-                ui.wait("does NOT delete");
+                // The explanation may wrap between the negation and the action.
+                ui.wait("does NOT");
+                ui.wait("delete file changes");
                 ui.send(b"\r");
             }
             ui.wait_until("model sees migrated files", || {
@@ -2325,6 +2548,8 @@ mod terminal_ui {
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("old-project-model");
         ui.send(b"jjj\r");
+        ui.wait("Inference provider");
+        ui.send(b"\r");
         ui.wait("Choose model for this project");
         ui.send(b"\r");
         ui.wait("Resume project");

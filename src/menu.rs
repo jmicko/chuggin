@@ -1,8 +1,8 @@
 use crate::{runner, setup};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use dialoguer::{Select, theme::ColorfulTheme};
 use std::{
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -18,17 +18,6 @@ pub fn select(title: &str, items: &[String], default: usize) -> Result<Option<us
         .items(items)
         .default(default)
         .interact_opt()?)
-}
-pub fn pause() -> Result<()> {
-    if crate::ui::active() {
-        crate::ui::select("Continue", &["Back".into()], 0)?;
-        return Ok(());
-    }
-    print!("\nPress Enter to return to the menu…");
-    io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    Ok(())
 }
 pub(crate) fn progress_text(progress: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(progress) else {
@@ -187,8 +176,9 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             return Ok(());
         }
         if let Err(e) = action {
-            crate::ui::notice(format!("\n{e:#}"));
-            pause().context("Could not return to menu")?;
+            crate::ui::clear_notes();
+            crate::ui::notice(format!("{e:#}"));
+            crate::ui::select("Could not complete this action", &["Return home".into()], 0)?;
         }
     }
 }

@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "chuggin"
-version = "0.13.0"
+version = "0.13.5"
 dependencies = [
  "anyhow",
  "chrono",

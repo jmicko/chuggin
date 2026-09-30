@@ -190,3 +190,11 @@ It incorporates the user's requested global connections/default model,
 project-specific routes and limits, integrated Settings workflow, a bounded Groq
 compatibility probe, and pinned public Codex source findings. It supersedes earlier
 proposals where they differ. The new design is planned, not yet implemented.
+
+September 29 implementation update: Groq inference is now available through the
+in-app model selector and shared settings, with a private global key, editable
+free-tier defaults, persistent request/token reservations across local projects,
+response-header feedback, and streamed tool/result support. This implements one
+Groq connection alongside Ollama; the broader named connection registry, project
+spending profiles and delegated-agent routing in PROVIDERS_AND_AGENTS.md remain
+future work. No paid-tier behavior was exercised against a paid account.

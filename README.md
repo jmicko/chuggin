@@ -711,3 +711,50 @@ calls; running commands must finish before the model can report completion.
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
+
+### Groq free-tier inference
+
+Choose **Choose model → Groq** from Home. Add the API key under
+**Settings → Shared settings → Groq connection and limits**. The model list comes
+from your Groq account. Project models use names such as
+`groq/openai/gpt-oss-120b`; the `groq/` prefix selects Groq, while existing model
+names continue to use Ollama. Chat can select a Groq model independently with the
+same prefix. Credentials live in the private global `groq.key` file, never in
+project configurations or model request artifacts. Connections use Groq's official
+HTTPS endpoint and do not follow redirects.
+
+The default shared budget is 24 requests/minute, 900 requests/day, 7,200
+tokens/minute, and 180,000 tokens/day. These defaults leave headroom below the
+published free limits for GPT-OSS and Qwen as of September 2026. Verify your actual
+account allowances on [Groq's Limits page](https://console.groq.com/settings/limits).
+Limits and the 1,024-token maximum response cap are editable in the same menu;
+optional separate input/output minute limits are supported too.
+
+Every inference call—including chat, recovery and watchdog requests—must reserve
+estimated input plus maximum output before sending. The budget is shared across
+projects and models on this machine, locked across processes, and persisted across
+restarts. Actual reported usage replaces reservations; interrupted or unreported
+requests retain their reservations. Daily accounting uses a conservative rolling
+24-hour window. Minute token capacity refills continuously; Chuggin waits for the
+next request to fit instead of always waiting a full minute. The dashboard labels
+this **Waiting for Groq budget**, separately from provider-error retries.
+Successful response headers can tighten admission, and an unexpected
+429 also establishes a shared cooldown. Manual retry rechecks this budget rather
+than bypassing it. A watchdog skips unavailable inference instead of waiting
+indefinitely while reviewing a command. Other agents can pause/stop normally during
+quota waits. Model-list connection tests do not invoke inference.
+
+Free-tier throughput is mostly constrained by **tokens**, not request counts.
+Once the daily budget is used, the loop waits for capacity to return; this is
+expected and survives restarting Chuggin. Waiting cannot make an oversized request
+fit. Groq requests therefore keep the system instructions and initial goal, drop
+older complete exchanges when necessary, and explicitly shorten large tool results.
+The latest exchange stays paired, and pre-shortening conversations are archived.
+If the required context still cannot fit, Chuggin reports the problem without sending
+it. This smaller working context applies only to Groq.
+
+Token counting is an estimate with headroom and upward calibration from actual
+usage, not a provider tokenizer guarantee. Other apps/machines using your Groq
+organization are only reflected in provider headers, so 429 recovery remains a
+fallback. Cached tokens are conservatively counted locally. The local limits are
+not an account-wide billing cap and do not automatically enable paid usage.

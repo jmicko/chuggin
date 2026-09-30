@@ -247,7 +247,7 @@ pub fn load(path: &Path) -> Result<Config> {
     }
     anyhow::ensure!(
         !c.model.trim().is_empty(),
-        "Choose an Ollama model from the home menu before starting a run"
+        "Choose a model from the home menu before starting a run"
     );
     anyhow::ensure!(!c.goal.trim().is_empty(), "Goal must not be empty");
     anyhow::ensure!(
@@ -1678,7 +1678,14 @@ pub fn run_controlled(
         fs::remove_file(c.state_dir.join("goal-completion.json"))?;
     }
     let mut session = load_conversation(&c, &state)?;
-    session.messages.push(json!({"role":"user","content":format!("Current overall goal: {}. Current visible project folder: {}. Branch: {}. HEAD: {}. Work directly here. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work; completed tasks may create normal commits.",c.goal,state.working_workspace.display(),state.working_branch,state.branch_head)}));
+    let resumed_context = json!({"role":"user","content":format!("Current overall goal: {}. Current visible project folder: {}. Branch: {}. HEAD: {}. Work directly here. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work; completed tasks may create normal commits.",c.goal,state.working_workspace.display(),state.working_branch,state.branch_head)});
+    if crate::groq::model_id(&c.model).is_some() && session.messages.len() >= 2 {
+        // Groq's free request allowance cannot afford a second copy of a long goal.
+        // Replace the pinned goal with current authoritative state when resuming.
+        session.messages[1] = resumed_context;
+    } else {
+        session.messages.push(resumed_context);
+    }
     save_conversation(&c, &session)?;
     crate::events::log(format!(
         "Working directly in {} on {}",

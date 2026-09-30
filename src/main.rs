@@ -8,6 +8,7 @@ mod command_watch;
 mod dev_tools;
 mod engine;
 mod events;
+mod groq;
 mod inference;
 mod mcp;
 mod menu;
