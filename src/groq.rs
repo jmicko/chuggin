@@ -24,7 +24,7 @@ pub fn path(name: &str) -> Result<PathBuf> {
 }
 pub fn key() -> Result<String> {
     let s = fs::read_to_string(path("groq.key")?)
-        .context("Add your Groq key in Shared settings → Groq connection and limits")?;
+        .context("Add your Groq key in Global settings → Groq connection and limits")?;
     ensure!(!s.trim().is_empty(), "Groq key is empty");
     Ok(s.trim().into())
 }

@@ -192,6 +192,20 @@ fn file_id(path: &Path) -> Result<u64> {
         Ok(0)
     }
 }
+fn normalized_commit_message(root: &Path, message: &str) -> Result<String> {
+    // Git's commit cleanup removes trailing whitespace and repeated blank lines.
+    // Use Git's own rules for both messages, including journals from older runs.
+    let mut input = tempfile::NamedTempFile::new()?;
+    std::io::Write::write_all(&mut input, message.as_bytes())?;
+    checked(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("stripspace")
+            .stdin(input.reopen()?)
+            .output()?,
+    )
+}
 /// Complete an interrupted commit without replaying hooks or modifying project files.
 pub fn recover_promotion(root: &Path) -> Result<()> {
     let dir = git_dir(root)?.join("chuggin-promotion");
@@ -217,7 +231,10 @@ pub fn recover_promotion(root: &Path) -> Result<()> {
         let parents = project::git(root, &["show", "-s", "--format=%P", &current])?;
         let subject = project::git(root, &["show", "-s", "--format=%B", &current])?;
         anyhow::ensure!(
-            parents == journal.old_head && subject.trim() == journal.message.trim(),
+            parents == journal.old_head
+                && (subject.trim() == journal.message.trim()
+                    || normalized_commit_message(root, &subject)?
+                        == normalized_commit_message(root, &journal.message)?),
             "HEAD changed during commit recovery; inspect {} before continuing",
             dir.display()
         );
@@ -549,6 +566,113 @@ mod tests {
             assert_eq!(head(p), old);
             assert_eq!(fs::read_to_string(sub.join("new")).unwrap(), "next");
             assert!(!git_dir(p).unwrap().join("index.lock").exists());
+        }
+    }
+    #[test]
+    fn task_commit_recovers_after_git_cleans_message_whitespace() {
+        let d = repo();
+        let p = d.path();
+        fs::write(p.join("file"), "completed").unwrap();
+        let message = "Finish task  \n\n\nVerified files; \n[truncated]\t\n";
+        let committed = promote(
+            p,
+            &p.join(".chuggin"),
+            &head(p),
+            &tree(p, None).unwrap(),
+            message,
+        )
+        .unwrap();
+        assert_eq!(head(p), committed);
+        assert_eq!(
+            project::git(p, &["show", "-s", "--format=%B", "HEAD"]).unwrap(),
+            "Finish task\n\nVerified files;\n[truncated]"
+        );
+        assert!(
+            project::git(p, &["status", "--porcelain"])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!git_dir(p).unwrap().join("chuggin-promotion").exists());
+        assert!(!git_dir(p).unwrap().join("index.lock").exists());
+        recover_promotion(p).unwrap();
+    }
+    fn pending_commit(p: &Path, message: &str) -> PathBuf {
+        let dir = git_dir(p).unwrap().join("chuggin-promotion");
+        fs::create_dir(&dir).unwrap();
+        fs::copy(git_dir(p).unwrap().join("index"), dir.join("index.before")).unwrap();
+        let journal = Promotion {
+            root: fs::canonicalize(p).unwrap(),
+            state: p.join(".chuggin"),
+            old_head: head(p),
+            tree: tree(p, None).unwrap(),
+            message: message.into(),
+            lock_id: 0,
+            had_index: true,
+        };
+        fs::write(
+            dir.join("record.json"),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        Index::new(p, &journal.tree)
+            .unwrap()
+            .git(p, &["commit", "-m", message])
+            .unwrap();
+        dir
+    }
+    #[test]
+    fn legacy_commit_recovery_preserves_later_work_and_other_staging() {
+        let d = repo();
+        let p = d.path();
+        fs::create_dir(p.join("project")).unwrap();
+        fs::write(p.join("project/new"), "completed").unwrap();
+        fs::write(p.join("file"), "human staging").unwrap();
+        project::git(p, &["add", "file"]).unwrap();
+        let sub = p.join("project");
+        let dir = pending_commit(&sub, "Finish task\n\nEvidence; \n[truncated]");
+        let committed = head(p);
+        fs::write(sub.join("new"), "later work").unwrap();
+        recover_promotion(&sub).unwrap();
+        assert_eq!(head(p), committed);
+        assert_eq!(fs::read_to_string(sub.join("new")).unwrap(), "later work");
+        assert_eq!(
+            project::git(p, &["show", ":project/new"]).unwrap(),
+            "completed"
+        );
+        assert_eq!(
+            project::git(p, &["show", ":file"]).unwrap(),
+            "human staging"
+        );
+        assert!(!dir.exists());
+        recover_promotion(&sub).unwrap();
+    }
+    #[test]
+    fn recovery_rejects_substantive_message_changes_and_unrelated_commits() {
+        for unrelated in [false, true] {
+            let d = repo();
+            let p = d.path();
+            fs::write(p.join("file"), "completed").unwrap();
+            let dir = pending_commit(p, "Finish task\n\nEvidence; \n[truncated]");
+            let record = dir.join("record.json");
+            if unrelated {
+                project::git(p, &["commit", "--allow-empty", "-m", "Unrelated commit"]).unwrap();
+            } else {
+                let mut journal: Promotion =
+                    serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+                journal.message = "Finish task\n\nDifferent evidence".into();
+                fs::write(&record, serde_json::to_vec(&journal).unwrap()).unwrap();
+            }
+            let committed = head(p);
+            let index = fs::read(git_dir(p).unwrap().join("index")).unwrap();
+            let error = recover_promotion(p).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("HEAD changed during commit recovery")
+            );
+            assert_eq!(head(p), committed);
+            assert_eq!(fs::read(git_dir(p).unwrap().join("index")).unwrap(), index);
+            assert!(record.exists());
         }
     }
 }

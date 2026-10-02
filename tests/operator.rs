@@ -22,6 +22,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(url: &str) -> Self {
+        Self::with_context(url, 8192)
+    }
+    fn with_context(url: &str, context_tokens: u32) -> Self {
         let dir = tempfile::tempdir().unwrap();
         for args in [
             vec!["init", "-q", "-b", "main"],
@@ -59,7 +62,7 @@ impl Fixture {
                 .unwrap()
                 .success()
         );
-        let config = json!({"repo":dir.path(),"state_dir":dir.path().join(".chuggin"),"goal":"Improve the fixture","ollama_url":url,"model":"test-model","context_tokens":8192,"output_tokens":512,"implementation_calls":6,"checks":[{"argv":["git","rev-parse","HEAD"],"timeout_seconds":10}],"retry_seconds":1});
+        let config = json!({"repo":dir.path(),"state_dir":dir.path().join(".chuggin"),"goal":"Improve the fixture","ollama_url":url,"model":"test-model","context_tokens":context_tokens,"output_tokens":512,"implementation_calls":6,"checks":[{"argv":["git","rev-parse","HEAD"],"timeout_seconds":10}],"retry_seconds":1});
         fs::write(
             dir.path().join("chuggin.json"),
             serde_json::to_vec(&config).unwrap(),
@@ -532,6 +535,37 @@ fn settings(f: &Fixture, s: &str, patch: Value) {
         json!({"expected_revision":current["result"]["revision"],"settings":patch}),
     );
     assert_eq!(response["status"], "complete", "{response}");
+}
+
+#[test]
+fn million_token_projects_open_and_settings_reject_impossible_response_budgets() {
+    // Startup loads the project through runner::load, not just the settings parser.
+    let f = Fixture::with_context("http://127.0.0.1:1", 1_048_576);
+    let session = f.session();
+    let current = f.call(&session, "get_settings", json!({}));
+    assert_eq!(current["result"]["settings"]["context_tokens"], 1_048_576);
+    settings(&f, &session, json!({"context_tokens":1_000_000}));
+    let path = f.dir.path().join("chuggin.json");
+    let saved = fs::read(&path).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&saved).unwrap()["context_tokens"],
+        1_000_000
+    );
+    for patch in [
+        json!({"context_tokens":4095}),
+        json!({"output_tokens":0}),
+        json!({"output_tokens":1_000_000}),
+        json!({"context_tokens":4096,"output_tokens":8192}),
+    ] {
+        let current = f.call(&session, "get_settings", json!({}));
+        let reply = f.call(
+            &session,
+            "update_settings",
+            json!({"expected_revision":current["result"]["revision"],"settings":patch}),
+        );
+        assert_ne!(reply["status"], "complete", "{reply}");
+        assert_eq!(fs::read(&path).unwrap(), saved);
+    }
 }
 #[test]
 fn closing_after_a_response_parks_its_tools_and_one_cycle_override_preserves_manual_hold() {

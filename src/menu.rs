@@ -72,7 +72,11 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
     let _screen = crate::ui::Screen::enter()?;
     loop {
         let project = setup::find_project()?;
-        let settings = setup::settings()?;
+        let preview = if project.is_none() {
+            Some(setup::draft_config(&std::env::current_dir()?)?)
+        } else {
+            None
+        };
         let items = vec![
             if project.is_some() {
                 "Resume project"
@@ -82,11 +86,12 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             .into(),
             "Project goal".into(),
             "Progress".into(),
-            "Choose model".into(),
+            "Project model".into(),
             "Settings".into(),
             "Run duration".into(),
             "Chat with this project".into(),
-            "Tool requests".into(),
+            "More project settings".into(),
+            "Global settings".into(),
             "Quit".into(),
         ];
         let effective = project.as_ref().and_then(|p| runner::load(p).ok());
@@ -99,7 +104,8 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
         let model = effective
             .as_ref()
             .map(|c| c.model.as_str())
-            .unwrap_or(&settings.model);
+            .or_else(|| preview.as_ref().map(|c| c.model.as_str()))
+            .unwrap_or("");
         let model = if model.trim().is_empty() {
             "Choose a model during setup"
         } else {
@@ -155,13 +161,13 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                         crate::ui::show("Saved progress", "This project has not started yet.")?;
                     }
                 }
-                3 => setup::choose_model(project.as_deref())?,
+                3 => setup::choose_project_model(project.as_deref())?,
                 4 => setup::project_settings_menu(project.as_deref())?,
                 5 => {
                     if let Some(path) = project.as_ref() {
                         setup::run_duration(path)?;
                     } else {
-                        crate::ui::show("Run duration", "Set up this project first.")?;
+                        setup::draft_run_duration()?;
                     }
                 }
                 6 => {
@@ -170,17 +176,14 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                     }
                 }
                 7 => {
-                    if let Some(path) = project.as_ref() {
-                        crate::tool_requests::menu(path)?;
-                    } else {
-                        crate::ui::show("Tool requests", "Set up this project first.")?;
-                    }
+                    setup::more_project_settings(project.as_deref())?;
                 }
+                8 => setup::settings_menu()?,
                 _ => {}
             }
             Ok(())
         })();
-        if choice == 8 {
+        if choice == 9 {
             return Ok(());
         }
         if let Err(e) = action {

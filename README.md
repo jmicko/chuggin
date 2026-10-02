@@ -198,7 +198,7 @@ project information before sharing it publicly.
 ## Active hours
 
 Open **Settings → This project · Active hours** (also available in tab 5).
-Choose Always allowed, custom hours, or the shared default under Shared settings.
+Choose Always allowed, custom hours, or the shared default under Global settings.
 Set opening and closing times, weekdays, and a named timezone. Overnight windows
 belong to the day they open; daylight-saving changes follow that timezone.
 Existing projects remain Always allowed until you opt in.
@@ -614,17 +614,33 @@ quotas apply to searches; keys are optional and web tools default to disabled.
 
 ## Settings and history
 
-Shared settings: ~/.config/chuggin/settings.json, or
+Global settings: ~/.config/chuggin/settings.json, or
 $XDG_CONFIG_HOME/chuggin/settings.json. Project-local chuggin.json contains the accepted
 goal, repository, checks, and state location. Project overrides take precedence;
 shared settings are reloaded when starting a run.
 
-On the home screen, **Choose model** changes the current project's model using
-its configured Ollama server. Before project setup it changes the shared default.
-**Shared settings** changes defaults; existing project overrides still take precedence.
+On the home screen, **Project model** changes only the current project's model.
+This also works before goal setup: your choices are saved in this directory and
+carried into goal drafting and the accepted project configuration. **Settings**
+opens common project settings: model, context and response limits, request timeout,
+run duration, active hours, and optional goal completion. **More project settings**
+contains chat model, investigation helpers, tool requests, command review, and MCP.
+**Global settings** contains shared provider connections and defaults; existing
+project overrides still take precedence. Both submenus are available directly
+from Home in new and configured projects. Preferences saved before setup live in
+`.chuggin/project-draft-settings.json` until the goal is accepted; saving preferences
+does not start the loop or initialize a Git repository.
+Context and response limits offer presets and a
+Custom option. Request settings apply to the next request without interrupting
+the current one.
 
 Defaults: 32,768 context tokens, 4,096 output tokens, thinking disabled, and up to
 48 work steps per cycle, with bounded request recovery within each step.
+The context setting supports million-token windows and has no model-independent
+cap beyond its 32-bit token count. Choose a window supported by your model and
+provider; the response limit must be smaller than that window. For cloud models,
+this setting controls when Chuggin refreshes context; it does not increase the
+provider's actual capacity. Larger settings do not fill the window in advance.
 Conversations are not reset at an estimated byte threshold. After repeated failed
 request recovery or actual context pressure, work can continue in a refreshed
 conversation with the current files, main goal, task, and recorded failures.
@@ -807,14 +823,14 @@ calls; running commands must finish before the model can report completion.
 
 ## Cloud inference
 
-**Choose model** offers Ollama, Groq, OpenCode Zen, and OpenRouter. Selecting a
+**Project model** offers Ollama, Groq, OpenCode Zen, and OpenRouter. Selecting a
 provider loads its model catalog; it does not generate a response. Model choices
 are explicit: adding a connection does not change an existing project's model or
 the shared default. Chat and investigation helpers can select these providers too.
 
 ### OpenCode Zen free models
 
-Choose **Choose model → OpenCode Zen**. No account or API key is needed for the
+Choose **Project model → OpenCode Zen**. No account or API key is needed for the
 free models offered by this connection. Saved model names start with `zen/`.
 The picker includes tool-capable models whose catalog lists free pricing.
 For Space Bunny, select `zen/space-bunny-free`.
@@ -830,8 +846,8 @@ Free API access should not be taken as an assurance of unlimited 24/7 use.
 
 ### OpenRouter free models
 
-Add your key under **Settings → Shared settings → OpenRouter**, then choose
-**Choose model → OpenRouter**. The key is masked during entry and stored privately
+Add your key under **Settings → Global settings → OpenRouter**, then choose
+**Project model → OpenRouter**. The key is masked during entry and stored privately
 as `openrouter.key` alongside the shared settings. It is excluded from project
 configuration and request artifacts. The catalog check lists models without
 generating a response; it does not verify your remaining inference allowance.
@@ -850,8 +866,8 @@ context and output limits still apply to that model.
 
 ### Groq free-tier inference
 
-Choose **Choose model → Groq** from Home. Add the API key under
-**Settings → Shared settings → Groq connection and limits**. The model list comes
+Choose **Project model → Groq** from Home. Add the API key under
+**Settings → Global settings → Groq connection and limits**. The model list comes
 from your Groq account. Project models use names such as
 `groq/openai/gpt-oss-120b`; the `groq/` prefix selects Groq, while existing model
 names continue to use Ollama. Chat can select a Groq model independently with the

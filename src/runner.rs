@@ -16,6 +16,16 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+pub const MIN_CONTEXT_TOKENS: u32 = 4096;
+
+pub fn validate_token_limits(context: u32, output: u32) -> Result<()> {
+    anyhow::ensure!(
+        context >= MIN_CONTEXT_TOKENS && output > 0 && output < context,
+        "Context must be at least {MIN_CONTEXT_TOKENS} tokens; response limit must be positive and smaller than context"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -413,12 +423,7 @@ pub fn load(path: &Path) -> Result<Config> {
         !c.checks.is_empty(),
         "Configure at least one real validation command"
     );
-    anyhow::ensure!(
-        (4096..=262144).contains(&c.context_tokens)
-            && c.output_tokens > 0
-            && c.output_tokens < c.context_tokens,
-        "Invalid context/output token limits"
-    );
+    validate_token_limits(c.context_tokens, c.output_tokens)?;
     anyhow::ensure!(
         (1..=100).contains(&c.implementation_calls),
         "implementation_calls must be 1..100"

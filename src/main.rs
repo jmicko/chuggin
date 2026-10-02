@@ -69,7 +69,7 @@ enum Command {
     #[command(hide = true)]
     Engine {
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
     },
     /// Interactive project setup without starting the loop.
     Setup,
@@ -161,6 +161,17 @@ fn main() -> Result<()> {
         }
         Some(Command::Engine { config }) => {
             events::protocol_output();
+            // Internal launches pass the path over stdin so a model's process
+            // name search for the project cannot match its own controller.
+            let config = match config {
+                Some(path) => path,
+                None => {
+                    use anyhow::Context;
+                    use std::io::Read;
+                    serde_json::from_reader(std::io::stdin().lock().take(1_000_000))
+                        .context("Missing or invalid controller startup configuration")?
+                }
+            };
             engine::serve(&config)
         }
         None => menu::home(stopped, running),

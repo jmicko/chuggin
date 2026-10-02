@@ -2030,7 +2030,7 @@ mod terminal_ui {
                 thread::sleep(Duration::from_millis(30));
             }
         }
-        fn wait_until(&mut self, description: &str, ready: impl Fn() -> bool) {
+        fn wait_until(&mut self, description: &str, mut ready: impl FnMut() -> bool) {
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             loop {
                 self.read();
@@ -2288,6 +2288,67 @@ mod terminal_ui {
                 usize::from(mode != 1)
             );
         }
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn project_process_name_cleanup_cannot_match_the_background_controller() {
+        let root = tempfile::Builder::new()
+            .prefix("chuggin-pkill-regression-")
+            .tempdir()
+            .unwrap();
+        let pattern = root
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let cleanup_pattern = pattern.clone();
+        let server = Server::custom(false, false, None, move |_, n| {
+            if n == 0 {
+                (
+                    "Close the fixture application.".into(),
+                    json!([{"function":{"name":"run_command","arguments":{"argv":["pkill","-f",cleanup_pattern],"reason":"Reproduce project-name cleanup without stopping the controller."}}}]),
+                )
+            } else {
+                (
+                    "Cleanup finished; the controller remains available.".into(),
+                    json!([]),
+                )
+            }
+        });
+        fixture(root.path(), &server.url, true);
+        // Match a real fixture process, so success cannot mean pkill never ran.
+        let mut application = Command::new("sleep")
+            .arg("60")
+            .arg0(&pattern)
+            .spawn()
+            .unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"\r");
+        ui.wait("Overall cycle: #1");
+        let marker = root.path().join("state/operator/controller-running.json");
+        let controller: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        let pid = controller["pid"].as_u64().unwrap();
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+        assert!(!String::from_utf8_lossy(&cmdline).contains(&pattern));
+        ui.wait_until("application cleanup and another provider request", || {
+            application.try_wait().unwrap().is_some() && server.requests.lock().unwrap().len() >= 2
+        });
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        assert!(
+            !ui.parser
+                .screen()
+                .contents()
+                .contains("controller disconnected")
+        );
+        ui.send(b"\r");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
     }
     #[test]
     fn disconnected_controller_can_reconnect_without_resuming_or_losing_recovery() {
@@ -2834,13 +2895,13 @@ mod terminal_ui {
         let root = tempfile::tempdir().unwrap();
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Set up this project");
-        ui.send(b"jjjj\r");
-        ui.wait("Shared settings");
+        ui.send(b"jjjjjjjj\r");
+        ui.wait("Global settings");
         ui.send(b"\r");
         ui.wait("Ctrl+U clear");
         ui.send("\x15http://localhost:11434".as_bytes());
         ui.send(b"\r");
-        ui.wait("Shared settings");
+        ui.wait("Global settings");
         ui.send(b"\x1b");
         ui.wait("Set up this project");
         ui.send(b"q");
@@ -2854,6 +2915,185 @@ mod terminal_ui {
     }
 
     #[test]
+    fn fresh_project_settings_persist_without_changing_defaults_or_starting_work() {
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(global.parent().unwrap()).unwrap();
+        let defaults = json!({"model":"shared-model","ollama_url":server.url,
+            "context_tokens":65536,"output_tokens":8192});
+        fs::write(&global, defaults.to_string()).unwrap();
+        let original_defaults = fs::read(&global).unwrap();
+        let draft = root.path().join(".chuggin/project-draft-settings.json");
+
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Set up this project");
+        ui.wait("Project model");
+        ui.wait("More project settings");
+        ui.wait("Global settings");
+        assert!(!ui.parser.screen().contents().contains("Default model"));
+        ui.send(b"jjj\r");
+        ui.wait("Inference provider");
+        ui.send(b"\r");
+        ui.wait("Choose model for this project");
+        ui.send(b"\r");
+        ui.wait("Set up this project");
+        ui.wait("fake");
+        ui.send(b"jjjj\r");
+        ui.wait("Project settings");
+        ui.send(b"j\r");
+        ui.wait("Context window · this project");
+        ui.wait("1,000,000 tokens");
+        // The inherited 65,536 preset is four rows before 1,000,000.
+        ui.send(b"jjjj\r");
+        ui.wait("Project settings");
+        ui.wait("1,000,000");
+        ui.send(b"jj\r");
+        ui.wait("Response limit · this project");
+        ui.send(b"j\r");
+        ui.wait("Project settings");
+        ui.wait("16,384");
+        ui.send(b"\x1b");
+        ui.wait("Set up this project");
+        ui.send(b"jjjjjjj\r");
+        ui.wait("More project settings");
+        ui.send(b"jj\r");
+        ui.wait("Helpers · Disabled");
+        ui.send(b"\r");
+        ui.wait("Helpers · Enabled");
+        ui.send(b"jj\r");
+        ui.wait("Model responses per helper");
+        ui.send(b"\x1524\r");
+        ui.wait("Model responses per helper · 24");
+        ui.send(b"\x1b");
+        ui.wait("More project settings");
+        ui.send(b"j\r");
+        ui.wait("Chat model (enter");
+        ui.send(b"\x15fake-chat\r");
+        ui.wait("Chat model · fake-chat");
+        ui.send(b"\x1b");
+        ui.wait("Set up this project");
+        ui.send(b"q");
+        ui.restored();
+
+        let saved: Value = serde_json::from_slice(&fs::read(&draft).unwrap()).unwrap();
+        assert_eq!(saved["model"], "fake");
+        assert_eq!(saved["context_tokens"], 1_000_000);
+        assert_eq!(saved["output_tokens"], 16384);
+        assert_eq!(saved["helpers"]["enabled"], true);
+        assert_eq!(saved["helpers"]["max_calls"], 24);
+        assert_eq!(saved["chat_model"], "fake-chat");
+        let saved_bytes = fs::read(&draft).unwrap();
+
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Set up this project");
+        ui.wait("fake");
+        ui.send(b"jjjj\r");
+        ui.wait("Project settings");
+        ui.wait("1,000,000");
+        ui.wait("16,384");
+        ui.send(b"\x1b");
+        ui.wait("Set up this project");
+        ui.send(b"q");
+        ui.restored();
+        assert_eq!(fs::read(&draft).unwrap(), saved_bytes);
+        assert_eq!(fs::read(&global).unwrap(), original_defaults);
+        for path in [
+            "chuggin.json",
+            ".git",
+            ".chuggin/state.json",
+            ".chuggin/operator",
+            ".chuggin/global/chuggin/runtime",
+        ] {
+            assert!(!root.path().join(path).exists(), "Unexpected {path}");
+        }
+        assert!(
+            server.requests.lock().unwrap().is_empty(),
+            "Settings must not generate"
+        );
+    }
+
+    #[test]
+    fn project_settings_presets_custom_defaults_and_advanced_tools_have_clear_scopes() {
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        let path = fixture(root.path(), &server.url, true);
+        let mut expected: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        expected["model"] = json!("old-project-model");
+        fs::write(&path, expected.to_string()).unwrap();
+        let shared = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        let defaults = json!({"model":"shared-model","ollama_url":"http://127.0.0.1:1","context_tokens":65536,"output_tokens":8192});
+        fs::write(&shared, defaults.to_string()).unwrap();
+        let original_defaults = fs::read(&shared).unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"jjjj\r");
+        ui.wait("Project settings");
+        ui.wait("Project model");
+        ui.send(b"\r");
+        ui.wait("Inference provider");
+        ui.send(b"\r");
+        ui.wait("Choose model for this project");
+        ui.send(b"\r");
+        ui.wait("Project settings");
+        ui.send(b"j\r");
+        ui.wait("Context window · this project");
+        ui.wait("1,048,576 tokens");
+        ui.wait("Custom");
+        // Current context is 32,768. Choose the 1,000,000 preset.
+        ui.send(b"jjjjj\r");
+        ui.wait("Project settings");
+        ui.wait("1,000,000");
+        ui.send(b"jj\r");
+        ui.wait("Response limit · this project");
+        ui.send(b"j\r");
+        ui.wait("Project settings");
+        expected["model"] = json!("fake");
+        expected["context_tokens"] = json!(1_000_000);
+        expected["output_tokens"] = json!(8192);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(fs::read(&shared).unwrap(), original_defaults);
+        ui.send(b"jjjjjjj\r");
+        ui.wait("More project settings");
+        ui.wait("Investigation helpers");
+        ui.send(b"jjjj\r");
+        ui.wait("No missing capabilities have been requested");
+        ui.send(b"\x1b");
+        ui.wait("More project settings");
+        ui.send(b"\x1b");
+        ui.wait("Project settings");
+        ui.send(b"jjjjjjjj\r");
+        ui.wait("Global settings");
+        ui.send(b"jj\r");
+        ui.wait("Default context window · global");
+        // Current default is 65,536; Custom is six rows below it.
+        ui.send(b"jjjjjj\r");
+        ui.wait("custom token count");
+        ui.send(b"\x152000000\r");
+        ui.wait("Global settings");
+        let global: Value = serde_json::from_slice(&fs::read(&shared).unwrap()).unwrap();
+        assert_eq!(global["context_tokens"], 2_000_000);
+        assert_eq!(global["model"], "shared-model");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            expected
+        );
+        ui.send(b"\x1b");
+        ui.wait("Project settings");
+        ui.send(b"\x1b");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        assert!(
+            server.requests.lock().unwrap().is_empty(),
+            "Settings never start generation"
+        );
+    }
+    #[test]
     fn observation_settings_apply_without_interrupting_active_requests() {
         let server = Server::new(false, true);
         let root = tempfile::tempdir().unwrap();
@@ -2865,6 +3105,14 @@ mod terminal_ui {
         ui.send(b"5");
         ui.wait("PROJECT SETTINGS");
         ui.send(b"\r\x15fake-next\r");
+        ui.send(b"\x1b[B\r");
+        ui.wait("Context window · this project");
+        ui.send(b"jjjjj\r");
+        ui.wait("PROJECT SETTINGS");
+        ui.send(b"\x1b[B\r");
+        ui.wait("Response limit · this project");
+        ui.send(b"j\r");
+        ui.wait("PROJECT SETTINGS");
         ui.send(b"\x1b[B\r\x150\r");
         // Reduce an initially unlimited run to one second from its original start.
         ui.send(b"\x1b[B\r\x150.0003\r");
@@ -2873,6 +3121,8 @@ mod terminal_ui {
         let config: Value =
             serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
         assert_eq!(config["model"], "fake-next");
+        assert_eq!(config["context_tokens"], 1_000_000);
+        assert_eq!(config["output_tokens"], 8192);
         assert_eq!(config["request_timeout_seconds"], 0);
         assert_eq!(config["run_duration_seconds"], 1);
         let state: Value =
@@ -2883,7 +3133,14 @@ mod terminal_ui {
         let requests = server.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["model"], "fake");
+        assert_eq!(requests[0]["options"]["num_ctx"], 32768);
+        assert_eq!(requests[0]["options"]["num_predict"], 4096);
         assert!(requests[1..].iter().all(|r| r["model"] == "fake-next"));
+        assert!(
+            requests[1..].iter().all(
+                |r| r["options"]["num_ctx"] == 1_000_000 && r["options"]["num_predict"] == 8192
+            )
+        );
         drop(requests);
         ui.send(b"q");
         ui.wait("Resume project");
@@ -2896,8 +3153,8 @@ mod terminal_ui {
         let root = tempfile::tempdir().unwrap();
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Set up this project");
-        ui.send(b"jjjj\r");
-        ui.wait("Shared settings");
+        ui.send(b"jjjjjjjj\r");
+        ui.wait("Global settings");
         ui.send(b"jjjjjjj\r");
         ui.wait("Enter or replace key");
         ui.send(b"\r");
@@ -2960,29 +3217,128 @@ mod terminal_ui {
         let settings = root.path().join(".chuggin/global/chuggin/settings.json");
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(
-            settings,
-            json!({"ollama_url":server.url,"model":"fake"}).to_string(),
+            &settings,
+            json!({"ollama_url":"http://127.0.0.1:1","model":"shared-model"}).to_string(),
         )
         .unwrap();
+        let original_defaults = fs::read(&settings).unwrap();
+        let draft_path = root.path().join(".chuggin/project-draft-settings.json");
+        let preferences = json!({"ollama_url":server.url,"model":"project-model",
+            "context_tokens":1_000_000,"output_tokens":8192,"request_timeout_seconds":1200,
+            "run_duration_seconds":36000,"command_review_seconds":300,"chat_model":"chat-model",
+            "allow_goal_completion":true,"active_hours":{"mode":"always"},
+            "helpers":{"enabled":true,"model":"","max_calls":24}});
+        fs::write(&draft_path, preferences.to_string()).unwrap();
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Set up this project");
+        // Reproduce a new directory without a configured commit identity. Git
+        // setup is a separate step and must not become context for the pitch.
+        fs::write(root.path().join(".chuggin/test-gitconfig"), "").unwrap();
         ui.send(b"\r");
+        ui.wait("Git author name");
+        ui.send(b"Project Operator\r");
+        ui.wait("Git author email");
+        let email_screen = ui.parser.screen().contents();
+        assert!(!email_screen.contains("Git author name"), "{email_screen}");
+        assert!(!email_screen.contains("user.name"), "{email_screen}");
+        assert!(server.requests.lock().unwrap().is_empty());
+        ui.send(b"project@example.com\r");
         ui.wait("Describe what you want to build");
+        ui.wait("Give a short description of this project");
+        let pitch_screen = ui.parser.screen().contents();
+        for old in [
+            "Git author",
+            "user.name",
+            "user.email",
+            "GitHub attribution",
+        ] {
+            assert!(!pitch_screen.contains(old), "{old}: {pitch_screen}");
+        }
         ui.send("An éditeur in Rust".as_bytes());
         ui.send(b"\r");
         ui.wait("Review your goal");
         ui.wait("Build a useful editor. Draft 1.");
+        let review_screen = ui.parser.screen().contents();
+        for old in [
+            "Give a short description",
+            "Git author",
+            "GitHub attribution",
+        ] {
+            assert!(!review_screen.contains(old), "{old}: {review_screen}");
+        }
+        ui.send(b"j\r");
+        ui.wait("What should change?");
+        ui.wait("Describe what should change in this goal");
+        ui.wait("Build a useful editor. Draft 1.");
+        let revision_screen = ui.parser.screen().contents();
+        assert!(!revision_screen.contains("Give a short description"));
+        assert!(!revision_screen.contains("Git author"));
+        ui.send(b"Include reliable document persistence.\r");
+        ui.wait("Review your goal");
+        ui.wait("Build a useful editor. Draft 2.");
+        let revised_screen = ui.parser.screen().contents();
+        assert_eq!(
+            revised_screen
+                .matches("Build a useful editor. Draft 2.")
+                .count(),
+            1
+        );
+        for old in ["Draft 1.", "Describe what should change", "Git author"] {
+            assert!(!revised_screen.contains(old), "{old}: {revised_screen}");
+        }
         ui.send(b"\r");
         ui.wait("Validation command");
+        ui.wait("Choose a check Chuggin can use");
+        let validation_screen = ui.parser.screen().contents();
+        for old in [
+            "Build a useful editor.",
+            "Proposed project goal",
+            "Git author",
+        ] {
+            assert!(
+                !validation_screen.contains(old),
+                "{old}: {validation_screen}"
+            );
+        }
         ui.send(b"git rev-parse HEAD\r");
         ui.wait("First command review (seconds)");
+        ui.wait("Choose when Chuggin first checks a running command");
+        let command_review_screen = ui.parser.screen().contents();
+        for old in [
+            "Choose a check Chuggin can use",
+            "Proposed project goal",
+            "Git author",
+        ] {
+            assert!(
+                !command_review_screen.contains(old),
+                "{old}: {command_review_screen}"
+            );
+        }
         ui.send(b"\r");
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
         let config: Value =
             serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
-        assert_eq!(config["goal"], "Build a useful editor. Draft 1.");
+        assert_eq!(config["goal"], "Build a useful editor. Draft 2.");
+        for (key, value) in preferences.as_object().unwrap() {
+            assert_eq!(&config[key], value, "Setup lost preference {key}");
+        }
+        assert_eq!(config["checks"][0]["timeout_seconds"], 300);
+        assert!(!draft_path.exists());
+        assert_eq!(fs::read(&settings).unwrap(), original_defaults);
+        assert!(!root.path().join(".chuggin/state.json").exists());
+        assert!(!root.path().join(".chuggin/global/chuggin/runtime").exists());
+        let calls = server.requests.lock().unwrap();
+        assert_eq!(calls.len(), 2, "Accepting a goal must not start the loop");
+        assert_eq!(calls[0]["model"], "project-model");
+        assert_eq!(calls[0]["options"]["num_ctx"], 1_000_000);
+        assert_eq!(calls[0]["options"]["num_predict"], 8192);
+        assert!(
+            calls[1]["messages"]
+                .to_string()
+                .contains("Include reliable document persistence.")
+        );
     }
 }
 

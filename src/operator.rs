@@ -605,11 +605,9 @@ impl Controller {
                 let proposed: runner::Config = serde_json::from_value(v.clone())?;
                 proposed.active_hours.at(chrono::Utc::now())?;
                 proposed.helpers.validate()?;
+                runner::validate_token_limits(proposed.context_tokens, proposed.output_tokens)?;
                 ensure!(
-                    !proposed.model.trim().is_empty()
-                        && proposed.context_tokens >= 1024
-                        && proposed.output_tokens > 0
-                        && proposed.command_review_seconds > 0,
+                    !proposed.model.trim().is_empty() && proposed.command_review_seconds > 0,
                     "Invalid model or working settings"
                 );
                 crate::setup::save(&self.path, &v)?;

@@ -54,6 +54,128 @@ pub fn settings() -> Result<Settings> {
         Ok(Settings::default())
     }
 }
+const DRAFT_SETTING_FIELDS: &[&str] = &[
+    "model",
+    "ollama_url",
+    "context_tokens",
+    "output_tokens",
+    "request_timeout_seconds",
+    "run_duration_seconds",
+    "allow_goal_completion",
+    "command_review_seconds",
+    "chat_model",
+    "helpers",
+    "active_hours",
+];
+
+fn draft_settings_path(root: &Path) -> PathBuf {
+    root.join(".chuggin/project-draft-settings.json")
+}
+
+fn draft_settings(root: &Path) -> Result<Value> {
+    let path = draft_settings_path(root);
+    let draft = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
+            format!("Could not read project settings draft: {}", path.display())
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    let fields = draft
+        .as_object()
+        .context("Project settings draft must be an object")?;
+    for field in fields.keys() {
+        anyhow::ensure!(
+            DRAFT_SETTING_FIELDS.contains(&field.as_str()),
+            "Unknown project settings draft field: {field}"
+        );
+    }
+    Ok(draft)
+}
+
+fn draft_config_with(root: &Path, defaults: &Settings, draft: &Value) -> Result<runner::Config> {
+    let root = fs::canonicalize(root).context("Project folder is unavailable")?;
+    let mut merged = serde_json::to_value(defaults)?;
+    merged["repo"] = json!(root);
+    merged["goal"] = json!("");
+    merged["checks"] = json!([]);
+    merged["state_dir"] = json!(root.join(".chuggin"));
+    merged["active_hours"] = json!({"mode":"shared"});
+    let fields = draft
+        .as_object()
+        .context("Project settings draft must be an object")?;
+    for (key, value) in fields {
+        anyhow::ensure!(
+            DRAFT_SETTING_FIELDS.contains(&key.as_str()),
+            "Unknown project settings draft field: {key}"
+        );
+        merged[key] = value.clone();
+    }
+    let config: runner::Config = serde_json::from_value(merged)
+        .context("A project settings draft value has the wrong type")?;
+    runner::validate_token_limits(config.context_tokens, config.output_tokens)?;
+    anyhow::ensure!(
+        (1..=100).contains(&config.implementation_calls),
+        "implementation_calls must be 1..100"
+    );
+    anyhow::ensure!(config.retry_seconds > 0, "retry_seconds must be positive");
+    anyhow::ensure!(
+        config.request_timeout_seconds <= 31_536_000 && config.run_duration_seconds <= 31_536_000,
+        "Choose 0 (unlimited) or a duration no longer than one year"
+    );
+    anyhow::ensure!(
+        (1..=86400).contains(&config.command_review_seconds),
+        "Command review interval must be 1–86400 seconds"
+    );
+    for (label, name) in [("Model", &config.model), ("Chat model", &config.chat_model)] {
+        anyhow::ensure!(
+            !name.chars().any(char::is_whitespace),
+            "{label} must be an exact model name without spaces"
+        );
+    }
+    let url = reqwest::Url::parse(&config.ollama_url).context("Enter a valid Ollama server URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+        "Ollama server must be an HTTP or HTTPS URL"
+    );
+    config.helpers.validate()?;
+    if let crate::schedule::Schedule::Custom { window } = &config.active_hours {
+        window.validate()?;
+    }
+    Ok(config)
+}
+
+/// Preview project options before its goal and checks have been accepted.
+/// This deliberately does not create a runnable configuration or controller.
+pub fn draft_config(root: &Path) -> Result<runner::Config> {
+    draft_config_with(root, &settings()?, &draft_settings(root)?)
+}
+
+fn save_draft_patch_with(root: &Path, patch: Value, defaults: &Settings) -> Result<()> {
+    anyhow::ensure!(
+        !root.join("chuggin.json").exists(),
+        "This project is already set up; change its project settings instead"
+    );
+    let fields = patch
+        .as_object()
+        .context("Project settings patch must be an object")?;
+    let mut draft = draft_settings(root)?;
+    for (key, value) in fields {
+        anyhow::ensure!(
+            DRAFT_SETTING_FIELDS.contains(&key.as_str()),
+            "Unknown project setting: {key}"
+        );
+        draft[key] = value.clone();
+    }
+    draft_config_with(root, defaults, &draft)?;
+    save(&draft_settings_path(root), &draft)
+}
+
+/// Persist only explicitly chosen options; remaining options follow global defaults.
+pub fn save_draft_patch(root: &Path, patch: Value) -> Result<()> {
+    save_draft_patch_with(root, patch, &settings()?)
+}
+
 pub fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(p) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(p)?;
@@ -106,6 +228,69 @@ fn number(label: &str, default: u32, min: u32, max: u32) -> Result<u32> {
         crate::ui::notice(format!("Enter a number between {min} and {max}."));
     }
 }
+fn token_count(value: u32) -> String {
+    let digits = value.to_string();
+    digits
+        .chars()
+        .enumerate()
+        .fold(String::new(), |mut text, (index, ch)| {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                text.push(',');
+            }
+            text.push(ch);
+            text
+        })
+}
+fn token_selector(
+    label: &str,
+    current: u32,
+    min: u32,
+    max: u32,
+    context: bool,
+) -> Result<Option<u32>> {
+    if !io::stdin().is_terminal() {
+        return number(label, current, min, max).map(Some);
+    }
+    let presets: &[u32] = if context {
+        &[
+            8192, 16384, 32768, 65536, 128000, 262144, 524288, 1_000_000, 1_048_576,
+        ]
+    } else {
+        &[
+            256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 128000,
+        ]
+    };
+    let values: Vec<u32> = presets
+        .iter()
+        .copied()
+        .filter(|v| (min..=max).contains(v))
+        .collect();
+    let mut rows: Vec<String> = values
+        .iter()
+        .map(|v| {
+            format!(
+                "{} tokens{}",
+                token_count(*v),
+                if *v == current { " · current" } else { "" }
+            )
+        })
+        .collect();
+    rows.push(format!(
+        "Custom… · current: {} tokens",
+        token_count(current)
+    ));
+    let selected = values
+        .iter()
+        .position(|v| *v == current)
+        .unwrap_or(values.len());
+    let Some(index) = crate::menu::select(label, &rows, selected)? else {
+        return Ok(None);
+    };
+    if let Some(value) = values.get(index) {
+        return Ok(Some(*value));
+    }
+    number(&format!("{label} · custom token count"), current, min, max).map(Some)
+}
 pub fn configure(show: bool) -> Result<()> {
     let path = settings_path()?;
     let mut s = settings()?;
@@ -117,8 +302,9 @@ pub fn configure(show: bool) -> Result<()> {
         ));
         return Ok(());
     }
+    crate::ui::clear_notes();
     crate::ui::notice(
-        "Chuggin · Shared settings\nThese defaults apply to every project unless overridden."
+        "Chuggin · Global settings\nThese defaults apply to every project unless overridden."
             .to_string(),
     );
     if io::stdin().is_terminal() {
@@ -144,13 +330,22 @@ pub fn configure(show: bool) -> Result<()> {
             .unwrap_or(chosen);
         anyhow::ensure!(names.contains(&s.model), "Choose an installed Ollama model");
     }
-    s.context_tokens = number("Context window (tokens)", s.context_tokens, 4096, 262144)?;
-    s.output_tokens = number(
-        "Maximum response (tokens)",
+    s.context_tokens = token_selector(
+        "Default context window",
+        s.context_tokens,
+        runner::MIN_CONTEXT_TOKENS,
+        u32::MAX,
+        true,
+    )?
+    .context("Setup cancelled")?;
+    s.output_tokens = token_selector(
+        "Default response limit",
         s.output_tokens.min(s.context_tokens / 4),
         256,
         s.context_tokens - 2048,
-    )?;
+        false,
+    )?
+    .context("Setup cancelled")?;
     s.implementation_calls = number(
         "Model responses per implementation task",
         s.implementation_calls,
@@ -198,8 +393,14 @@ pub fn ensure_git_identity(root: &Path) -> Result<()> {
             io::stdin().is_terminal() || crate::ui::active(),
             "Git identity is missing {key}. Open chuggin interactively to set it up, or set git config --global {key} before continuing. Use an email associated with GitHub if you want GitHub attribution."
         );
+        crate::ui::clear_notes();
+        let guidance = if key == "user.name" {
+            "Enter the author name to use on this project's Git commits."
+        } else {
+            "Enter the email to use on this project's Git commits. A GitHub verified or noreply email enables GitHub attribution."
+        };
         crate::ui::notice(format!(
-            "Git needs {key} before Chuggin can continue. Enter your commit identity (a GitHub verified or noreply email enables GitHub attribution). This setting will be saved for this project."
+            "Git needs {key} before Chuggin can continue. {guidance} This setting will be saved for this project."
         ));
         let value = ask(label, "")?;
         // A new project may not have a repository yet. Initialize it only after
@@ -209,6 +410,7 @@ pub fn ensure_git_identity(root: &Path) -> Result<()> {
         }
         project::git(root, &["config", "--local", key, &value])?;
     }
+    crate::ui::clear_notes();
     Ok(())
 }
 
@@ -220,16 +422,18 @@ pub fn wizard() -> Result<PathBuf> {
         !config.exists(),
         "Project already configured; run chuggin to resume."
     );
-    crate::ui::notice(format!(
-        "\nChuggin · Get started\nProject: {}\n",
-        root.display()
-    ));
-    if !settings_path()?.exists() || settings()?.model.trim().is_empty() {
-        configure(false)?;
+    if draft_config(&root)?.model.trim().is_empty() {
+        if io::stdin().is_terminal() {
+            choose_project_model(None)?;
+        } else {
+            configure(false)?;
+        }
     }
-    let s = settings()?;
+    let s = draft_config(&root)?;
+    crate::ui::clear_notes();
     crate::ui::notice(format!(
-        "Using {} on {} (change from Settings on the home menu).",
+        "Give a short description of this project: what you want to accomplish, any important requirements, and what a successful result would look like. Chuggin will draft a goal for you to review before work starts.\n\nProject: {}\nGoal drafting model: {} on {} (change from Project model on the home menu).",
+        root.display(),
         s.model,
         crate::cloud::label(&s.ollama_url, &s.model)
     ));
@@ -247,8 +451,9 @@ pub fn wizard() -> Result<PathBuf> {
     save(&draft_path, &draft)?;
     loop {
         if draft.goal.is_empty() || !draft.feedback.is_empty() {
+            crate::ui::clear_notes();
             crate::ui::notice("Drafting your project goal…".to_string());
-            let current = settings()?;
+            let current = draft_config(&root)?;
             let model = Model::new(
                 &current.ollama_url,
                 &current.model,
@@ -278,8 +483,9 @@ pub fn wizard() -> Result<PathBuf> {
                 }
             }
         }
+        crate::ui::clear_notes();
         crate::ui::notice(format!(
-            "\n── Proposed project goal ──\n{}\n──────────────────────────",
+            "Proposed project goal\n\n{}\n\nAccept this goal, request changes, or return to the menu with the draft saved. Work starts when you later select Resume project.",
             draft.goal
         ));
         let action = if io::stdin().is_terminal() {
@@ -293,7 +499,14 @@ pub fn wizard() -> Result<PathBuf> {
                 0,
             )? {
                 Some(0) => "accept".into(),
-                Some(1) => ask("What should change?", "")?,
+                Some(1) => {
+                    crate::ui::clear_notes();
+                    crate::ui::notice(format!(
+                        "Describe what should change in this goal: add requirements, correct assumptions, or explain what you want to keep.\n\nCurrent goal\n{}",
+                        draft.goal
+                    ));
+                    ask("What should change?", "")?
+                }
                 _ => anyhow::bail!("Goal draft saved. Continue setup when you are ready."),
             }
         } else {
@@ -305,7 +518,8 @@ pub fn wizard() -> Result<PathBuf> {
         draft.feedback = action;
         save(&draft_path, &draft)?;
     }
-    crate::ui::notice("\nChoose a check Chuggin can use to guide refinement. All work is saved even when checks fail.\nChoose validation appropriate to this project: tests, a document linter, a data checker, or your own validation script.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
+    crate::ui::clear_notes();
+    crate::ui::notice("Choose a check Chuggin can use to guide refinement. All work is saved even when checks fail.\nChoose validation appropriate to this project: tests, a document linter, a data checker, or your own validation script.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
     let check = loop {
         let default_check = if root.join("Cargo.toml").is_file() {
             "cargo test"
@@ -318,7 +532,14 @@ pub fn wizard() -> Result<PathBuf> {
             _ => crate::ui::notice("Enter a valid command with balanced quotes.".to_string()),
         }
     };
-    let timeout = number("First command review (seconds)", 120, 1, 86400)?;
+    crate::ui::clear_notes();
+    crate::ui::notice("Choose when Chuggin first checks a running command, in seconds. This sets the first review point for commands and validation checks; the watchdog can inspect work that takes longer.".into());
+    let timeout = number(
+        "First command review (seconds)",
+        draft_config(&root)?.command_review_seconds as u32,
+        1,
+        86400,
+    )?;
     // Do not accidentally initialize or commit an ancestor repository.
     let top = project::git(&root, &["rev-parse", "--show-toplevel"]).ok();
     if let Some(top) = top {
@@ -363,6 +584,7 @@ pub fn wizard() -> Result<PathBuf> {
             .map(|p| format!(":(literal){p}"))
             .collect();
         if has_files {
+            crate::ui::clear_notes();
             crate::ui::notice("\nThis project has no commits yet. Chuggin can commit all project files as its starting point. Git-ignored files and Chuggin's local state are excluded.\n".to_string());
             for file in files.split('\0').filter(|s| !s.is_empty()).take(40) {
                 crate::ui::notice(format!("  {file}"));
@@ -409,13 +631,21 @@ pub fn wizard() -> Result<PathBuf> {
         project::git(&root, &commit)?;
         crate::ui::notice("Created the first commit.".to_string());
     }
-    save(
-        &config,
-        &json!({"repo":".","goal":draft.goal,"state_dir":".chuggin","helpers":s.helpers,"active_hours":{"mode":"shared"},
-        "command_review_seconds":timeout,"checks":[{"argv":check,"timeout_seconds":timeout}]}),
-    )?;
+    let mut accepted = json!({"repo":".","goal":draft.goal,"state_dir":".chuggin","helpers":draft_config(&root)?.helpers,"active_hours":{"mode":"shared"},
+        "command_review_seconds":timeout,"checks":[{"argv":check,"timeout_seconds":timeout}]});
+    for (key, value) in draft_settings(&root)?.as_object().unwrap() {
+        accepted[key] = value.clone();
+    }
+    // The validation prompt is the final choice for the command review interval.
+    accepted["command_review_seconds"] = json!(timeout);
+    save(&config, &accepted)?;
     // Check merged project/global settings before starting.
     runner::load(&config)?;
+    let preferences = draft_settings_path(&root);
+    if preferences.exists() {
+        fs::remove_file(preferences)?;
+    }
+    crate::ui::clear_notes();
     crate::ui::notice(
         "\nGoal accepted and saved. Chuggin will edit this folder on its current branch, keep recovery saves, and commit completed tasks. Existing staged changes are preserved. Select Resume project to start.".to_string(),
     );
@@ -460,7 +690,7 @@ pub fn choose_model(project: Option<&Path>) -> Result<()> {
     let title = if project.is_some() {
         "Choose model for this project"
     } else {
-        "Choose model (shared default)"
+        "Choose default model · global"
     };
     if let Some(index) = crate::menu::select(title, &names, selected)? {
         s.model = names[index].clone();
@@ -479,9 +709,55 @@ pub fn choose_model(project: Option<&Path>) -> Result<()> {
     }
     Ok(())
 }
+pub fn choose_project_model(project: Option<&Path>) -> Result<()> {
+    if project.is_some() {
+        return choose_model(project);
+    }
+    let root = std::env::current_dir()?;
+    let effective = draft_config(&root)?;
+    let mut connection = settings()?;
+    connection.model = effective.model;
+    connection.ollama_url = effective.ollama_url;
+    let names = select_provider_models(&connection)?;
+    let selected = names
+        .iter()
+        .position(|name| name == &connection.model)
+        .unwrap_or(0);
+    if let Some(index) = crate::menu::select("Choose model for this project", &names, selected)? {
+        save_draft_patch(&root, json!({"model": names[index]}))?;
+        crate::ui::notice(format!("Project model saved: {}", names[index]));
+    }
+    Ok(())
+}
+
+fn editing_config(project: Option<&Path>) -> Result<runner::Config> {
+    match project {
+        Some(path) => runner::load(path),
+        None => draft_config(&std::env::current_dir()?),
+    }
+}
+
+fn save_project_patch(project: Option<&Path>, patch: Value) -> Result<()> {
+    let Some(path) = project else {
+        return save_draft_patch(&std::env::current_dir()?, patch);
+    };
+    let client = crate::engine::Client::connect(path)?;
+    let session = client.open_session(None)?;
+    let current = client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
+    let reply = client.call(
+        &session,
+        "update_settings",
+        json!({"expected_revision":current["result"]["revision"],"settings":patch}),
+        &crate::operator::id(),
+    )?;
+    anyhow::ensure!(reply["status"] == "complete", "{}", reply["error"]);
+    Ok(())
+}
 pub fn settings_menu() -> Result<()> {
     loop {
         let mut s = settings()?;
+        crate::ui::clear_notes();
+        crate::ui::notice("Global connections are shared across projects. These model and working defaults apply where a project has no override; changing them preserves existing project overrides.".into());
         let items = vec![
             format!("Ollama server     {}", s.ollama_url),
             format!(
@@ -492,10 +768,10 @@ pub fn settings_menu() -> Result<()> {
                     &s.model
                 }
             ),
-            format!("Context window    {}", s.context_tokens),
-            format!("Response limit    {}", s.output_tokens),
-            format!("Task responses    {}", s.implementation_calls),
-            format!("Retry delay       {} seconds", s.retry_seconds),
+            format!("Default context window    {}", s.context_tokens),
+            format!("Default response limit    {}", s.output_tokens),
+            format!("Default task responses    {}", s.implementation_calls),
+            format!("Default retry delay       {} seconds", s.retry_seconds),
             format!(
                 "Brave web tools   {}",
                 if s.web_enabled { "Enabled" } else { "Disabled" }
@@ -509,13 +785,15 @@ pub fn settings_menu() -> Result<()> {
                 }
             ),
             "Test Brave connection".into(),
-            "Shared active hours".into(),
+            "Default active hours".into(),
             "Groq connection and limits".into(),
             "Investigation helpers · defaults for new projects".into(),
             "OpenRouter · free cloud models and connection".into(),
             "Back".into(),
         ];
-        let Some(index) = crate::menu::select("Shared settings", &items, 0)? else {
+        let Some(index) =
+            crate::menu::select("Global settings · connections and defaults", &items, 0)?
+        else {
             return Ok(());
         };
         match index {
@@ -534,17 +812,31 @@ pub fn settings_menu() -> Result<()> {
                 continue;
             }
             2 => {
-                s.context_tokens =
-                    number("Context window (tokens)", s.context_tokens, 4096, 262144)?;
+                let Some(tokens) = token_selector(
+                    "Default context window · global",
+                    s.context_tokens,
+                    runner::MIN_CONTEXT_TOKENS,
+                    u32::MAX,
+                    true,
+                )?
+                else {
+                    continue;
+                };
+                s.context_tokens = tokens;
                 s.output_tokens = s.output_tokens.min(s.context_tokens - 2048);
             }
             3 => {
-                s.output_tokens = number(
-                    "Response limit (tokens)",
+                let Some(tokens) = token_selector(
+                    "Default response limit · global",
                     s.output_tokens,
                     256,
                     s.context_tokens - 2048,
+                    false,
                 )?
+                else {
+                    continue;
+                };
+                s.output_tokens = tokens;
             }
             4 => {
                 s.implementation_calls =
@@ -626,8 +918,13 @@ pub fn settings_menu() -> Result<()> {
 }
 
 pub fn run_duration(path: &Path) -> Result<()> {
-    let config: Value = serde_json::from_slice(&fs::read(path)?)?;
-    let seconds = config["run_duration_seconds"].as_u64().unwrap_or(0);
+    project_run_duration(Some(path))
+}
+pub fn draft_run_duration() -> Result<()> {
+    project_run_duration(None)
+}
+fn project_run_duration(project: Option<&Path>) -> Result<()> {
+    let seconds = editing_config(project)?.run_duration_seconds;
     crate::ui::notice("Set the duration of each run in hours (0 means unlimited). The current cycle finishes before stopping. Resuming starts a new timer. This setting applies only to this project.".into());
     loop {
         let text = ask(
@@ -639,7 +936,7 @@ pub fn run_duration(path: &Path) -> Result<()> {
             && (0.0..=8760.0).contains(&hours)
             && (hours == 0.0 || hours * 3600.0 >= 1.0)
         {
-            save_live_setting(path, 2, &hours.to_string())?;
+            save_project_setting(project, 2, &hours.to_string())?;
             return Ok(());
         }
         crate::ui::notice(
@@ -649,11 +946,29 @@ pub fn run_duration(path: &Path) -> Result<()> {
 }
 
 pub fn save_live_setting(path: &Path, field: usize, input: &str) -> Result<()> {
+    save_project_setting(Some(path), field, input)
+}
+fn save_project_setting(project: Option<&Path>, field: usize, input: &str) -> Result<()> {
+    let Some(path) = project else {
+        let config = editing_config(None)?;
+        return save_project_patch(None, setting_patch(&config, field, input)?);
+    };
     let client = crate::engine::Client::connect(path)?;
     let session = client.open_session(None)?;
     let current = client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
-    let original = current["result"]["settings"].clone();
-    let mut config = original.clone();
+    let config: runner::Config = serde_json::from_value(current["result"]["settings"].clone())?;
+    let patch = setting_patch(&config, field, input)?;
+    let reply = client.call(
+        &session,
+        "update_settings",
+        json!({"expected_revision":current["result"]["revision"],"settings":patch}),
+        &crate::operator::id(),
+    )?;
+    anyhow::ensure!(reply["status"] == "complete", "{}", reply["error"]);
+    Ok(())
+}
+fn setting_patch(current: &runner::Config, field: usize, input: &str) -> Result<Value> {
+    let mut config = json!({});
     match field {
         0 => {
             let name = input.trim();
@@ -693,28 +1008,31 @@ pub fn save_live_setting(path: &Path, field: usize, input: &str) -> Result<()> {
                 _ => anyhow::bail!("Enter on or off"),
             });
         }
+        5 => {
+            let context: u32 = input.trim().parse().context("Enter a whole token count")?;
+            anyhow::ensure!(
+                context >= runner::MIN_CONTEXT_TOKENS,
+                "Context must be at least {} tokens",
+                runner::MIN_CONTEXT_TOKENS
+            );
+            config["context_tokens"] = json!(context);
+            // Keep a valid response allowance when reducing the context window.
+            config["output_tokens"] = json!(current.output_tokens.min(context - 2048));
+        }
+        6 => {
+            let output: u32 = input.trim().parse().context("Enter a whole token count")?;
+            runner::validate_token_limits(current.context_tokens, output)?;
+            config["output_tokens"] = json!(output);
+        }
         _ => anyhow::bail!("Unknown project setting"),
     }
-    let patch: serde_json::Map<String, Value> = config
-        .as_object()
-        .unwrap()
-        .iter()
-        .filter(|(k, v)| original[*k] != **v)
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let reply = client.call(
-        &session,
-        "update_settings",
-        json!({"expected_revision":current["result"]["revision"],"settings":patch}),
-        &crate::operator::id(),
-    )?;
-    anyhow::ensure!(reply["status"] == "complete", "{}", reply["error"]);
-    Ok(())
+    Ok(config)
 }
 
 fn draft_recovery(root: &Path, detail: &str) -> Result<()> {
     let log = root.join(".chuggin/goal-error.txt");
     fs::write(&log, detail)?;
+    crate::ui::clear_notes();
     crate::ui::notice(format!(
         "\nCouldn't finish drafting your goal. Your pitch and any earlier draft are saved.\nDetails: {}",
         log.display()
@@ -730,7 +1048,7 @@ fn draft_recovery(root: &Path, detail: &str) -> Result<()> {
             0,
         )? {
             Some(0) => {}
-            Some(1) => settings_menu()?,
+            Some(1) => project_settings_menu(None)?,
             _ => anyhow::bail!("Draft saved. Return to Setup to continue."),
         }
     } else {
@@ -740,9 +1058,15 @@ fn draft_recovery(root: &Path, detail: &str) -> Result<()> {
 }
 
 pub fn active_hours_menu(project: Option<&Path>) -> Result<()> {
+    active_hours_scope(project, false)
+}
+fn project_active_hours_menu(project: Option<&Path>) -> Result<()> {
+    active_hours_scope(project, true)
+}
+fn active_hours_scope(project: Option<&Path>, project_scope: bool) -> Result<()> {
     use crate::schedule::{Closing, Schedule, Window};
-    let current = if let Some(p) = project {
-        crate::runner::load(p)?.active_hours
+    let current = if project.is_some() || project_scope {
+        editing_config(project)?.active_hours
     } else {
         settings()?.active_hours
     };
@@ -771,7 +1095,7 @@ pub fn active_hours_menu(project: Option<&Path>) -> Result<()> {
         Schedule::Shared => 2,
     };
     let mut choices = vec!["Always allowed".into(), "Set active hours…".into()];
-    if project.is_some() {
+    if project.is_some() || project_scope {
         choices.push("Use shared active hours".into());
     }
     let Some(choice) = crate::ui::select(
@@ -828,12 +1152,8 @@ pub fn active_hours_menu(project: Option<&Path>) -> Result<()> {
             Schedule::Custom { window: w }
         }
     };
-    if let Some(path) = project {
-        let client = crate::engine::Client::connect(path)?;
-        let session = client.open_session(None)?;
-        let current = client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
-        let result=client.call(&session,"update_settings",json!({"expected_revision":current["result"]["revision"],"settings":{"active_hours":schedule}}),&crate::operator::id())?;
-        anyhow::ensure!(result["status"] == "complete", "{}", result["error"]);
+    if project.is_some() || project_scope {
+        save_project_patch(project, json!({"active_hours":schedule}))?;
     } else {
         let mut s = settings()?;
         s.active_hours = schedule;
@@ -850,20 +1170,158 @@ pub fn external_control_info(path: &Path) -> Result<()> {
         ),
     )
 }
-pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
-    if path.is_none() {
-        return settings_menu();
+#[derive(Clone, Copy)]
+pub enum ProjectSetting {
+    Model,
+    Context,
+    Output,
+    Timeout,
+    Duration,
+    ActiveHours,
+    Completion,
+    More,
+    Global,
+}
+pub const PROJECT_SETTINGS: [ProjectSetting; 9] = [
+    ProjectSetting::Model,
+    ProjectSetting::Context,
+    ProjectSetting::Output,
+    ProjectSetting::Timeout,
+    ProjectSetting::Duration,
+    ProjectSetting::ActiveHours,
+    ProjectSetting::Completion,
+    ProjectSetting::More,
+    ProjectSetting::Global,
+];
+impl ProjectSetting {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Model => "Project model",
+            Self::Context => "Context window (tokens)",
+            Self::Output => "Response limit (tokens)",
+            Self::Timeout => "Request timeout (minutes; 0 unlimited)",
+            Self::Duration => "Run duration (hours; 0 unlimited)",
+            Self::ActiveHours => "Active hours",
+            Self::Completion => "Allow goal completion (on/off)",
+            Self::More => "More project settings…",
+            Self::Global => "Global settings…",
+        }
     }
+    pub fn value(self, c: &runner::Config) -> String {
+        match self {
+            Self::Model => c.model.clone(),
+            Self::Context => token_count(c.context_tokens),
+            Self::Output => token_count(c.output_tokens),
+            Self::Timeout => (c.request_timeout_seconds as f64 / 60.0).to_string(),
+            Self::Duration => (c.run_duration_seconds as f64 / 3600.0).to_string(),
+            Self::ActiveHours => c
+                .active_hours
+                .at(chrono::Utc::now())
+                .map(|s| s.description)
+                .unwrap_or_else(|e| e.to_string()),
+            Self::Completion => if c.allow_goal_completion { "on" } else { "off" }.into(),
+            Self::More => "Chat model, helpers, tool requests, command review, MCP".into(),
+            Self::Global => "Shared connections and defaults for projects".into(),
+        }
+    }
+    pub fn field(self) -> Option<usize> {
+        match self {
+            Self::Model => Some(0),
+            Self::Timeout => Some(1),
+            Self::Duration => Some(2),
+            Self::Completion => Some(4),
+            Self::Context => Some(5),
+            Self::Output => Some(6),
+            _ => None,
+        }
+    }
+}
+pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
     loop {
+        let c = editing_config(path)?;
+        crate::ui::clear_notes();
+        crate::ui::notice(format!(
+            "These settings apply only to {} and are saved automatically. Global connections and defaults have their own submenu.",
+            c.repo.display()
+        ));
+        let mut rows: Vec<String> = PROJECT_SETTINGS
+            .iter()
+            .map(|s| format!("{}: {}", s.label(), s.value(&c)))
+            .collect();
+        rows.push("Back".into());
+        let Some(index) = crate::menu::select("Project settings", &rows, 0)? else {
+            return Ok(());
+        };
+        let Some(setting) = PROJECT_SETTINGS.get(index).copied() else {
+            return Ok(());
+        };
+        match setting {
+            ProjectSetting::Model => choose_project_model(path)?,
+            ProjectSetting::ActiveHours => project_active_hours_menu(path)?,
+            ProjectSetting::More => more_project_settings(path)?,
+            ProjectSetting::Global => settings_menu()?,
+            ProjectSetting::Context | ProjectSetting::Output => edit_project_tokens(path, setting)?,
+            _ => {
+                let value = ask(setting.label(), &setting.value(&c))?;
+                save_project_setting(path, setting.field().unwrap(), &value)?;
+            }
+        }
+    }
+}
+pub fn edit_project_tokens(path: Option<&Path>, setting: ProjectSetting) -> Result<()> {
+    let c = editing_config(path)?;
+    let (label, current, min, max, context) = match setting {
+        ProjectSetting::Context => (
+            "Context window · this project",
+            c.context_tokens,
+            runner::MIN_CONTEXT_TOKENS,
+            u32::MAX,
+            true,
+        ),
+        ProjectSetting::Output => (
+            "Response limit · this project",
+            c.output_tokens,
+            1,
+            c.context_tokens - 1,
+            false,
+        ),
+        _ => anyhow::bail!("Not a token setting"),
+    };
+    if let Some(tokens) = token_selector(label, current, min, max, context)? {
+        save_project_setting(path, setting.field().unwrap(), &tokens.to_string())?;
+    }
+    Ok(())
+}
+pub fn more_project_settings(path: Option<&Path>) -> Result<()> {
+    loop {
+        let c = editing_config(path)?;
+        crate::ui::clear_notes();
+        crate::ui::notice("These options apply only to this project. You can save them before setting up its goal.".into());
         let Some(choice) = crate::ui::select(
-            "Settings",
+            "More project settings · only this project",
             &[
-                "This project · Active hours".into(),
-                "This project · Chat model".into(),
-                "This project · Investigation helpers".into(),
-                "This project · External AI access (MCP)".into(),
-                "This project · Tool requests".into(),
-                "Shared settings".into(),
+                format!(
+                    "Command first review · {} seconds",
+                    c.command_review_seconds
+                ),
+                format!(
+                    "Chat model · {}",
+                    if c.chat_model.is_empty() {
+                        "Use project model"
+                    } else {
+                        &c.chat_model
+                    }
+                ),
+                format!(
+                    "Investigation helpers · {}",
+                    if c.helpers.enabled {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    }
+                ),
+                "External AI access (MCP)".into(),
+                "Tool requests".into(),
                 "Back".into(),
             ],
             0,
@@ -873,34 +1331,49 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
         };
         match choice {
             0 => {
-                if let Some(p) = path {
-                    active_hours_menu(Some(p))?;
-                }
+                let value = ask(
+                    "Command first review (seconds)",
+                    &c.command_review_seconds.to_string(),
+                )?;
+                save_project_setting(path, 3, &value)?;
             }
             1 => {
-                if let Some(p) = path {
-                    let model = ask(
-                        "Chat model (leave project model by entering 'default')",
-                        "default",
-                    )?;
-                    let client = crate::engine::Client::connect(p)?;
-                    let session = client.open_session(None)?;
-                    let current =
-                        client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
-                    let result=client.call(&session,"update_settings",json!({"expected_revision":current["result"]["revision"],"settings":{"chat_model":if model=="default"{""}else{&model}}}),&crate::operator::id())?;
-                    anyhow::ensure!(result["status"] == "complete", "{}", result["error"]);
-                }
+                let model = ask(
+                    "Chat model (enter 'default' to use project model)",
+                    if c.chat_model.is_empty() {
+                        "default"
+                    } else {
+                        &c.chat_model
+                    },
+                )?;
+                save_project_patch(
+                    path,
+                    json!({"chat_model":if model=="default"{""}else{&model}}),
+                )?;
             }
             2 => {
-                helpers_menu(path)?;
+                helpers_scope(path, true)?;
             }
             3 => {
-                if let Some(p) = path {
-                    external_control_info(p)?;
+                if let Some(path) = path {
+                    external_control_info(path)?;
+                } else {
+                    crate::ui::show(
+                        "External AI access (MCP)",
+                        "Set up this project's goal first. You can then connect another AI application to its tools and loop controls.",
+                    )?;
                 }
             }
-            4 => crate::tool_requests::menu(path.context("No project selected")?)?,
-            5 => settings_menu()?,
+            4 => {
+                if let Some(path) = path {
+                    crate::tool_requests::menu(path)?;
+                } else {
+                    crate::ui::show(
+                        "Tool requests",
+                        "No missing capabilities have been requested. Set up this project and start its loop to receive requests from the model.",
+                    )?;
+                }
+            }
             _ => return Ok(()),
         }
     }
@@ -930,13 +1403,16 @@ fn helper_rows(helpers: &crate::agents::Settings) -> Vec<String> {
 }
 
 pub fn helpers_menu(project: Option<&Path>) -> Result<()> {
+    helpers_scope(project, false)
+}
+fn helpers_scope(project: Option<&Path>, project_scope: bool) -> Result<()> {
     loop {
-        let mut helpers = if let Some(path) = project {
-            runner::load(path)?.helpers
+        let mut helpers = if project.is_some() || project_scope {
+            editing_config(project)?.helpers
         } else {
             settings()?.helpers
         };
-        let title = if project.is_some() {
+        let title = if project.is_some() || project_scope {
             "Investigation helpers · this project"
         } else {
             "Investigation helpers · defaults for new projects"
@@ -969,8 +1445,8 @@ pub fn helpers_menu(project: Option<&Path>) -> Result<()> {
                     helpers.model.clear();
                 } else if route == 1 {
                     let mut connection = settings()?;
-                    if let Some(path) = project {
-                        let config = runner::load(path)?;
+                    if project.is_some() || project_scope {
+                        let config = editing_config(project)?;
                         connection.model = config.model;
                         connection.ollama_url = config.ollama_url;
                     }
@@ -1010,6 +1486,8 @@ pub fn helpers_menu(project: Option<&Path>) -> Result<()> {
                 client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
             let reply = client.update_helpers(&current["result"]["revision"], &helpers)?;
             anyhow::ensure!(reply["status"] == "complete", "{}", reply["error"]);
+        } else if project_scope {
+            save_project_patch(None, json!({"helpers":helpers}))?;
         } else {
             let mut defaults = settings()?;
             defaults.helpers = helpers;
@@ -1019,6 +1497,8 @@ pub fn helpers_menu(project: Option<&Path>) -> Result<()> {
 }
 
 fn select_provider_models(s: &Settings) -> Result<Vec<String>> {
+    crate::ui::clear_notes();
+    crate::ui::notice("Choose an inference provider, then a model from its catalog. Loading the catalog does not generate a response. Shared connections can be configured in Global settings.".into());
     let selected = match crate::cloud::provider(&s.model) {
         Some(crate::cloud::Provider::Zen) => 2,
         Some(crate::cloud::Provider::OpenRouter) => 3,
@@ -1066,7 +1546,7 @@ fn select_provider_models(s: &Settings) -> Result<Vec<String>> {
             }
             anyhow::ensure!(
                 crate::cloud::key("openrouter/connection-check")?.is_some(),
-                "Add an OpenRouter API key in Shared settings before selecting its models"
+                "Add an OpenRouter API key in Global settings before selecting its models"
             );
             crate::ui::clear_notes();
             crate::ui::notice("Only free OpenRouter models are offered here. Free-tier rate and capacity limits can require waiting; Chuggin retries without switching to a paid model. Your project context and response settings remain unchanged.".into());
@@ -1195,5 +1675,88 @@ pub fn groq_settings() -> Result<()> {
             Some(8) => crate::ui::notice("Free-tier defaults leave headroom: 24 requests/minute, 900/day, 7,200 tokens/minute, 180,000/day. All Chuggin projects and chats on this machine share this budget. Usage survives restarts and model changes. Each request reserves estimated input plus maximum output; final usage replaces that reservation. Interrupted requests keep their reservation. Daily limits use a conservative rolling 24-hour window. Groq headers can impose stricter waits. Other apps using the account are only visible through those headers. Manual retry rechecks budgets and never bypasses them. Raise limits only to match your Groq account. Requests use a smaller working context when necessary; full request logs remain available. Groq responses default to a 1,024-token cap, adjustable here.".into()),
             _ => return Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod project_draft_tests {
+    use super::*;
+
+    #[test]
+    fn draft_preferences_follow_defaults_without_becoming_a_configured_project() {
+        let root = tempfile::tempdir().unwrap();
+        let mut defaults = Settings {
+            model: "shared-model".into(),
+            context_tokens: 65536,
+            output_tokens: 8192,
+            ..Settings::default()
+        };
+        let preview = draft_config_with(root.path(), &defaults, &json!({})).unwrap();
+        assert_eq!(preview.model, "shared-model");
+        assert!(preview.goal.is_empty());
+        assert!(preview.checks.is_empty());
+        assert!(!root.path().join(".chuggin").exists());
+
+        save_draft_patch_with(
+            root.path(),
+            json!({"model":"project-model","context_tokens":1_000_000,"run_duration_seconds":36000,
+                "allow_goal_completion":true,"helpers":{"enabled":true,"max_calls":24}}),
+            &defaults,
+        )
+        .unwrap();
+        let saved = draft_settings(root.path()).unwrap();
+        assert_eq!(saved["model"], "project-model");
+        assert!(saved.get("output_tokens").is_none());
+        defaults.model = "new-shared-model".into();
+        defaults.output_tokens = 16384;
+        let preview = draft_config_with(root.path(), &defaults, &saved).unwrap();
+        assert_eq!(preview.model, "project-model");
+        assert_eq!(preview.context_tokens, 1_000_000);
+        assert_eq!(preview.output_tokens, 16384);
+        assert_eq!(preview.run_duration_seconds, 36000);
+        assert!(preview.allow_goal_completion);
+        assert!(preview.helpers.enabled);
+        assert_eq!(preview.helpers.max_calls, 24);
+        assert!(preview.goal.is_empty());
+        assert!(preview.checks.is_empty());
+        for path in [
+            "chuggin.json",
+            ".git",
+            ".chuggin/state.json",
+            ".chuggin/operator",
+        ] {
+            assert!(!root.path().join(path).exists(), "Unexpected {path}");
+        }
+    }
+
+    #[test]
+    fn invalid_draft_patches_preserve_saved_options() {
+        let root = tempfile::tempdir().unwrap();
+        let defaults = Settings::default();
+        save_draft_patch_with(root.path(), json!({"model":"project-model"}), &defaults).unwrap();
+        let path = draft_settings_path(root.path());
+        let before = fs::read(&path).unwrap();
+        for patch in [
+            json!({"goal":"Must not turn preferences into an accepted goal"}),
+            json!({"model":"invalid model name"}),
+            json!({"ollama_url":"not a URL"}),
+            json!({"context_tokens":2048}),
+            json!({"output_tokens":32768}),
+            json!({"output_tokens":"8192"}),
+            json!({"request_timeout_seconds":31_536_001}),
+            json!({"command_review_seconds":0}),
+            json!({"allow_goal_completion":"yes"}),
+            json!({"helpers":{"max_calls":0}}),
+            json!({"active_hours":{"mode":"custom","window":{"start":"01:00","end":"01:00","timezone":"UTC","days":[0]}}}),
+        ] {
+            assert!(save_draft_patch_with(root.path(), patch, &defaults).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+        fs::write(root.path().join("chuggin.json"), "{}").unwrap();
+        assert!(
+            save_draft_patch_with(root.path(), json!({"model":"another-model"}), &defaults)
+                .is_err()
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
     }
 }

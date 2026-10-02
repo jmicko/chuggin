@@ -215,11 +215,7 @@ fn splash(
         "Continue the next focused cycle",
         "The ambition guiding every cycle",
         "Saved checkpoints and check results",
-        if items.first().is_some_and(|item| item == "Resume project") {
-            "Change the model for this project"
-        } else {
-            "Choose a shared model default"
-        },
+        "Change the model for this project",
         "Defaults for projects without overrides",
         "Return to your shell",
     ];
@@ -230,10 +226,13 @@ fn splash(
             ListItem::new(vec![
                 Line::from(item.clone()).bold(),
                 Line::from(match item.as_str() {
+                    "Set up this project" => "Define a goal and start this project",
                     "Run duration" => "Finish the current cycle when time is up",
                     "Chat with this project" => "Discuss the project and control its loop",
                     "Tool requests" => "Review missing capabilities suggested by models",
-                    "Settings" => "Project options and shared connections",
+                    "Settings" => "Common settings for this project",
+                    "More project settings" => "Chat, helpers, tools and command review",
+                    "Global settings" => "Shared connections and defaults",
                     "Quit" => "Return to your shell",
                     _ => descriptions.get(i).copied().unwrap_or(""),
                 })
@@ -1402,53 +1401,16 @@ fn duration(s: u64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 fn setting_value(c: &runner::Config, field: usize) -> String {
-    match field {
-        0 => c.model.clone(),
-        1 => format!("{}", c.request_timeout_seconds as f64 / 60.0),
-        2 => format!("{}", c.run_duration_seconds as f64 / 3600.0),
-        5 => c
-            .active_hours
-            .at(chrono::Utc::now())
-            .map(|s| s.description)
-            .unwrap_or_else(|e| e.to_string()),
-        6 => "Choose model…".into(),
-        9 => "Review saved suggestions…".into(),
-        7 => "Connect another AI app…".into(),
-        8 => format!(
-            "{} · {} · {} responses",
-            if c.helpers.enabled { "on" } else { "off" },
-            if c.helpers.model.is_empty() {
-                "project model"
-            } else {
-                &c.helpers.model
-            },
-            c.helpers.max_calls
-        ),
-        4 => if c.allow_goal_completion { "on" } else { "off" }.into(),
-        _ => c.command_review_seconds.to_string(),
-    }
+    crate::setup::PROJECT_SETTINGS[field].value(c)
 }
 fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from("PROJECT SETTINGS").fg(ACCENT).bold(),
-        Line::from("Only this project; saved automatically."),
+        Line::from("Common settings for this project; saved automatically."),
         Line::from(""),
     ];
-    for (index, label) in [
-        "Model (exact installed name)",
-        "Request timeout (minutes; 0 unlimited)",
-        "Run duration (hours; 0 unlimited)",
-        "Command first review (seconds)",
-        "Allow goal completion (on/off)",
-        "Active hours",
-        "Chat model",
-        "External AI access (MCP)",
-        "Investigation helpers",
-        "Tool requests",
-    ]
-    .iter()
-    .enumerate()
-    {
+    for (index, setting) in crate::setup::PROJECT_SETTINGS.iter().enumerate() {
+        let label = setting.label();
         let value = if index == d.settings_selected {
             d.settings_edit
                 .clone()
@@ -1480,7 +1442,7 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
     lines.extend([
         Line::from(""),
         Line::from("↑↓ select · Enter edit/save · Ctrl+U clear · Esc cancel"),
-        Line::from("Model and timeout apply to the NEXT request."),
+        Line::from("Model, token limits and timeout apply to the NEXT request."),
         Line::from(format!("Current/last request model: {}", d.active_model)),
         Line::from("Timer changes apply now, measured from this run's start."),
         Line::from("An expired timer finishes the cycle; it never cancels a call."),
@@ -2292,7 +2254,9 @@ fn dashboard_session(
                                     let value = text.clone();
                                     match crate::setup::save_live_setting(
                                         path,
-                                        d.settings_selected,
+                                        crate::setup::PROJECT_SETTINGS[d.settings_selected]
+                                            .field()
+                                            .unwrap(),
                                         &value,
                                     ) {
                                         Ok(()) => {
@@ -2322,23 +2286,34 @@ fn dashboard_session(
                         }
                         match k.code {
                             KeyCode::Up => {
-                                d.settings_selected = (d.settings_selected + 9) % 10;
+                                d.settings_selected = (d.settings_selected
+                                    + crate::setup::PROJECT_SETTINGS.len()
+                                    - 1)
+                                    % crate::setup::PROJECT_SETTINGS.len();
                                 continue;
                             }
                             KeyCode::Down => {
-                                d.settings_selected = (d.settings_selected + 1) % 10;
+                                d.settings_selected = (d.settings_selected + 1)
+                                    % crate::setup::PROJECT_SETTINGS.len();
                                 continue;
                             }
                             KeyCode::Enter => {
-                                match d.settings_selected {
-                                    5 => crate::setup::active_hours_menu(Some(path))?,
-                                    6 => crate::setup::project_settings_menu(Some(path))?,
-                                    7 => crate::setup::external_control_info(path)?,
-                                    8 => crate::setup::helpers_menu(Some(path))?,
-                                    9 => crate::tool_requests::menu(path)?,
+                                use crate::setup::ProjectSetting;
+                                match crate::setup::PROJECT_SETTINGS[d.settings_selected] {
+                                    ProjectSetting::ActiveHours => {
+                                        crate::setup::active_hours_menu(Some(path))?
+                                    }
+                                    ProjectSetting::More => {
+                                        crate::setup::more_project_settings(Some(path))?
+                                    }
+                                    ProjectSetting::Global => crate::setup::settings_menu()?,
+                                    setting
+                                    @ (ProjectSetting::Context | ProjectSetting::Output) => {
+                                        crate::setup::edit_project_tokens(Some(path), setting)?
+                                    }
                                     _ => {
                                         d.settings_edit =
-                                            Some(setting_value(&config, d.settings_selected))
+                                            Some(setting_value(&config, d.settings_selected));
                                     }
                                 }
                                 continue;
@@ -2626,14 +2601,12 @@ mod tests {
         assert_eq!(c.model, "example-model:latest");
     }
     #[test]
-    fn helper_settings_remain_visible_at_small_terminal_sizes() {
+    fn common_token_settings_remain_visible_at_small_terminal_sizes() {
         let mut c = config();
-        c.helpers.enabled = true;
-        c.helpers.model = "groq/example-model".into();
-        c.helpers.max_calls = 24;
+        c.context_tokens = 1_048_576;
         let mut d = Dashboard::new(&c);
         d.tab = 4;
-        d.settings_selected = 8;
+        d.settings_selected = 1;
         d.scroll = 500;
         for (width, height) in [(80, 24), (100, 30)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -2641,23 +2614,23 @@ mod tests {
                 .draw(|f| render_dashboard(f, &mut d, &c, false))
                 .unwrap();
             let text = screen_text(&terminal);
-            assert!(text.contains("Investigation helpers"));
-            assert!(text.contains("on · groq/example-model · 24 responses"));
+            assert!(text.contains("Context window"));
+            assert!(text.contains("1,048,576"));
         }
     }
     #[test]
-    fn tool_request_review_remains_visible_on_a_small_settings_tab() {
+    fn project_and_global_submenus_remain_visible_on_a_small_settings_tab() {
         let c = config();
         let mut d = Dashboard::new(&c);
         d.tab = 4;
-        d.settings_selected = 9;
+        d.settings_selected = 8;
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|f| render_dashboard(f, &mut d, &c, false))
             .unwrap();
         let text = screen_text(&terminal);
-        assert!(text.contains("Tool requests"));
-        assert!(text.contains("Review saved suggestions"));
+        assert!(text.contains("More project settings"));
+        assert!(text.contains("Global settings"));
     }
     #[test]
     fn cold_start_restores_visible_history_without_session_activity() {
@@ -2755,8 +2728,12 @@ mod tests {
             "Resume project",
             "Project goal",
             "Progress",
-            "Choose model",
+            "Project model",
             "Settings",
+            "Run duration",
+            "Chat with this project",
+            "More project settings",
+            "Global settings",
             "Quit",
         ]
         .into_iter()
@@ -2778,6 +2755,10 @@ mod tests {
             if w == 120 {
                 let text = screen_text(&t);
                 assert!(text.contains("Resume project"));
+                assert!(text.contains("Project model"));
+                assert!(text.contains("More project settings"));
+                assert!(text.contains("Global settings"));
+                assert!(!text.contains("shared model default"));
                 if let Ok(dir) = std::env::var("CHUGGIN_UI_SNAPSHOTS") {
                     fs::create_dir_all(&dir).unwrap();
                     fs::write(Path::new(&dir).join("splash.txt"), text).unwrap();

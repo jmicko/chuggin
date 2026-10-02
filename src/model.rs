@@ -609,7 +609,7 @@ impl Model {
         if cloud.is_some() {
             anyhow::ensure!(
                 cloud != Some(crate::cloud::Provider::OpenRouter) || key.is_some(),
-                "Add your OpenRouter API key in Shared settings → OpenRouter connection"
+                "Add your OpenRouter API key in Global settings → OpenRouter connection"
             );
             crate::cloud::validate(name)?;
         }
@@ -617,6 +617,10 @@ impl Model {
             .as_ref()
             .map(|c| c.output_tokens)
             .unwrap_or(self.output);
+        let context = live
+            .as_ref()
+            .map(|c| c.context_tokens)
+            .unwrap_or(self.context);
         let output = self.output_cap.get().map_or(output, |cap| output.min(cap));
         let output = if groq.is_some() {
             output.min(crate::groq::Limits::load()?.max_response_tokens)
@@ -657,7 +661,7 @@ impl Model {
         } else {
             messages.to_vec()
         };
-        let mut body = json!({"model":name,"messages":wire_messages,"stream":true,"think":false,"options":{"num_ctx":self.context,"num_predict":output,"temperature":0.4}});
+        let mut body = json!({"model":name,"messages":wire_messages,"stream":true,"think":false,"options":{"num_ctx":context,"num_predict":output,"temperature":0.4}});
         if let Some(t) = tools {
             body["tools"] = t;
         }
@@ -841,7 +845,8 @@ impl Model {
                             r.settle(prompt, generated)?;
                         }
                         self.context_pressure.set(
-                            prompt + generated >= self.context.saturating_sub(output + 1024) as u64,
+                            prompt + generated
+                                >= context.saturating_sub(output.saturating_add(1024)) as u64,
                         );
                         crate::events::send(crate::events::Event::Metrics {
                             prompt,
@@ -913,7 +918,7 @@ impl Model {
                 let used = d["prompt_eval_count"].as_u64().unwrap_or(0)
                     + d["eval_count"].as_u64().unwrap_or(0);
                 self.context_pressure
-                    .set(used >= self.context.saturating_sub(self.output + 1024) as u64);
+                    .set(used >= context.saturating_sub(output.saturating_add(1024)) as u64);
                 crate::events::send(crate::events::Event::Metrics {
                     prompt: d["prompt_eval_count"].as_u64().unwrap_or(0),
                     generated: d["eval_count"].as_u64().unwrap_or(0),
@@ -1770,7 +1775,7 @@ mod cloud_transport_tests {
         let mut model = Model::new(
             "http://unused",
             name,
-            128000,
+            1_048_576,
             4096,
             Arc::new(AtomicBool::new(false)),
         )

@@ -104,23 +104,38 @@ impl Client {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
-        let log = fs::OpenOptions::new()
+        let mut log = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(client.socket.with_extension("log"))?;
         let mut child = std::process::Command::new(std::env::current_exe()?)
             .arg("engine")
-            .arg("--config")
-            .arg(&path)
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .stderr(log)
+            .stderr(log.try_clone()?)
             .spawn()?;
+        serde_json::to_writer(
+            child
+                .stdin
+                .take()
+                .context("Controller startup pipe missing")?,
+            &path,
+        )?;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if client.request(json!({"action":"status"})).is_ok() {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
+                std::thread::spawn(move || match child.wait() {
+                    Ok(status) if !status.success() => {
+                        let _ = writeln!(
+                            log,
+                            "{} Background controller exited unexpectedly: {status}",
+                            chrono::Utc::now()
+                        );
+                    }
+                    Err(error) => {
+                        let _ = writeln!(log, "Cannot observe controller exit: {error}");
+                    }
+                    _ => {}
                 });
                 return Ok(client);
             }
