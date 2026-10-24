@@ -14,12 +14,12 @@ pub struct CommandWatch {
     pub command: Value,
     pub recent: Vec<Value>,
     pub activity: Vec<Value>,
-    // Command processes are not reattached after a restart. Only completed
-    // observations belong in saved recovery state.
-    #[serde(skip)]
+    // Retain provenance across a soft stop. The controller reconciles these IDs
+    // against its owned sessions on resume; a cold restart never reattaches a PID.
     pending: std::collections::BTreeMap<String, PendingCommand>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct PendingCommand {
     name: String,
     args: Value,
@@ -48,6 +48,13 @@ impl CommandWatch {
         self.pending.contains_key(id)
     }
 
+    pub fn retain_pending(&mut self, ids: &std::collections::HashSet<String>) {
+        self.pending.retain(|id, _| ids.contains(id));
+    }
+    pub fn pending_ids(&self) -> Vec<String> {
+        self.pending.keys().cloned().collect()
+    }
+
     /// Capture the original request before a command can complete asynchronously.
     /// IDs include their cycle so a later cycle cannot reuse an interrupted job.
     pub fn started(
@@ -58,10 +65,6 @@ impl CommandWatch {
         before: Option<&str>,
         task_id: u64,
     ) {
-        if let Some((cycle, _)) = id.rsplit_once('/') {
-            let prefix = format!("{cycle}/");
-            self.pending.retain(|key, _| key.starts_with(&prefix));
-        }
         self.pending
             .entry(id.to_owned())
             .or_insert_with(|| PendingCommand {
@@ -333,11 +336,13 @@ mod tests {
         assert_eq!(watch.count, 0);
         watch.started("cycle-000001/d", "run_command", &args, Some("b"), 2);
         let saved = serde_json::to_value(&watch).unwrap();
-        assert!(saved.get("pending").is_none());
+        assert!(saved.get("pending").is_some());
         let mut restored: CommandWatch = serde_json::from_value(saved).unwrap();
+        assert!(restored.has_pending("cycle-000001/d"));
+        restored.retain_pending(&std::collections::HashSet::new());
         assert!(!restored.completed("cycle-000001/d", &done, Some("b"), 2));
         watch.started("cycle-000002/d", "run_command", &args, Some("b"), 2);
-        assert!(!watch.has_pending("cycle-000001/d"));
+        assert!(watch.has_pending("cycle-000001/d"));
         assert!(watch.completed("cycle-000002/d", &done, Some("b"), 2));
         assert_eq!(watch.count, 1);
     }

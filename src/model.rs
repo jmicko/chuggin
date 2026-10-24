@@ -41,6 +41,30 @@ impl std::fmt::Display for InterruptedResponse {
 }
 impl std::error::Error for InterruptedResponse {}
 
+fn reasoning_output_limit(
+    configured: u32,
+    cap: Option<u32>,
+    setting: &crate::reasoning::Setting,
+) -> Result<u32> {
+    let cap = cap.map(|cap| {
+        if let crate::reasoning::Setting::TokenBudget(tokens) = setting {
+            // Short watchdog/diagnostic replies still need room for the user's
+            // explicit thinking budget; the configured allowance remains final.
+            cap.max(tokens.saturating_add(2048))
+        } else {
+            cap
+        }
+    });
+    let output = cap.map_or(configured, |cap| configured.min(cap));
+    if let crate::reasoning::Setting::TokenBudget(tokens) = setting {
+        anyhow::ensure!(
+            *tokens < output,
+            "Reasoning token budget ({tokens}) must be smaller than the response limit ({output}) so there is room for an answer. Raise the response limit or reduce the reasoning budget."
+        );
+    }
+    Ok(output)
+}
+
 pub struct Model {
     client: Client,
     url: String,
@@ -56,12 +80,26 @@ pub struct Model {
     chat_settings: Option<PathBuf>,
     completed_messages: RefCell<Option<Vec<Value>>>,
     completed_reasoning: RefCell<String>,
+    last_context_usage: RefCell<Option<crate::context_usage::Usage>>,
     context_pressure: Cell<bool>,
     run_controls: Option<(Arc<AtomicBool>, Instant)>,
     pub(crate) controls: Arc<crate::run_control::RunControl>,
     request_target: RefCell<(String, String)>,
     pinned_target: Option<(String, String, PathBuf)>,
     vision_capabilities: RefCell<HashMap<(String, String), bool>>,
+    reasoning: crate::reasoning::Setting,
+    reasoning_role: ReasoningRole,
+    reasoning_capabilities:
+        RefCell<HashMap<(String, String), (Instant, crate::reasoning::Capabilities)>>,
+    request_timeout_seconds: u64,
+    #[cfg(test)]
+    responses_test_token: Option<String>,
+}
+#[derive(Clone, Copy)]
+enum ReasoningRole {
+    Loop,
+    Chat,
+    Helper,
 }
 impl Model {
     pub fn new(
@@ -88,13 +126,45 @@ impl Model {
             chat_settings: None,
             completed_messages: RefCell::new(None),
             completed_reasoning: RefCell::new(String::new()),
+            last_context_usage: RefCell::new(None),
             context_pressure: Cell::new(false),
             run_controls: None,
             controls: Arc::new(crate::run_control::RunControl::default()),
             request_target: RefCell::new((name.into(), crate::cloud::url(url, name))),
             pinned_target: None,
             vision_capabilities: RefCell::new(HashMap::new()),
+            reasoning: crate::reasoning::Setting::default(),
+            reasoning_role: ReasoningRole::Loop,
+            reasoning_capabilities: RefCell::new(HashMap::new()),
+            request_timeout_seconds: 1800,
+            #[cfg(test)]
+            responses_test_token: None,
         })
+    }
+    pub fn set_reasoning(&mut self, setting: crate::reasoning::Setting) {
+        self.reasoning = setting;
+    }
+    pub fn set_request_timeout(&mut self, seconds: u64) {
+        self.request_timeout_seconds = seconds;
+    }
+    fn chatgpt_token(&self, url: &str) -> Result<String> {
+        #[cfg(test)]
+        if let Some(token) = &self.responses_test_token {
+            return Ok(token.clone());
+        }
+        anyhow::ensure!(
+            url == "https://api.openai.com/v1/responses",
+            "ChatGPT plan credentials can only be sent to the official Responses endpoint"
+        );
+        crate::chatgpt::access_token()
+    }
+    fn renew_chatgpt_token(&self, rejected: &str) -> Result<String> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            self.responses_test_token.is_none(),
+            "Mock ChatGPT token was rejected"
+        );
+        crate::chatgpt::refresh_access_token(rejected)
     }
     fn supports_vision(&self, name: &str, url: &str) -> bool {
         if let Some(id) = crate::groq::model_id(name) {
@@ -107,6 +177,26 @@ impl Model {
         let cache_key = (url.to_owned(), name.to_owned());
         if let Some(supported) = self.vision_capabilities.borrow().get(&cache_key) {
             return *supported;
+        }
+        if crate::chatgpt::model_id(name).is_some() {
+            let supported = crate::chatgpt::model_info(name)
+                .ok()
+                .and_then(|metadata| {
+                    metadata["supports_images"].as_bool().or_else(|| {
+                        ["input_modalities", "supported_input_modalities"]
+                            .into_iter()
+                            .find_map(|field| {
+                                metadata[field].as_array().map(|modalities| {
+                                    modalities.iter().any(|value| value == "image")
+                                })
+                            })
+                    })
+                })
+                .unwrap_or(true);
+            self.vision_capabilities
+                .borrow_mut()
+                .insert(cache_key, supported);
+            return supported;
         }
         if crate::cloud::provider(name).is_some() {
             // Cloud catalog capabilities are validated before the request. If
@@ -149,6 +239,10 @@ impl Model {
     pub fn take_completed_reasoning(&self) -> String {
         std::mem::take(&mut *self.completed_reasoning.borrow_mut())
     }
+    /// Usage belongs to the last call, including a response that reached its limit.
+    pub(crate) fn take_context_usage(&self) -> Option<crate::context_usage::Usage> {
+        self.last_context_usage.borrow_mut().take()
+    }
     pub fn command_review_seconds(&self, fallback: u64) -> u64 {
         self.settings_path
             .as_ref()
@@ -165,6 +259,7 @@ impl Model {
     pub fn use_chat_settings(&mut self, path: &Path, session: &Path) {
         self.settings_path = Some(path.into());
         self.chat_settings = Some(session.join("provider-wait.json"));
+        self.reasoning_role = ReasoningRole::Chat;
     }
     fn selected_name<'a>(&'a self, c: &'a crate::runner::Config) -> &'a str {
         if let Some((name, _, _)) = &self.pinned_target {
@@ -173,6 +268,16 @@ impl Model {
             &c.chat_model
         } else {
             &c.model
+        }
+    }
+    fn selected_reasoning<'a>(
+        &'a self,
+        c: &'a crate::runner::Config,
+    ) -> &'a crate::reasoning::Setting {
+        match self.reasoning_role {
+            ReasoningRole::Loop => &c.reasoning,
+            ReasoningRole::Chat => &c.chat_reasoning,
+            ReasoningRole::Helper => &c.helpers.reasoning,
         }
     }
     pub fn use_run_controls(&mut self, stop: Arc<AtomicBool>, started: Instant) {
@@ -193,6 +298,7 @@ impl Model {
         helper.controls = self.controls.clone();
         helper.run_controls = self.run_controls.clone();
         helper.settings_path = Some(config_path.into());
+        helper.reasoning_role = ReasoningRole::Helper;
         helper.pinned_target = Some((name.into(), url.into(), jobdir.join("provider-wait.json")));
     }
     pub fn pause_point(&self) {
@@ -343,6 +449,7 @@ impl Model {
     ) -> Result<Value> {
         *self.completed_messages.borrow_mut() = None;
         self.completed_reasoning.borrow_mut().clear();
+        *self.last_context_usage.borrow_mut() = None;
         let mut conversation = messages.to_vec();
         let canonical_tools = tools;
         let mut transport_retries = 0;
@@ -577,6 +684,14 @@ impl Model {
             .as_ref()
             .map(|c| self.selected_name(c))
             .unwrap_or(&self.name);
+        if self
+            .last_context_usage
+            .borrow()
+            .as_ref()
+            .is_some_and(|usage| usage.model != name)
+        {
+            *self.last_context_usage.borrow_mut() = None;
+        }
         let url = live
             .as_ref()
             .map(|c| crate::cloud::url(&c.ollama_url, self.selected_name(c)))
@@ -588,7 +703,7 @@ impl Model {
         let timeout = live
             .as_ref()
             .map(|c| c.request_timeout_seconds)
-            .unwrap_or(1800);
+            .unwrap_or(self.request_timeout_seconds);
         let timeout = if self.watchdog_call.get() {
             if timeout == 0 { 120 } else { timeout.min(120) }
         } else {
@@ -596,12 +711,43 @@ impl Model {
         };
         let groq = crate::groq::model_id(name);
         let cloud = crate::cloud::provider(name);
-        let openai = groq.is_some() || cloud.is_some();
+        let chatgpt = crate::chatgpt::model_id(name);
+        let remote = cloud.is_some() || chatgpt.is_some();
+        let openai = groq.is_some() || remote;
         // Metadata refresh errors belong to this target as well. Recording a
         // previous model here would let a live switch bypass provider backoff.
         *self.request_target.borrow_mut() = (name.to_owned(), url.clone());
+        let reasoning = live
+            .as_ref()
+            .map(|c| self.selected_reasoning(c))
+            .unwrap_or(&self.reasoning);
+        let thinking_capabilities = if reasoning.is_default() {
+            None
+        } else {
+            let cache_key = (url.clone(), name.to_owned());
+            let cached = self
+                .reasoning_capabilities
+                .borrow()
+                .get(&cache_key)
+                .filter(|(at, _)| at.elapsed() < Duration::from_secs(300))
+                .map(|(_, capabilities)| capabilities.clone());
+            let capabilities = match cached {
+                Some(capabilities) => capabilities,
+                None => {
+                    let capabilities = crate::reasoning::discover(&url, name)?;
+                    self.reasoning_capabilities
+                        .borrow_mut()
+                        .insert(cache_key, (Instant::now(), capabilities.clone()));
+                    capabilities
+                }
+            };
+            capabilities.validate_selection(reasoning)?;
+            Some(capabilities)
+        };
         // Validate/read credentials before reserving capacity. Never include them in traces.
-        let key = if groq.is_some() {
+        let key = if chatgpt.is_some() {
+            Some(self.chatgpt_token(&url)?)
+        } else if groq.is_some() {
             Some(crate::groq::key()?)
         } else {
             crate::cloud::key(name)?
@@ -621,12 +767,12 @@ impl Model {
             .as_ref()
             .map(|c| c.context_tokens)
             .unwrap_or(self.context);
-        let output = self.output_cap.get().map_or(output, |cap| output.min(cap));
         let output = if groq.is_some() {
             output.min(crate::groq::Limits::load()?.max_response_tokens)
         } else {
             output
         };
+        let output = reasoning_output_limit(output, self.output_cap.get(), reasoning)?;
         let (_permit, reservation) = loop {
             let permit = crate::inference::acquire(&url, &self.controls, &self.stop)?;
             if groq.is_none() {
@@ -661,7 +807,7 @@ impl Model {
         } else {
             messages.to_vec()
         };
-        let mut body = json!({"model":name,"messages":wire_messages,"stream":true,"think":false,"options":{"num_ctx":context,"num_predict":output,"temperature":0.4}});
+        let mut body = json!({"model":name,"messages":wire_messages,"stream":true,"options":{"num_ctx":context,"num_predict":output,"temperature":0.4}});
         if let Some(t) = tools {
             body["tools"] = t;
         }
@@ -669,7 +815,10 @@ impl Model {
             body["format"] = schema;
             body["options"]["temperature"] = json!(0);
         }
-        if let Some(id) = groq.or_else(|| crate::cloud::model_id(name)) {
+        if chatgpt.is_some() {
+            body =
+                crate::responses::request(name, messages, body.get("tools"), body.get("format"))?;
+        } else if let Some(id) = groq.or_else(|| crate::cloud::model_id(name)) {
             let formatted = body.get("format").is_some();
             let wire_messages = if cloud.is_some() {
                 crate::openai::messages_for(messages, name)?
@@ -701,13 +850,14 @@ impl Model {
             }
             body = wire;
         }
+        crate::reasoning::apply(&mut body, name, reasoning, thinking_capabilities.as_ref())?;
         let sequence = self.sequence.get();
         self.sequence.set(sequence + 1);
         let mut trace = if let Some(path) = self.trace.borrow().as_ref() {
             std::fs::write(
                 path.join(format!("connection-{sequence:03}.json")),
                 serde_json::to_vec_pretty(
-                    &json!({"model":name,"request_timeout_seconds":timeout}),
+                    &json!({"model":name,"request_timeout_seconds":timeout,"reasoning":reasoning}),
                 )?,
             )?;
             std::fs::write(
@@ -725,17 +875,14 @@ impl Model {
         } else {
             None
         };
-        let request = cloud_client
-            .as_ref()
-            .unwrap_or(&self.client)
-            .post(url)
-            .json(&body);
-        let request = if let Some(key) = key {
+        let client = cloud_client.as_ref().unwrap_or(&self.client);
+        let request = client.post(url).json(&body);
+        let request = if let Some(key) = key.as_deref() {
             request.bearer_auth(key)
         } else {
             request
         };
-        let request = if cloud.is_some() {
+        let request = if remote {
             request.header(
                 reqwest::header::USER_AGENT,
                 concat!("chuggin/", env!("CARGO_PKG_VERSION")),
@@ -748,9 +895,20 @@ impl Model {
         } else {
             request.timeout(Duration::from_secs(timeout))
         };
-        let response = request.send().map_err(|error| {
-            let error = anyhow::Error::from(error);
-            if cloud.is_some() {
+        let response = if chatgpt.is_some() {
+            send_responses_request(
+                client,
+                &self.request_target.borrow().1,
+                &body,
+                key.as_deref().context("Missing ChatGPT access token")?,
+                timeout,
+                |rejected| self.renew_chatgpt_token(rejected),
+            )
+        } else {
+            request.send().map_err(anyhow::Error::from)
+        }
+        .map_err(|error| {
+            if remote && error.downcast_ref::<reqwest::Error>().is_some() {
                 error.context(crate::provider::Unavailable {
                     reason: "Cloud provider connection failed or timed out",
                     retry_after: None,
@@ -778,7 +936,7 @@ impl Model {
             }
             let mut body = String::new();
             if let Err(error) = response.take(16384).read_to_string(&mut body) {
-                if cloud.is_some() {
+                if remote {
                     if let Some(provider) = crate::provider::classify(status, "", retry_after) {
                         return Err(provider.into());
                     }
@@ -799,6 +957,16 @@ impl Model {
             {
                 return Err(VisionRejected.into());
             }
+            if chatgpt.is_some()
+                && let Ok(value) = serde_json::from_str::<Value>(&body)
+                && value["error"]["code"].as_str().is_some()
+            {
+                let mut error = crate::responses::error(&value);
+                if let Some(unavailable) = error.downcast_mut::<crate::provider::Unavailable>() {
+                    unavailable.retry_after = retry_after;
+                }
+                return Err(error);
+            }
             if let Some(provider) = crate::provider::classify(status, &body, retry_after) {
                 return Err(provider.into());
             }
@@ -810,12 +978,13 @@ impl Model {
         let mut done = false;
         let started = Instant::now();
         let mut stream = crate::openai::Stream::default();
+        let mut responses = crate::responses::Stream::default();
         let mut finish_reason = String::new();
         for line in BufReader::new(response).lines() {
             anyhow::ensure!(!self.stop.load(Ordering::SeqCst), "Stopped by operator");
             let line = line.map_err(|error| {
                 let error = anyhow::Error::from(error);
-                if cloud.is_some() {
+                if remote {
                     error.context(crate::provider::Unavailable {
                         reason: "Cloud provider stream interrupted",
                         retry_after: None,
@@ -830,7 +999,45 @@ impl Model {
             if line.is_empty() {
                 continue;
             }
-            let d: Value = if openai {
+            let d: Value = if chatgpt.is_some() {
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    continue;
+                }
+                let previous = responses.usage;
+                let parsed = responses.frame(data);
+                if responses.usage != previous
+                    && let Some((prompt, generated)) = responses.usage
+                {
+                    if prompt > 0 {
+                        *self.last_context_usage.borrow_mut() = Some(crate::context_usage::Usage {
+                            prompt,
+                            model: name.to_owned(),
+                            context_tokens: context,
+                            recorded_at: Some(chrono::Utc::now().to_rfc3339()),
+                        });
+                    }
+                    self.context_pressure.set(
+                        prompt.saturating_add(generated)
+                            >= context.saturating_sub(output.saturating_add(1024)) as u64,
+                    );
+                    crate::events::send(crate::events::Event::Metrics {
+                        prompt,
+                        generated,
+                        seconds: started.elapsed().as_secs_f64(),
+                    });
+                }
+                parsed.map_err(|mut error| {
+                    if let Some(unavailable) = error.downcast_mut::<crate::provider::Unavailable>()
+                    {
+                        unavailable.retry_after = unavailable.retry_after.or(retry_after);
+                    }
+                    error
+                })?
+            } else if openai {
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
@@ -869,7 +1076,19 @@ impl Model {
                     done = true;
                     break;
                 }
-                let frame = stream.frame(data)?;
+                let prior_usage = stream.usage;
+                let parsed = stream.frame(data);
+                if stream.usage != prior_usage
+                    && let Some((prompt, _)) = stream.usage.filter(|(prompt, _)| *prompt > 0)
+                {
+                    *self.last_context_usage.borrow_mut() = Some(crate::context_usage::Usage {
+                        prompt,
+                        model: name.to_owned(),
+                        context_tokens: context,
+                        recorded_at: Some(chrono::Utc::now().to_rfc3339()),
+                    });
+                }
+                let frame = parsed?;
                 if let Some(reason) = frame["done_reason"].as_str() {
                     finish_reason = reason.into();
                 }
@@ -915,26 +1134,39 @@ impl Model {
                 .into());
             }
             if d["done"].as_bool() == Some(true) {
+                if let Some(prompt) = d["prompt_eval_count"].as_u64().filter(|prompt| *prompt > 0) {
+                    *self.last_context_usage.borrow_mut() = Some(crate::context_usage::Usage {
+                        prompt,
+                        model: name.to_owned(),
+                        context_tokens: context,
+                        recorded_at: Some(chrono::Utc::now().to_rfc3339()),
+                    });
+                }
                 let used = d["prompt_eval_count"].as_u64().unwrap_or(0)
                     + d["eval_count"].as_u64().unwrap_or(0);
-                self.context_pressure
-                    .set(used >= context.saturating_sub(output.saturating_add(1024)) as u64);
-                crate::events::send(crate::events::Event::Metrics {
-                    prompt: d["prompt_eval_count"].as_u64().unwrap_or(0),
-                    generated: d["eval_count"].as_u64().unwrap_or(0),
-                    seconds: d["eval_duration"].as_f64().unwrap_or(0.) / 1_000_000_000.,
-                });
+                if chatgpt.is_none() {
+                    self.context_pressure
+                        .set(used >= context.saturating_sub(output.saturating_add(1024)) as u64);
+                    crate::events::send(crate::events::Event::Metrics {
+                        prompt: d["prompt_eval_count"].as_u64().unwrap_or(0),
+                        generated: d["eval_count"].as_u64().unwrap_or(0),
+                        seconds: d["eval_duration"].as_f64().unwrap_or(0.) / 1_000_000_000.,
+                    });
+                }
                 if d["done_reason"] == "length" {
                     return Err(InterruptedResponse {
                         reason: "Model reached its generation limit; produce a shorter complete response",
                         prefix: String::new(),
                     }.into());
                 }
+                if chatgpt.is_some() {
+                    calls = responses.calls()?;
+                }
                 done = true;
                 break;
             }
         }
-        if !done && cloud.is_some() {
+        if !done && remote {
             return Err(crate::provider::Unavailable {
                 reason: "Cloud provider stream disconnected before completion",
                 retry_after: None,
@@ -943,6 +1175,12 @@ impl Model {
         }
         anyhow::ensure!(done, "Model stream disconnected before completion");
         let mut reply = json!({"role":"assistant","content":content,"tool_calls":calls});
+        if chatgpt.is_some() && !self.watchdog_call.get() {
+            let items = responses.items()?;
+            if !items.is_empty() {
+                reply["_chuggin_responses"] = json!({"model":name,"items":items});
+            }
+        }
         if cloud.is_some() && !self.watchdog_call.get() {
             reply["_chuggin_reasoning"] =
                 json!({"model":name,"content":thinking,"details":stream.reasoning_details});
@@ -986,6 +1224,37 @@ impl Model {
             }
         }
     }
+}
+
+fn send_responses_request(
+    client: &Client,
+    url: &str,
+    body: &Value,
+    token: &str,
+    timeout: u64,
+    refresh: impl FnOnce(&str) -> Result<String>,
+) -> Result<reqwest::blocking::Response> {
+    let send = |token: &str| {
+        let request = client.post(url).bearer_auth(token).json(body).header(
+            reqwest::header::USER_AGENT,
+            concat!("chuggin/", env!("CARGO_PKG_VERSION")),
+        );
+        let request = if timeout == 0 {
+            request
+        } else {
+            request.timeout(Duration::from_secs(timeout))
+        };
+        request.send().map_err(anyhow::Error::from)
+    };
+    let response = send(token)?;
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(response);
+    }
+    // Only retry admission, before reading/acting on any streamed inference.
+    // Passing the rejected token avoids duplicate concurrent token rotations.
+    drop(response);
+    let renewed = refresh(token)?;
+    send(&renewed)
 }
 
 fn parse_reply<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
@@ -1248,6 +1517,156 @@ mod formatting_tests {
     }
 }
 
+#[cfg(test)]
+mod thinking_controls_transport_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_caps_preserve_a_valid_budget_and_reject_insufficient_configured_output() {
+        let budget = crate::reasoning::Setting::TokenBudget(4096);
+        assert_eq!(
+            reasoning_output_limit(8192, Some(2048), &budget).unwrap(),
+            6144
+        );
+        assert_eq!(
+            reasoning_output_limit(5000, Some(2048), &budget).unwrap(),
+            5000
+        );
+        assert!(
+            reasoning_output_limit(4096, Some(2048), &budget)
+                .unwrap_err()
+                .to_string()
+                .contains("Raise the response limit")
+        );
+        assert_eq!(
+            reasoning_output_limit(8192, Some(2048), &crate::reasoning::Setting::Default).unwrap(),
+            2048
+        );
+    }
+
+    #[test]
+    fn default_skips_metadata_and_live_overrides_apply_on_the_next_call() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut raw = vec![0; length];
+                reader.read_exact(&mut raw).unwrap();
+                let body: Value = serde_json::from_slice(&raw).unwrap();
+                let reply = if index == 1 {
+                    assert!(request.contains("/api/show"));
+                    json!({"thinking":{"values":[true,false],"default":true}})
+                } else {
+                    assert!(request.contains("/api/chat"));
+                    match index {
+                        0 => assert!(body.get("think").is_none(), "Default must not force thinking off"),
+                        2 => assert_eq!(body["think"], true),
+                        3 => assert_eq!(body["think"], false),
+                        _ => unreachable!(),
+                    }
+                    json!({"message":{"role":"assistant","content":"Done"},"done":true,"done_reason":"stop"})
+                }.to_string()+"\n";
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("chuggin.json");
+        let mut c: crate::runner::Config = serde_json::from_value(json!({
+            "repo":directory.path(),"goal":"A useful project","ollama_url":url,
+            "model":"local-fixture","context_tokens":4096,"output_tokens":256,
+            "implementation_calls":4,"checks":[{"argv":["true"],"timeout_seconds":10}],
+            "state_dir":directory.path().join(".chuggin"),"retry_seconds":1
+        }))
+        .unwrap();
+        crate::setup::save(&config, &c).unwrap();
+        let mut model =
+            Model::new(&url, &c.model, 4096, 256, Arc::new(AtomicBool::new(false))).unwrap();
+        model.use_project_settings(&config);
+        let messages = [json!({"role":"user","content":"Work"})];
+        model.chat(&messages, None, false).unwrap();
+        c.reasoning = crate::reasoning::Setting::On;
+        crate::setup::save(&config, &c).unwrap();
+        model.chat(&messages, None, false).unwrap();
+        c.reasoning = crate::reasoning::Setting::Off;
+        crate::setup::save(&config, &c).unwrap();
+        model.chat(&messages, None, false).unwrap();
+        c.reasoning = crate::reasoning::Setting::Effort("high".into());
+        crate::setup::save(&config, &c).unwrap();
+        let error = model.chat(&messages, None, false).unwrap_err();
+        assert!(error.to_string().contains("not advertised"), "{error:#}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn role_settings_are_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut c: crate::runner::Config = serde_json::from_value(json!({
+            "repo":directory.path(),"goal":"A useful project","ollama_url":"http://unused",
+            "model":"main","chat_model":"chat","setup_model":"setup",
+            "context_tokens":4096,"output_tokens":256,"implementation_calls":4,"checks":[],
+            "state_dir":directory.path().join(".chuggin"),"retry_seconds":1
+        }))
+        .unwrap();
+        c.reasoning = crate::reasoning::Setting::Off;
+        c.chat_reasoning = crate::reasoning::Setting::Effort("high".into());
+        c.helpers.reasoning = crate::reasoning::Setting::On;
+        let mut model = Model::new(
+            "http://unused",
+            "main",
+            4096,
+            256,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(model.selected_reasoning(&c), &c.reasoning);
+        model.use_chat_settings(&directory.path().join("chuggin.json"), directory.path());
+        assert_eq!(model.selected_reasoning(&c), &c.chat_reasoning);
+        assert_eq!(model.selected_name(&c), "chat");
+        let mut helper = Model::new(
+            "http://unused",
+            "helper",
+            4096,
+            256,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        model.configure_helper(
+            &mut helper,
+            &directory.path().join("chuggin.json"),
+            directory.path(),
+            "helper",
+            "http://unused",
+        );
+        assert_eq!(helper.selected_reasoning(&c), &c.helpers.reasoning);
+        assert_eq!(helper.selected_name(&c), "helper");
+    }
+}
+
 pub fn goal_completion_tool() -> Value {
     json!({"type":"function","function":{"name":"finish_project","description":"Mark the overall project goal complete when it has been fully achieved and verified. Completing an individual task or nudge does not complete the project. This saves work and stops the loop.","parameters":{"type":"object","properties":{"summary":{"type":"string"},"evidence":{"type":"string"}},"required":["summary","evidence"]}}})
 }
@@ -1426,6 +1845,106 @@ mod reasoning_transport_tests {
     }
 
     #[test]
+    fn context_usage_belongs_to_one_call_and_missing_counts_remain_unknown() {
+        let reported = |prompt| {
+            vec![json!({
+                "message":{"content":"reply"},"done":true,"done_reason":"stop",
+                "prompt_eval_count":prompt,"eval_count":10
+            })]
+        };
+        let (model, server) = fixture(vec![
+            reported(321),
+            reported(654),
+            completed("missing usage", ""),
+            reported(17),
+            completed("after observer", ""),
+        ]);
+        let messages = vec![json!({"role":"user","content":"fixture"})];
+        model.chat(&messages, None, false).unwrap();
+        let usage = model.take_context_usage().unwrap();
+        assert_eq!(usage.prompt, 321);
+        assert_eq!(usage.model, "reasoning-fixture");
+        assert_eq!(usage.context_tokens, 4096);
+        assert!(usage.recorded_at.is_some());
+        assert!(model.take_context_usage().is_none());
+
+        model.chat(&messages, None, false).unwrap();
+        // An unconsumed earlier measurement must not fill in absent metadata.
+        model.chat(&messages, None, false).unwrap();
+        assert!(model.take_context_usage().is_none());
+        model.watchdog_chat(&messages, json!([])).unwrap();
+        model.chat(&messages, None, false).unwrap();
+        assert!(model.take_context_usage().is_none());
+        server.join().unwrap();
+
+        model.stop.store(true, Ordering::SeqCst);
+        assert!(model.chat(&messages, None, false).is_err());
+        assert!(model.take_context_usage().is_none());
+    }
+
+    #[test]
+    fn context_usage_survives_a_reported_generation_limit_error() {
+        let (model, server) = fixture(
+            (101..=103)
+                .map(|prompt| {
+                    vec![json!({
+                        "message":{"content":"partial"},"done":true,"done_reason":"length",
+                        "prompt_eval_count":prompt,"eval_count":256
+                    })]
+                })
+                .collect(),
+        );
+        let messages = vec![json!({"role":"user","content":"fixture"})];
+        assert!(model.chat(&messages, None, false).is_err());
+        assert_eq!(model.take_context_usage().unwrap().prompt, 103);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn context_usage_is_not_carried_to_a_new_model_during_recovery() {
+        let (mut model, server) = fixture(vec![
+            vec![json!({
+                "message":{"content":"partial"},"done":true,"done_reason":"length",
+                "prompt_eval_count":321,"eval_count":256
+            })],
+            completed("same-model response without usage", ""),
+            completed("new-model response without usage", ""),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chuggin.json");
+        let mut c: crate::runner::Config = serde_json::from_value(json!({
+            "repo":directory.path(),"state_dir":directory.path().join(".chuggin"),
+            "goal":"Retain only relevant usage","model":"reasoning-fixture",
+            "ollama_url":model.url.strip_suffix("/api/chat").unwrap(),
+            "context_tokens":4096,"output_tokens":256,"implementation_calls":4,
+            "checks":[{"argv":["true"],"timeout_seconds":10}],"retry_seconds":1
+        }))
+        .unwrap();
+        crate::setup::save(&path, &c).unwrap();
+        model.use_project_settings(&path);
+        let messages = vec![json!({"role":"user","content":"fixture"})];
+        let error = model.chat_format_once(&messages, None, None).unwrap_err();
+        assert!(
+            error.downcast_ref::<InterruptedResponse>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(
+            model.last_context_usage.borrow().as_ref().unwrap().prompt,
+            321
+        );
+        model.chat_format_once(&messages, None, None).unwrap();
+        assert_eq!(
+            model.last_context_usage.borrow().as_ref().unwrap().prompt,
+            321
+        );
+        c.model = "new-local-fixture".into();
+        crate::setup::save(&path, &c).unwrap();
+        model.chat_format_once(&messages, None, None).unwrap();
+        assert!(model.take_context_usage().is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
     fn reasoning_is_drained_once_and_is_not_sent_in_later_requests() {
         let (model, server) = fixture(vec![
             vec![
@@ -1488,6 +2007,282 @@ mod reasoning_transport_tests {
             model.take_completed_reasoning(),
             "PRIVATE_REASONING new main"
         );
+        server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod responses_transport_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn read_request(socket: &std::net::TcpStream) -> (String, Value) {
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut headers = String::new();
+        let mut size = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(length) = line.to_lowercase().strip_prefix("content-length:") {
+                size = length.trim().parse().unwrap();
+            }
+            headers.push_str(&line);
+        }
+        let mut bytes = vec![0; size];
+        reader.read_exact(&mut bytes).unwrap();
+        (headers, serde_json::from_slice(&bytes).unwrap())
+    }
+    fn fixture(frames: Vec<Vec<Value>>) -> (Model, std::thread::JoinHandle<Vec<Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut model = Model::new(
+            "http://unused",
+            "chatgpt/mock-model",
+            32768,
+            4096,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        model.url = format!("http://{}/responses", listener.local_addr().unwrap());
+        model.responses_test_token = Some("fake-fixture-token".into());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for frames in frames {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (headers, body) = read_request(&socket);
+                assert!(
+                    headers
+                        .to_lowercase()
+                        .contains("authorization: bearer fake-fixture-token")
+                );
+                requests.push(body);
+                let mut text = String::new();
+                for frame in frames {
+                    text.push_str(&format!(
+                        "event: {}\ndata: {frame}\n\n",
+                        frame["type"].as_str().unwrap()
+                    ));
+                }
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",text.len()).unwrap();
+            }
+            requests
+        });
+        (model, server)
+    }
+    #[test]
+    fn model_responses_branch_keeps_tools_history_reasoning_and_usage() {
+        let reasoning = json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque-model-state"});
+        let call = json!({"type":"function_call","id":"fc_1","call_id":"call_1","namespace":"chuggin","name":"read_file","arguments":"{\"path\":\"a.txt\"}","status":"completed"});
+        let message = json!({"type":"message","id":"msg_2","role":"assistant","phase":"final_answer","status":"completed","content":[{"type":"output_text","text":"Checked","annotations":[]}]});
+        let (model, server) = fixture(vec![
+            vec![
+                json!({"type":"response.reasoning_summary_text.delta","delta":"Inspecting project evidence"}),
+                json!({"type":"response.completed","response":{"status":"completed","output":[reasoning,call],"usage":{"input_tokens":1024,"output_tokens":30}}}),
+            ],
+            vec![
+                json!({"type":"response.output_text.delta","delta":"Checked"}),
+                json!({"type":"response.completed","response":{"status":"completed","output":[message],"usage":{"input_tokens":1134,"output_tokens":10}}}),
+            ],
+        ]);
+        let trace = tempfile::tempdir().unwrap();
+        model.trace_to(trace.path());
+        let mut messages = vec![
+            json!({"role":"system","content":"Long project instructions ".repeat(1000)}),
+            json!({"role":"user","content":"Read a.txt"}),
+        ];
+        let reply = model.chat(&messages, Some(tools()), false).unwrap();
+        assert_eq!(
+            reply["tool_calls"][0]["function"]["arguments"]["path"],
+            "a.txt"
+        );
+        assert_eq!(
+            model.take_completed_reasoning(),
+            "Inspecting project evidence"
+        );
+        assert_eq!(model.take_context_usage().unwrap().prompt, 1024);
+        messages.push(reply);
+        messages.push(json!({"role":"tool","tool_call_id":"call_1","content":"Source evidence"}));
+        let reply = model.chat(&messages, Some(tools()), false).unwrap();
+        assert_eq!(reply["content"], "Checked");
+        assert_eq!(
+            reply["_chuggin_responses"]["items"][0]["phase"],
+            "final_answer"
+        );
+        let usage = model.take_context_usage().unwrap();
+        assert_eq!(usage.prompt, 1134);
+        assert_eq!(usage.model, "chatgpt/mock-model");
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["input"][0]["role"], "developer");
+        assert!(
+            requests[0]["input"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .len()
+                > 20000
+        );
+        assert_eq!(
+            requests[1]["input"][2]["encrypted_content"],
+            "opaque-model-state"
+        );
+        assert_eq!(
+            requests[1]["input"][3]["call_id"],
+            requests[1]["input"][4]["call_id"]
+        );
+        for request in requests {
+            assert_eq!(request["store"], false);
+            assert_eq!(request["stream"], true);
+            assert_eq!(request["tools"][0]["type"], "namespace");
+            for key in [
+                "temperature",
+                "max_output_tokens",
+                "max_tokens",
+                "options",
+                "previous_response_id",
+            ] {
+                assert!(request.get(key).is_none(), "{key}");
+            }
+        }
+        for file in std::fs::read_dir(trace.path()).unwrap() {
+            let text = std::fs::read_to_string(file.unwrap().path()).unwrap();
+            assert!(!text.contains("fake-fixture-token"));
+        }
+    }
+    #[test]
+    fn model_never_returns_partial_or_failed_responses_calls() {
+        let partial = json!({"type":"function_call","id":"fc_1","call_id":"call_1","namespace":"chuggin","name":"read_file","arguments":"{\"path\":","status":"in_progress"});
+        let (model, server) = fixture(vec![
+            vec![
+                json!({"type":"response.output_item.added","output_index":0,"item":partial}),
+                json!({"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded"},"usage":{"input_tokens":987,"output_tokens":2}}}),
+            ],
+            vec![json!({"type":"response.output_item.added","output_index":0,"item":partial})],
+            vec![
+                json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":988,"output_tokens":3}}}),
+            ],
+        ]);
+        let messages = [json!({"role":"user","content":"Read evidence"})];
+        let error = model
+            .chat_format_once(&messages, Some(tools()), None)
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::provider::Unavailable>()
+                .is_some()
+        );
+        assert_eq!(model.take_context_usage().unwrap().prompt, 987);
+        let error = model
+            .chat_format_once(&messages, Some(tools()), None)
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::provider::Unavailable>()
+                .is_some()
+        );
+        let error = model
+            .chat_format_once(&messages, Some(tools()), None)
+            .unwrap_err();
+        assert!(error.downcast_ref::<InterruptedResponse>().is_some());
+        assert_eq!(model.take_context_usage().unwrap().prompt, 988);
+        server.join().unwrap();
+    }
+    #[test]
+    fn admission_refreshes_once_without_touching_account_storage() {
+        for final_status in ["200 OK", "401 Unauthorized"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/responses", listener.local_addr().unwrap());
+            let body = crate::responses::request(
+                "chatgpt/mock-model",
+                &[json!({"role":"system","content":"Inspect this project"})],
+                Some(&json!([])),
+                None,
+            )
+            .unwrap();
+            let expected = body.clone();
+            let server = std::thread::spawn(move || {
+                for (index, status) in ["401 Unauthorized", final_status].into_iter().enumerate() {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let (headers, body) = read_request(&socket);
+                    assert_eq!(body, expected);
+                    assert!(headers.to_lowercase().contains(if index == 0 {
+                        "authorization: bearer fake-old"
+                    } else {
+                        "authorization: bearer fake-new"
+                    }));
+                    let frames = if status == "200 OK" {
+                        format!(
+                            "data: {}\n\ndata: {}\n\n",
+                            json!({"type":"response.output_text.delta","delta":"Ready"}),
+                            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Ready"}]}],"usage":{"input_tokens":31,"output_tokens":2}}})
+                        )
+                    } else {
+                        "{}".into()
+                    };
+                    write!(socket,"HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{frames}",frames.len()).unwrap();
+                }
+            });
+            let renewals = Cell::new(0);
+            let response = send_responses_request(
+                &crate::groq::client().unwrap(),
+                &url,
+                &body,
+                "fake-old",
+                5,
+                |rejected| {
+                    assert_eq!(rejected, "fake-old");
+                    renewals.set(renewals.get() + 1);
+                    Ok("fake-new".into())
+                },
+            )
+            .unwrap();
+            assert_eq!(renewals.get(), 1);
+            if final_status == "200 OK" {
+                let mut stream = crate::responses::Stream::default();
+                for line in BufReader::new(response).lines() {
+                    let line = line.unwrap();
+                    if let Some(data) = line.strip_prefix("data:") {
+                        stream.frame(data.trim()).unwrap();
+                    }
+                }
+                assert!(stream.completed);
+                assert_eq!(stream.usage, Some((31, 2)));
+                assert!(stream.calls().unwrap().is_empty());
+            } else {
+                assert_eq!(response.status().as_u16(), 401);
+            }
+            server.join().unwrap();
+        }
+    }
+    #[test]
+    fn successful_admission_never_refreshes_or_retries_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/responses", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_request(&socket);
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let response = send_responses_request(
+            &crate::groq::client().unwrap(),
+            &url,
+            &json!({"model":"mock"}),
+            "fake-token",
+            5,
+            |_| panic!("successful admission must not refresh"),
+        )
+        .unwrap();
+        assert!(response.status().is_success());
         server.join().unwrap();
     }
 }
@@ -1784,7 +2579,7 @@ mod cloud_transport_tests {
         let trace = tempfile::tempdir().unwrap();
         model.trace_to(trace.path());
         let server = std::thread::spawn(move || {
-            for round in 0..5 {
+            for round in 0..6 {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1859,18 +2654,29 @@ mod cloud_transport_tests {
                     1 => vec![
                         json!({"choices":[{"delta":{"content":"{\"goal\":\"Complete\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9100,"completion_tokens":20}}),
                     ],
+                    5 => vec![
+                        json!({"choices":[{"delta":{"content":"Partial response"}}]}),
+                        json!({"choices":[],"usage":{"prompt_tokens":9876,"completion_tokens":3}}),
+                    ],
                     _ => vec![json!({"error":{"code":503,"message":"Upstream maintenance"}})],
                 };
                 let mut data: String = frames
                     .iter()
                     .map(|frame| format!("data: {frame}\n\n"))
                     .collect();
-                data.push_str("data: [DONE]\n\n");
+                if round != 5 {
+                    data.push_str("data: [DONE]\n\n");
+                }
                 write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",data.len()).unwrap();
             }
         });
         let mut messages = vec![json!({"role":"user","content":"x".repeat(30000)})];
         let first = model.chat(&messages, Some(tools()), false).unwrap();
+        let usage = model.take_context_usage().unwrap();
+        assert_eq!(usage.prompt, 9000);
+        assert_eq!(usage.model, name);
+        assert_eq!(usage.context_tokens, 1_048_576);
+        assert!(usage.recorded_at.is_some());
         assert_eq!(
             first["tool_calls"][0]["function"]["arguments"],
             json!({"path":"fixture.txt"})
@@ -1880,6 +2686,7 @@ mod cloud_transport_tests {
         messages.push(first);
         messages.push(json!({"role":"tool","tool_call_id":"cloud-call","tool_name":"read_file","content":"Tool evidence"}));
         let second = model.chat(&messages, None, true).unwrap();
+        assert_eq!(model.take_context_usage().unwrap().prompt, 9100);
         assert_eq!(second["content"], "{\"goal\":\"Complete\"}");
         let error = model.chat_format_once(&messages, None, None).unwrap_err();
         assert_eq!(
@@ -1904,6 +2711,18 @@ mod cloud_transport_tests {
                 .retry_after,
             Some(Duration::from_secs(321))
         );
+        // A reported usage frame is authoritative even if the stream then ends
+        // without [DONE]. Use one attempt rather than retrying the provider.
+        let error = model.chat_format_once(&messages, None, None).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::provider::Unavailable>()
+                .is_some()
+        );
+        let usage = model.take_context_usage().unwrap();
+        assert_eq!(usage.prompt, 9876);
+        assert_eq!(usage.model, name);
+        assert_eq!(usage.context_tokens, 1_048_576);
         server.join().unwrap();
         for file in std::fs::read_dir(trace.path()).unwrap().flatten() {
             assert!(

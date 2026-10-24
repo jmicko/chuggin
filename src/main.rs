@@ -1,15 +1,18 @@
 mod action_watch;
 mod agents;
 mod chat;
+mod chatgpt;
 mod cloud;
 mod code_index;
 mod command_jobs;
 mod command_output;
 mod command_session;
 mod command_watch;
+mod context_usage;
 mod dev_tools;
 mod engine;
 mod events;
+mod goal_setup;
 mod groq;
 mod history;
 mod image_tools;
@@ -18,6 +21,7 @@ mod mcp;
 mod menu;
 mod migration;
 mod model;
+mod model_picker;
 mod nudge;
 mod openai;
 mod operator;
@@ -25,7 +29,9 @@ mod project;
 mod prompts;
 mod prose_watch;
 mod provider;
+mod reasoning;
 mod repetition;
+mod responses;
 mod run_control;
 mod runner;
 mod schedule;
@@ -73,7 +79,7 @@ enum Command {
     },
     /// Interactive project setup without starting the loop.
     Setup,
-    /// Edit shared Ollama and model defaults.
+    /// Edit shared inference providers and model defaults.
     Settings {
         #[arg(long)]
         show: bool,

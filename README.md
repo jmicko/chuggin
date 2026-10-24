@@ -1,6 +1,6 @@
 # Chuggin
 
-A Rust terminal tool for advancing software, document, and data projects with local models.
+A Rust terminal tool for advancing software, document, and data projects with local and cloud models.
 It keeps working, checking results, and refining the same project.
 
 **Save the work. Test it. Keep improving it.**
@@ -8,7 +8,7 @@ It keeps working, checking results, and refining the same project.
 ## Install
 
 Chuggin is currently tested on Linux. Install a recent stable Rust toolchain and
-Git, and have an Ollama server with a tool-capable chat model available.
+Git, and a tool-capable model through Ollama or a supported cloud provider.
 
 Chuggin uses your configured Git `user.name` and `user.email` for commits,
 including repository overrides of global settings. If either is missing,
@@ -62,7 +62,7 @@ tool actions, check output, recovery messages, and recent outcomes.
   When the run finishes, Enter returns to the splash screen.
 
 The side panel shows request counts, recent checkpoints and findings, context usage,
-and generation speed. Token counts and speed come from Ollama after each completed
+and generation speed. Token counts and speed come from the selected provider after each completed
 response, not estimates during streaming. CPU, RAM, and process memory describe
 the local Linux computer; they do not measure the remote server's GPU.
 
@@ -78,15 +78,61 @@ Updating the executable does not change an already-running process. The new UI
 appears the next time you launch Chuggin. Explicit `chuggin run` commands retain plain
 output for scripts and redirected logs.
 
-New installations default to **http://localhost:11434**, with no model preselected.
-Setup connects to your server and asks you to choose from its installed models.
-For a remote Ollama server, enter its URL during setup or in Settings.
-Existing saved settings take precedence over these defaults. Brave is optional
-and disabled until configured.
+New installations have no model preselected. **Project model** opens a provider
+selector, followed by the provider's live model catalog. Use arrow keys to choose,
+**/** to search, **R** to refresh, **C** for the connection, and **Esc** to return to
+providers. Refresh works without restarting or updating Chuggin. Each model shows
+its pricing category and any context/output limits supplied by the catalog.
+**A** shows unavailable, paid, or unconfirmed entries with an explanation; paid or
+unconfirmed Zen/OpenRouter entries cannot be selected. Free pricing does not
+promise unlimited access or remaining account allowance.
 
-Setup expands your elevator pitch into a project goal. Accept it or request
-changes; drafts persist across revisions and restarts. Choose a validation
-command, then Resume. Empty projects get an initial Git commit. For existing
+Configure all connections through **Global settings → Inference providers**:
+Ollama, Groq, OpenAI (ChatGPT plan), OpenCode Zen, and OpenRouter use the same menu.
+Ollama defaults to **http://localhost:11434**; enter a remote server address there.
+Cloud-only projects do not need an Ollama URL. Connections are global, while
+project, setup, chat, and helper model choices remain separate. Selecting a local
+model saves its effective server address together with that role. Explicit
+connection edits persist globally; backing out of a model picker does not change
+model choices. Existing saved settings take precedence. Brave is optional and
+disabled until configured.
+
+### Sign in with ChatGPT
+
+Choose **OpenAI · ChatGPT plan → Account → Continue with ChatGPT** in Inference
+providers. Chuggin opens the official authorization page in your browser, then
+receives its callback on a temporary localhost port. Eligible Plus/Pro users can
+authorize their existing plan allowance; this does not provide additional usage.
+After authorization, select a model from your account's live catalog. Models are
+saved as `chatgpt/<model-id>`, and model calls use OpenAI's public Responses API.
+No Codex installation, API key, or Python runtime is needed.
+
+Credentials are stored separately from project files, in owner-only account
+records under the global Chuggin configuration directory. Registrations remain
+separate even when they share an email address. Tokens renew automatically;
+authentication expiry, provider outages, and exhausted plan usage go through
+normal provider recovery. Disconnect locally from the Account menu, and manage
+or revoke Chuggin's authorization in ChatGPT settings. Tokens are never added to
+model prompts or request traces.
+
+ChatGPT plan requests are stateless and stream their output. Complete tool calls
+are released only after a successful completed response. The conversation,
+client-side tools, and saved progress remain in Chuggin. Thinking options are
+read from the account model catalog. OpenAI controls response length for this
+connection: Chuggin does not send its response-token cap or sampling overrides.
+See the [official Sign in with ChatGPT documentation](https://developers.openai.com/siwc/quickstart)
+for plan eligibility and usage controls.
+
+Setup offers guided goals for rewriting software in Rust, building new software,
+and research. The questionnaires produce an editable goal in a fixed format,
+without calling a model. Rust rewrites record where the original software can be
+found, including local files, archives or ISOs, a URL, or a request to locate it.
+You can also write a goal directly, or discuss it with an AI that can inspect the
+project using read-only tools. The AI proposes a goal for you to accept, edit, or
+reject; its conversation and drafts persist across restarts. Accepting a goal
+does not start the loop.
+
+Choose a validation command, then Resume. Empty projects get an initial Git commit. For existing
 files without commits, setup offers to commit project files while respecting
 Git ignores and excluding Chuggin's state.
 
@@ -115,7 +161,7 @@ and also applies to command-line runs.
 
 ## Live project settings
 
-Tab **5 Settings** in the observation view edits the exact model name, request
+Tab **5 Settings** in the observation view opens the provider/model picker and edits request
 timeout in minutes (0 means unlimited), and run duration in hours (0 means
 unlimited). Use arrows to select, Enter to edit/save, Ctrl+U to clear, and Esc
 to cancel. Changes persist only in this project’s `chuggin.json`.
@@ -143,7 +189,7 @@ commands, launch other helpers, or decide whether work is complete. Their report
 are advisory, and main work remains saved even when an investigation is inconclusive.
 
 Choose **Use project model** to use the project's connection, or explicitly
-select a model from Ollama, Groq, OpenCode Zen, or OpenRouter. Ollama uses the
+select a model from Ollama, Groq, OpenAI, OpenCode Zen, or OpenRouter. Ollama uses the
 project's server; cloud models use their provider's connection and limits.
 Groq keeps its shared request/token budgets. Investigations run sequentially
 with main work. Separate-provider parallel jobs are not enabled by this feature.
@@ -502,6 +548,13 @@ divider separates this history from new activity. This display uses the last 200
 saved messages within the normal bounded scrollback; older conversation archives
 and full command logs remain on disk. It does not replay actions, reconstruct old
 command-output panels, or add anything to model context or session counters.
+
+Context shows the input token count last reported for the main loop. On resume,
+the saved count is labeled **Saved response** until a fresh report arrives. When
+no measurement is available, it shows **Awaiting usage report** instead of zero.
+Helper and watchdog requests do not replace this count. It describes the last
+measured request, rather than estimating the current conversation's size.
+
 Command output is collapsed by default. Recognized Rust, pytest, Jest/Vitest and TAP
 summaries show passed/total counts, failures and skipped tests. Multiple Rust suites
 are aggregated without counting individual test lines twice. Other commands show
@@ -533,9 +586,14 @@ explicit newline when needed) or closes stdin; **stop_command** terminates the
 process group with a recorded reason. Input reports how many bytes were accepted,
 so callers can retry only the remainder if a pipe is full. These are pipe-backed
 sessions, not full PTYs. Completed responses include the exit status, bounded
-output tail, and full log ID. The agent can inspect files while a command runs;
-new commands, project edits, restoration and task completion wait until it finishes.
-This prevents duplicate builds and checks racing with edits.
+output tail, and full log ID. The default `mode: "finite"` covers builds, tests,
+scripts and commands that modify files. The agent can inspect or plan while finite
+work runs; further workspace writes and validation wait for it to finish.
+Use `mode: "background"` with a `reason` to keep a needed application or server
+open during development. Background mode does not turn an unfinished build, test
+or file mutation into safe completed work. Launch the application directly rather
+than a shell command ending with `&`: Chuggin cleans up process-group descendants
+when their parent command exits and reports `descendant_cleanup_reason`.
 
 A fresh, read-only **watchdog** inspects long-running processes. The default first
 review is after 120 seconds, configurable in observation Settings as **Command
@@ -558,10 +616,24 @@ model calls or while waiting for a command; they do not interrupt an in-flight
 model request or require parallel Ollama inference.
 
 Both model-requested commands and final checkpoint checks use this mechanism.
-Unfinished commands are awaited before checkpoint verification; running checks
-never count as passing. Sessions belong to the current cycle and are not reattached
-on restart. Errors or normal shutdown clean up owned processes; force stop kills
-the active process group. Files and command logs are retained. Session metadata
+Sessions belong to the controller and retain their command IDs across model turns,
+cycles, pauses, run timers and ordinary Stop/Resume. Ending a work interval returns
+control promptly while commands remain observable. Finite work must finish before
+checkpoint verification; running, interrupted and unexecuted checks never count
+as passing. Intentionally open background apps can remain while development and
+configured validation continue.
+
+An explicit controller close can clean up its loop-owned commands with
+`cleanup_commands: true` and a recorded reason. An idle controller upgrade uses
+this cleanup before starting the new version. Operator-owned or external commands
+must finish before that close. The terminal shows shutdown progress and waits for
+the previous controller to release its project locks before opening the replacement.
+Startup errors show output from the current attempt; earlier run logs stay on disk.
+Ordinary soft stops and automatic idle-close attempts
+retain live sessions. Force stop terminates active process groups. Command records
+and resume notices explain intentional cleanup so it is not mistaken for an
+unexplained application crash. Processes are not reattached after the controller
+exits. Files and command logs are retained. Session metadata
 is saved beside logs as `*.session.json`; `watchdog-*/decision.json` and diagnostic
 artifacts record each assessment. The observation sidebar shows command elapsed
 time and time until its next review.
@@ -571,7 +643,8 @@ continued conversations retrieve the original evidence even after command number
 repeat. Legacy IDs without a cycle prefix refer only to the current cycle.
 Commands and checks share
 the live output view and process-group cleanup on completion or explicit termination.
-Long-running applications can be inspected during a cycle, but are not detached services.
+Background applications remain owned and observable until targeted stop or
+explicit controller cleanup.
 
 **compiler_diagnostics** is a Rust helper that requires a Cargo manifest. It runs
 Cargo check for all targets and returns grouped errors/warnings, source locations,
@@ -624,7 +697,8 @@ This also works before goal setup: your choices are saved in this directory and
 carried into goal drafting and the accepted project configuration. **Settings**
 opens common project settings: model, context and response limits, request timeout,
 run duration, active hours, and optional goal completion. **More project settings**
-contains chat model, investigation helpers, tool requests, command review, and MCP.
+contains setup and chat models, their thinking settings, investigation helpers,
+tool requests, command review, and MCP.
 **Global settings** contains shared provider connections and defaults; existing
 project overrides still take precedence. Both submenus are available directly
 from Home in new and configured projects. Preferences saved before setup live in
@@ -634,7 +708,23 @@ Context and response limits offer presets and a
 Custom option. Request settings apply to the next request without interrupting
 the current one.
 
-Defaults: 32,768 context tokens, 4,096 output tokens, thinking disabled, and up to
+The setup model can differ from the loop model: use a larger model to investigate
+and define the goal, then a smaller model for ongoing work. An unset setup or chat
+model uses the loop model. Global settings supply defaults for new projects;
+project settings take precedence.
+
+Thinking is configured separately for setup, the loop, chat, and helpers. Each
+defaults to **Model default**, which omits a reasoning override from requests.
+The selector discovers the exact supported values from Ollama's `/api/show` and
+OpenRouter's model metadata, or the authorized ChatGPT account catalog. Groq options use documented model-specific mappings,
+because its model list does not advertise reasoning levels. Unknown models and
+providers offer Model default until their controls can be verified. Where the
+provider advertises them, choices include on/off, effort levels, or a reasoning
+token budget. Explicit unsupported choices produce an error rather than silently
+changing their meaning. Reasoning tokens share the provider's response allowance
+and can increase latency and usage.
+
+Defaults: 32,768 context tokens, 4,096 output tokens, Model default thinking, and up to
 48 work steps per cycle, with bounded request recovery within each step.
 The context setting supports million-token windows and has no model-independent
 cap beyond its 32-bit token count. Choose a window supported by your model and

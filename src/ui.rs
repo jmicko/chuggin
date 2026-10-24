@@ -301,6 +301,26 @@ fn render_selection(
     offset: u16,
     detail: &str,
 ) {
+    render_selection_footer(
+        f,
+        title,
+        items,
+        selected,
+        offset,
+        detail,
+        "↑ ↓ select · Enter confirm · Esc back",
+    );
+}
+
+fn render_selection_footer(
+    f: &mut Frame,
+    title: &str,
+    items: &[String],
+    selected: usize,
+    offset: u16,
+    detail: &str,
+    footer: &str,
+) {
     base(f);
     let outer = f.area().inner(Margin::new(3, 1));
     let has_detail = !detail.trim().is_empty();
@@ -368,14 +388,16 @@ fn render_selection(
         width,
         height,
     );
+    let available = area.height.saturating_sub(header_height + 2);
+    let choices_height = if has_detail {
+        menu_height.min(available.saturating_sub(details_height.min(available / 2)))
+    } else {
+        menu_height.min(available)
+    };
     let rows = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(0),
-        Constraint::Length(
-            menu_height
-                .min(area.height.saturating_sub(header_height + 2))
-                .max(3),
-        ),
+        Constraint::Length(choices_height.max(3)),
         Constraint::Length(2),
     ])
     .split(area);
@@ -402,10 +424,188 @@ fn render_selection(
         rows[2],
         &mut state,
     );
-    f.render_widget(
-        p("↑ ↓ select · Enter confirm · Esc back").fg(MUTED),
-        rows[3],
-    );
+    f.render_widget(p(footer.to_owned()).fg(MUTED), rows[3]);
+}
+
+/// A catalog is inspected locally; neither filtering nor selecting a row sends
+/// project content to the provider. Refresh and connection editing stay explicit.
+pub fn select_model(
+    title: &str,
+    provider: crate::model_picker::Provider,
+    entries: &[crate::model_picker::Entry],
+    current: &str,
+    checked: &str,
+) -> Result<crate::model_picker::Action> {
+    use crate::model_picker::Action;
+    let mut all = false;
+    let mut query = String::new();
+    let mut searching = false;
+    let mut error = String::new();
+    let mut initial = true;
+    let mut index = 0usize;
+    loop {
+        let needle = query.to_lowercase();
+        let visible: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                (all || e.selectable)
+                    && (needle.is_empty()
+                        || e.id.to_lowercase().contains(&needle)
+                        || e.name.to_lowercase().contains(&needle))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if initial {
+            index = visible
+                .iter()
+                .position(|i| entries[*i].id == current)
+                .unwrap_or(0);
+            initial = false;
+        }
+        let mut rows: Vec<_> = visible
+            .iter()
+            .map(|i| clean(&entries[*i].row(current)))
+            .collect();
+        rows.extend([
+            "Refresh model list".into(),
+            "Connection settings…".into(),
+            "Choose another provider".into(),
+            "Cancel selection".into(),
+        ]);
+        index = index.min(rows.len() - 1);
+        let selected_detail = visible.get(index).map(|i| entries[*i].details()).unwrap_or_else(|| if visible.is_empty() { "No matching selectable models. Refresh, change provider, or press A to inspect all catalog entries.".into() } else { "Choose an action below.".into() });
+        let missing_current = !current.is_empty() && !entries.iter().any(|e| e.id == current);
+        let detail = format!(
+            "{} · checked {checked} · {} models{}\n{}\n{}{}{}{}",
+            provider.label(),
+            visible.len(),
+            if all {
+                " · showing all catalog entries"
+            } else {
+                " · selectable only"
+            },
+            selected_detail,
+            provider.description(),
+            if missing_current {
+                format!("\nCurrent selection {current} is not listed by this provider.")
+            } else {
+                String::new()
+            },
+            if query.is_empty() {
+                String::new()
+            } else {
+                format!("\nSearch: {query}")
+            },
+            if error.is_empty() {
+                String::new()
+            } else {
+                format!("\n{error}")
+            }
+        );
+        if !active() {
+            notice(detail);
+            return Ok(match crate::menu::select(title, &rows, index)? {
+                Some(i) if i < visible.len() => Action::Select(visible[i]),
+                Some(i) if i == visible.len() => Action::Refresh,
+                Some(i) if i == visible.len() + 1 => Action::Connection,
+                Some(i) if i == visible.len() + 2 => Action::Provider,
+                Some(_) => Action::Cancel,
+                None => Action::Provider,
+            });
+        }
+        draw(|f| {
+            render_selection_footer(
+                f,
+                title,
+                &rows,
+                index,
+                0,
+                &detail,
+                if searching {
+                    "Type to search · Enter browse · Esc clear search"
+                } else {
+                    "↑ ↓ select · Enter choose · / search · R refresh\nC connection · A all entries · Esc providers"
+                },
+            )
+        })?;
+        if let Some(event) = input()? {
+            if let Input::Paste(text) = &event {
+                query.push_str(&clean(text));
+                index = 0;
+                searching = true;
+            }
+            if let Some(key) = pressed(&event) {
+                if searching {
+                    match key.code {
+                        KeyCode::Esc => {
+                            searching = false;
+                            query.clear();
+                            index = 0;
+                        }
+                        KeyCode::Enter => searching = false,
+                        KeyCode::Backspace => {
+                            query.pop();
+                            index = 0;
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            query.clear();
+                            index = 0;
+                        }
+                        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            query.push(ch);
+                            index = 0;
+                        }
+                        KeyCode::Up => {
+                            searching = false;
+                            index = index.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            searching = false;
+                            index = (index + 1).min(rows.len() - 1);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => index = index.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => index = (index + 1).min(rows.len() - 1),
+                    KeyCode::Home => index = 0,
+                    KeyCode::End => index = rows.len() - 1,
+                    KeyCode::PageUp => index = index.saturating_sub(8),
+                    KeyCode::PageDown => index = (index + 8).min(rows.len() - 1),
+                    KeyCode::Char('/') => searching = true,
+                    KeyCode::Char('r' | 'R') => return Ok(Action::Refresh),
+                    KeyCode::Char('c' | 'C') => return Ok(Action::Connection),
+                    KeyCode::Char('a' | 'A') => {
+                        all = !all;
+                        index = 0;
+                        error.clear();
+                    }
+                    KeyCode::Enter => {
+                        if let Some(entry) = visible.get(index).map(|i| &entries[*i]) {
+                            if !entry.selectable {
+                                error = format!("Cannot select this model: {}", entry.explanation);
+                            } else {
+                                return Ok(Action::Select(visible[index]));
+                            }
+                        } else {
+                            return Ok(match index - visible.len() {
+                                0 => Action::Refresh,
+                                1 => Action::Connection,
+                                2 => Action::Provider,
+                                _ => Action::Cancel,
+                            });
+                        }
+                    }
+                    KeyCode::Left => return Ok(Action::Provider),
+                    _ if cancelled(key) => return Ok(Action::Provider),
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 pub fn select(title: &str, items: &[String], default: usize) -> Result<Option<usize>> {
@@ -738,7 +938,8 @@ struct Dashboard {
     task: String,
     cycle: u64,
     calls: u64,
-    prompt: u64,
+    context_usage: Option<crate::context_usage::Usage>,
+    context_restored: bool,
     generated: u64,
     speed: f64,
     request_active: bool,
@@ -796,7 +997,12 @@ impl Dashboard {
             task: "Waiting for the next task".into(),
             cycle: 0,
             calls: 0,
-            prompt: 0,
+            context_usage: crate::context_usage::load(
+                &config.state_dir,
+                &config.model,
+                config.context_tokens,
+            ),
+            context_restored: true,
             generated: 0,
             speed: 0.,
             request_active: false,
@@ -1063,7 +1269,22 @@ impl Dashboard {
                 self.recovery = recovery;
                 self.commit_pending = pending;
             }
-            Event::RequestModel(name) => self.active_model = name,
+            Event::RequestModel(name) => {
+                if self
+                    .context_usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.model != name)
+                {
+                    self.context_usage = None;
+                }
+                self.active_model = name;
+            }
+            Event::ContextUsage(usage) => {
+                if usage.model == self.active_model {
+                    self.context_usage = Some(usage);
+                    self.context_restored = false;
+                }
+            }
             Event::RequestFinished => self.request_active = false,
             Event::ProviderWait { reason, seconds } => {
                 self.request_active = false;
@@ -1112,11 +1333,8 @@ impl Dashboard {
                 self.stream(Kind::Model, &s);
             }
             Event::Metrics {
-                prompt,
-                generated,
-                seconds,
+                generated, seconds, ..
             } => {
-                self.prompt = prompt;
                 self.generated += generated;
                 self.speed = if seconds > 0. {
                     generated as f64 / seconds
@@ -1442,7 +1660,7 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
     lines.extend([
         Line::from(""),
         Line::from("↑↓ select · Enter edit/save · Ctrl+U clear · Esc cancel"),
-        Line::from("Model, token limits and timeout apply to the NEXT request."),
+        Line::from("Model, thinking, token limits and timeout apply to the NEXT request."),
         Line::from(format!("Current/last request model: {}", d.active_model)),
         Line::from("Timer changes apply now, measured from this run's start."),
         Line::from("An expired timer finishes the cycle; it never cancels a call."),
@@ -1897,24 +2115,37 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             p(Text::from(vec![
                 Line::from(if d.helper.is_some() {
                     "CONTEXT · HELPER RESPONSE"
+                } else if d.context_usage.is_none() {
+                    "CONTEXT · NOT REPORTED"
+                } else if d.context_restored {
+                    "CONTEXT · SAVED RESPONSE"
                 } else {
-                    "CONTEXT · LAST RESPONSE"
+                    "CONTEXT · LAST REPORTED"
                 })
                 .fg(CYAN)
                 .bold(),
                 Line::from(if let Some(helper) = &d.helper {
-                    format!("{} input tokens", helper.prompt)
+                    if helper.prompt > 0 {
+                        format!("{} input tokens", helper.prompt)
+                    } else {
+                        "Awaiting usage report".into()
+                    }
+                } else if let Some(usage) = &d.context_usage {
+                    format!("{} / {} tokens", usage.prompt, usage.context_tokens)
                 } else {
-                    format!("{} / {} tokens", d.prompt, c.context_tokens)
+                    "Awaiting usage report".into()
                 }),
             ])),
             side[1],
         );
-        if side[1].height > 2 && d.helper.is_none() {
+        if side[1].height > 2
+            && d.helper.is_none()
+            && let Some(usage) = &d.context_usage
+        {
             f.render_widget(
                 Gauge::default()
                     .gauge_style(Style::default().fg(ACCENT).bg(BG))
-                    .ratio((d.prompt as f64 / c.context_tokens.max(1) as f64).clamp(0., 1.))
+                    .ratio((usage.prompt as f64 / usage.context_tokens.max(1) as f64).clamp(0., 1.))
                     .label(""),
                 Rect::new(side[1].x, side[1].y + 2, side[1].width, 1),
             );
@@ -2083,7 +2314,7 @@ fn dashboard_session(
     // Identity setup can prompt, so complete it on the thread that owns the terminal.
     crate::setup::ensure_git_identity(&config.repo)?;
     let mut d = Dashboard::new(&config);
-    let client = crate::engine::Client::connect(path)?;
+    let client = crate::engine::Client::connect_interactive(path)?;
     if start {
         resume_client(&client)?;
     }
@@ -2300,6 +2531,12 @@ fn dashboard_session(
                             KeyCode::Enter => {
                                 use crate::setup::ProjectSetting;
                                 match crate::setup::PROJECT_SETTINGS[d.settings_selected] {
+                                    ProjectSetting::Model => {
+                                        crate::setup::choose_project_model(Some(path))?
+                                    }
+                                    ProjectSetting::Thinking => {
+                                        crate::setup::choose_project_reasoning(Some(path))?
+                                    }
                                     ProjectSetting::ActiveHours => {
                                         crate::setup::active_hours_menu(Some(path))?
                                     }
@@ -2461,11 +2698,14 @@ pub fn busy<T: Send + 'static>(
     });
     let started = Instant::now();
     let mut output = String::new();
+    let mut status = clean(label);
     let response = (|| -> Result<T> {
         loop {
             for event in rx.try_iter().take(4096) {
-                if let Event::Delta(s) = event {
-                    output.push_str(&clean(&s));
+                match event {
+                    Event::Delta(s) => output.push_str(&clean(&s)),
+                    Event::Phase(s) => status = clean(&s),
+                    _ => {}
                 }
             }
             if output.len() > 12000 {
@@ -2488,25 +2728,26 @@ pub fn busy<T: Send + 'static>(
                 let area = f.area().inner(Margin::new(3, 2));
                 let spinner =
                     ["◐", "◓", "◑", "◒"][(started.elapsed().as_millis() / 200 % 4) as usize];
-                let lines: Vec<_> =
-                    textwrap::wrap(&output, area.width.saturating_sub(3).max(1) as usize)
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
+                let heading = format!(
+                    "{spinner} {status} · {}",
+                    duration(started.elapsed().as_secs())
+                );
+                let content_width = area.width.saturating_sub(3).max(1) as usize;
+                let heading_rows = textwrap::wrap(&heading, content_width).len();
+                let lines: Vec<_> = textwrap::wrap(&output, content_width)
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
                 let tail = lines
                     .iter()
                     .rev()
-                    .take(area.height.saturating_sub(4) as usize)
+                    .take((area.height as usize).saturating_sub(heading_rows + 3))
                     .rev()
                     .cloned()
                     .collect::<Vec<_>>()
                     .join("\n");
                 f.render_widget(
-                    p(format!(
-                        "{spinner} {label} · {}\n\n{tail}",
-                        duration(started.elapsed().as_secs())
-                    ))
-                    .block(panel("CHUGGIN · Working")),
+                    p(format!("{heading}\n\n{tail}")).block(panel("CHUGGIN · Working")),
                     area,
                 );
             })?;
@@ -2529,6 +2770,24 @@ pub fn busy<T: Send + 'static>(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    #[test]
+    fn long_model_catalog_keeps_selected_model_details_and_navigation_visible() {
+        let choices: Vec<String> = (0..80).map(|i| format!("model-{i} · Free")).collect();
+        for (width, height) in [(110, 36), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| render_selection_footer(
+                f, "Choose model for this project", &choices, 63, 0,
+                "OpenCode Zen · checked 12:34:56\nSelected model: model-63\nModel ID: zen/model-63\nFree · context: 128000 tokens\nCatalog refresh does not generate a response.",
+                "↑ ↓ select · Enter choose · / search · R refresh\nC connection · A all entries · Esc providers",
+            )).unwrap();
+            let text = screen_text(&terminal);
+            assert!(text.contains("Selected model: model-63"));
+            assert!(text.contains("zen/model-63"));
+            assert!(text.contains("R refresh"));
+            assert!(text.contains("Esc providers"));
+            assert!(text.contains("model-63 · Free"));
+        }
+    }
     #[test]
     fn helper_activity_is_visible_without_changing_main_request_counters() {
         let c = config();
@@ -2563,7 +2822,7 @@ mod tests {
         );
         assert_eq!(d.calls, 0);
         assert_eq!(d.generated, 0);
-        assert_eq!(d.prompt, 0);
+        assert!(d.context_usage.is_none());
         let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
         terminal
             .draw(|f| render_dashboard(f, &mut d, &c, false))
@@ -2606,7 +2865,10 @@ mod tests {
         c.context_tokens = 1_048_576;
         let mut d = Dashboard::new(&c);
         d.tab = 4;
-        d.settings_selected = 1;
+        d.settings_selected = crate::setup::PROJECT_SETTINGS
+            .iter()
+            .position(|setting| matches!(setting, crate::setup::ProjectSetting::Context))
+            .unwrap();
         d.scroll = 500;
         for (width, height) in [(80, 24), (100, 30)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -2623,7 +2885,10 @@ mod tests {
         let c = config();
         let mut d = Dashboard::new(&c);
         d.tab = 4;
-        d.settings_selected = 8;
+        d.settings_selected = crate::setup::PROJECT_SETTINGS
+            .iter()
+            .position(|setting| matches!(setting, crate::setup::ProjectSetting::Global))
+            .unwrap();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|f| render_dashboard(f, &mut d, &c, false))
@@ -2679,6 +2944,124 @@ mod tests {
                 .any(|e| e.text.contains("could not be displayed"))
         );
     }
+
+    #[test]
+    fn cold_start_restores_reported_context_without_recounting_session_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config();
+        c.state_dir = dir.path().into();
+        let usage = crate::context_usage::Usage {
+            prompt: 156789,
+            model: c.model.clone(),
+            context_tokens: 262144,
+            recorded_at: Some("2026-10-05T06:00:00Z".into()),
+        };
+        let saved = serde_json::json!({"messages":[],"last_context_usage":usage}).to_string();
+        fs::write(dir.path().join("conversation.json"), &saved).unwrap();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::RequestModel(c.model.clone()));
+        d.apply(Event::Request);
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.contains("CONTEXT · SAVED RESPONSE"));
+        assert!(text.contains("156789 / 262144 tokens"));
+        assert!(text.contains("This session: 0 finished"));
+        assert!(text.contains("Generated: 0 tokens"));
+        assert_eq!(d.calls, 1);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("conversation.json")).unwrap(),
+            saved
+        );
+
+        d.apply(Event::ContextUsage(crate::context_usage::Usage {
+            prompt: 1234,
+            model: c.model.clone(),
+            context_tokens: c.context_tokens,
+            recorded_at: None,
+        }));
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.contains("CONTEXT · LAST REPORTED"));
+        assert!(text.contains("1234 / 128000 tokens"));
+        assert!(!text.contains("SAVED RESPONSE"));
+    }
+
+    #[test]
+    fn unavailable_usage_is_unknown_and_observer_metrics_do_not_replace_main_context() {
+        let mut c = config();
+        let dir = tempfile::tempdir().unwrap();
+        c.state_dir = dir.path().into();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::Metrics {
+            prompt: 0,
+            generated: 10,
+            seconds: 1.0,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.contains("Awaiting usage report"));
+        assert!(!text.contains("0 / 128000 tokens"));
+
+        d.apply(Event::ContextUsage(crate::context_usage::Usage {
+            prompt: 40000,
+            model: c.model.clone(),
+            context_tokens: c.context_tokens,
+            recorded_at: None,
+        }));
+        d.apply(Event::Metrics {
+            prompt: 700,
+            generated: 20,
+            seconds: 1.0,
+        });
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.contains("40000 / 128000 tokens"));
+        assert!(!text.contains("700 / 128000 tokens"));
+    }
+
+    #[test]
+    fn switching_model_does_not_present_previous_model_usage_as_current() {
+        let c = config();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::ContextUsage(crate::context_usage::Usage {
+            prompt: 40000,
+            model: c.model.clone(),
+            context_tokens: c.context_tokens,
+            recorded_at: None,
+        }));
+        d.apply(Event::RequestModel("different-model".into()));
+        assert!(d.context_usage.is_none());
+        // A late usage event from an earlier retry must not undo the switch.
+        d.apply(Event::ContextUsage(crate::context_usage::Usage {
+            prompt: 40000,
+            model: c.model.clone(),
+            context_tokens: c.context_tokens,
+            recorded_at: None,
+        }));
+        assert!(d.context_usage.is_none());
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal
+            .draw(|f| render_dashboard(f, &mut d, &c, false))
+            .unwrap();
+        assert!(screen_text(&terminal).contains("Awaiting usage report"));
+        d.apply(Event::ContextUsage(crate::context_usage::Usage {
+            prompt: 6000,
+            model: "different-model".into(),
+            context_tokens: 8192,
+            recorded_at: None,
+        }));
+        assert_eq!(d.context_usage.as_ref().unwrap().prompt, 6000);
+    }
     #[test]
     fn nudge_editor_visible_while_paused() {
         let c = config();
@@ -2707,7 +3090,7 @@ mod tests {
         assert_eq!(e.value, "héllo\nworld");
     }
     fn config() -> runner::Config {
-        runner::Config {helpers:crate::agents::Settings::default(),chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
+        runner::Config {reasoning:crate::reasoning::Setting::Default,setup_model:String::new(),setup_reasoning:crate::reasoning::Setting::Default,chat_reasoning:crate::reasoning::Setting::Default,helpers:crate::agents::Settings::default(),chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
     }
     fn screen_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();
@@ -2770,6 +3153,12 @@ mod tests {
                 "Add document container with paragraph iteration".into(),
             ));
             d.apply(Event::Phase("Work".into()));
+            d.apply(Event::ContextUsage(crate::context_usage::Usage {
+                prompt: 7641,
+                model: c.model.clone(),
+                context_tokens: c.context_tokens,
+                recorded_at: None,
+            }));
             d.apply(Event::Metrics {
                 prompt: 7641,
                 generated: 2137,

@@ -52,6 +52,9 @@ pub struct Controller {
     lease: Mutex<Option<Lease>>,
     sessions: Mutex<BTreeMap<String, Instant>>,
     commands: Mutex<BTreeMap<String, OwnedJob>>,
+    loop_commands: Mutex<runner::Commands>,
+    pub(crate) lifecycle: Mutex<()>,
+    pub(crate) closing: AtomicBool,
     operations: Mutex<()>,
     release_when_idle: Mutex<BTreeMap<String, String>>,
     settings: Mutex<()>,
@@ -115,13 +118,16 @@ impl Controller {
         }
         Ok(Arc::new(Self {
             path,
-            controls,
+            controls: controls.clone(),
             stop: Arc::default(),
             running: Arc::default(),
             generation: AtomicU64::new(0),
             lease: Mutex::new(None),
             sessions: Mutex::default(),
             commands: Mutex::default(),
+            loop_commands: Mutex::new(runner::Commands::new(controls)),
+            lifecycle: Mutex::new(()),
+            closing: AtomicBool::new(false),
             operations: Mutex::new(()),
             release_when_idle: Mutex::default(),
             settings: Mutex::new(()),
@@ -172,6 +178,11 @@ impl Controller {
         count: Option<u64>,
         reopen: bool,
     ) -> Result<Value> {
+        let _admission = self.lifecycle.lock().unwrap();
+        ensure!(
+            !self.closing.load(Ordering::SeqCst),
+            "Controller is closing; reconnect before resuming"
+        );
         ensure!(
             ["scheduled", "one_cycle", "until_close"].contains(&mode),
             "Unknown resume mode"
@@ -207,11 +218,16 @@ impl Controller {
         std::thread::spawn(move || {
             crate::events::set_actor("loop");
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runner::run_controlled(
+                let mut commands = engine
+                    .loop_commands
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                runner::run_controlled_with_commands(
                     &engine.path,
                     count,
                     engine.stop.clone(),
                     engine.controls.clone(),
+                    &mut commands,
                 )
             }));
             *engine.last_error.lock().unwrap() = match result {
@@ -234,6 +250,55 @@ impl Controller {
         let started = *self.started.lock().unwrap();
         ended.or_else(|| started.map(|t| self.controls.active_elapsed(t).as_secs()))
     }
+    /// Only an explicit controller close owns cleanup; soft stops retain sessions.
+    pub fn shutdown_loop_commands(&self, reason: &str) -> Result<()> {
+        ensure!(
+            !self.running.load(Ordering::SeqCst),
+            "Stop the loop before closing its commands"
+        );
+        let mut commands = match self.loop_commands.try_lock() {
+            Ok(commands) => commands,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                anyhow::bail!("Loop worker is still releasing its command ownership")
+            }
+        };
+        let owned = commands.owned_pids();
+        ensure!(
+            project::active_checks()
+                .iter()
+                .all(|pid| owned.contains(pid)),
+            "Operator or external commands are still running; finish those commands before closing the controller"
+        );
+        commands.shutdown(&self.config()?.state_dir, reason)
+    }
+    pub fn force_stop_loop_commands(&self) -> Result<()> {
+        self.stop.store(true, Ordering::SeqCst);
+        let reason =
+            "Operator force-stopped the controller; loop-owned commands stopped, not verified";
+        let mut updates = crate::command_session::stop_actor("loop", reason)?;
+        if updates.is_empty() {
+            return Ok(());
+        }
+        for update in &mut updates {
+            update["command_id"] = update["job_id"].clone();
+            update["artifact_directory"] = json!(
+                update["log"]
+                    .as_str()
+                    .and_then(|log| Path::new(log).parent())
+            );
+        }
+        let path = self.config()?.state_dir.join("command-lifecycle.json");
+        let mut notices: Vec<Value> = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        notices.push(json!({"command_updates":updates,"reason":reason,"instruction":"Chuggin intentionally closed these processes during force stop. Inspect stop_reason and saved output before retrying. Interrupted work and unrun checks are not passing validation; this is not an unexplained application crash."}));
+        if notices.len() > 32 {
+            notices.drain(..notices.len() - 32);
+        }
+        crate::setup::save(&path, &notices)
+    }
     pub fn status(&self) -> Result<Value> {
         let c = self.config()?;
         let lease = self
@@ -243,7 +308,7 @@ impl Controller {
             .as_ref()
             .map(|l| json!({"session":l.session,"granted":l.granted}));
         Ok(
-            json!({"version":env!("CARGO_PKG_VERSION"),"config":self.path,"project":c.repo,"running":self.running.load(Ordering::SeqCst),"paused":self.controls.is_paused(),"pause_requested":self.controls.pause_requested(),"manual_pause":self.controls.manual_pause(),"holds":self.controls.reasons(),"schedule":self.controls.schedule_status().ok(),"stop_requested":self.stop.load(Ordering::SeqCst),"active_commands":project::active_checks(),"editing":lease,"interrupted_editing":read_json(&c.state_dir.join("operator/editing.json")).ok(),"interrupted_controller":read_json(&c.state_dir.join("operator/interrupted-controller.json")).ok(),"generation":self.generation.load(Ordering::SeqCst),"model":c.model,"goal":c.goal,"state":read_json(&c.state_dir.join("state.json")).ok().map(|v|compact_state(&v)),"active_elapsed_seconds":self.elapsed(),"nudges":crate::nudge::read(&c.state_dir)?,"last_error":self.last_error.lock().unwrap().clone()}),
+            json!({"version":env!("CARGO_PKG_VERSION"),"config":self.path,"project":c.repo,"running":self.running.load(Ordering::SeqCst),"closing":self.closing.load(Ordering::SeqCst),"paused":self.controls.is_paused(),"pause_requested":self.controls.pause_requested(),"manual_pause":self.controls.manual_pause(),"holds":self.controls.reasons(),"schedule":self.controls.schedule_status().ok(),"stop_requested":self.stop.load(Ordering::SeqCst),"active_commands":project::active_checks(),"editing":lease,"interrupted_editing":read_json(&c.state_dir.join("operator/editing.json")).ok(),"interrupted_controller":read_json(&c.state_dir.join("operator/interrupted-controller.json")).ok(),"generation":self.generation.load(Ordering::SeqCst),"model":c.model,"goal":c.goal,"state":read_json(&c.state_dir.join("state.json")).ok().map(|v|compact_state(&v)),"active_elapsed_seconds":self.elapsed(),"nudges":crate::nudge::read(&c.state_dir)?,"last_error":self.last_error.lock().unwrap().clone()}),
         )
     }
     pub fn begin_edit(&self, session: &str) -> Result<Value> {
@@ -271,7 +336,7 @@ impl Controller {
         let l = lease.as_mut().unwrap();
         if !l.granted
             && (!self.running.load(Ordering::SeqCst) || self.controls.is_paused())
-            && project::active_checks().is_empty()
+            && crate::command_session::workspace_checks().is_empty()
         {
             let c = self.config()?;
             l.baseline = crate::workspace::tree(&c.repo, Some(&c.state_dir))?;
@@ -304,13 +369,13 @@ impl Controller {
         ensure!(l.session == session, "Another operator owns editing");
         ensure!(
             !l.granted
-                || (project::active_checks().is_empty()
+                || (crate::command_session::workspace_checks().is_empty()
                     && !self
                         .commands
                         .lock()
                         .unwrap()
                         .values()
-                        .any(|(_, j)| j.lock().unwrap().running())),
+                        .any(|(_, j)| j.lock().unwrap().blocks_workspace())),
             "Commands are still running; editing ownership is retained"
         );
         let c = self.config()?;
@@ -399,6 +464,52 @@ impl Controller {
         Ok(
             json!({"status":"complete","result":{"revision":config_revision(&self.path)?,"settings":config}}),
         )
+    }
+
+    /// Human connection setup can save an endpoint and role selection together.
+    /// This operation is deliberately absent from the model/MCP tool schemas.
+    pub(crate) fn update_human_settings(&self, args: &Value) -> Result<Value> {
+        let result = self.update_working_settings(args, true)?;
+        Ok(json!({"status":"complete","result":result}))
+    }
+
+    fn update_working_settings(&self, args: &Value, human: bool) -> Result<Value> {
+        let _guard = self.settings.lock().unwrap();
+        check_revision(&self.path, args)?;
+        let mut config = read_json(&self.path)?;
+        let patch = args["settings"]
+            .as_object()
+            .context("settings must be an object")?;
+        for (key, value) in patch {
+            let ordinary = [
+                "model",
+                "reasoning",
+                "setup_model",
+                "setup_reasoning",
+                "chat_model",
+                "chat_reasoning",
+                "active_hours",
+                "run_duration_seconds",
+                "request_timeout_seconds",
+                "command_review_seconds",
+                "allow_goal_completion",
+                "context_tokens",
+                "output_tokens",
+            ]
+            .contains(&key.as_str());
+            ensure!(
+                ordinary || (human && ["ollama_url", "helpers"].contains(&key.as_str())),
+                "Setting {key} is managed in human connection setup"
+            );
+            config[key] = value.clone();
+        }
+        let proposed = runner::load_value(&self.path, &config)?;
+        proposed.active_hours.at(chrono::Utc::now())?;
+        crate::setup::save(&self.path, &config)?;
+        if patch.contains_key("active_hours") {
+            self.controls.respect_schedule();
+        }
+        Ok(json!({"revision":config_revision(&self.path)?,"settings":config}))
     }
     pub fn operation_path(&self, session: &str, operation: &str) -> Result<PathBuf> {
         valid_id(session)?;
@@ -493,7 +604,7 @@ impl Controller {
                     "Confirm all external editing processes have stopped before recovering ownership"
                 );
                 ensure!(
-                    project::active_checks().is_empty(),
+                    crate::command_session::workspace_checks().is_empty(),
                     "Managed commands are still running; inspect list_commands first"
                 );
                 let path = c.state_dir.join("operator/editing.json");
@@ -577,45 +688,7 @@ impl Controller {
             "get_settings" => Ok(
                 json!({"revision":config_revision(&self.path)?,"settings":read_json(&self.path)?}),
             ),
-            "update_settings" => {
-                let _guard = self.settings.lock().unwrap();
-                check_revision(&self.path, args)?;
-                let mut v = read_json(&self.path)?;
-                let patch = args["settings"]
-                    .as_object()
-                    .context("settings must be an object")?;
-                for (key, val) in patch {
-                    ensure!(
-                        [
-                            "model",
-                            "chat_model",
-                            "active_hours",
-                            "run_duration_seconds",
-                            "request_timeout_seconds",
-                            "command_review_seconds",
-                            "allow_goal_completion",
-                            "context_tokens",
-                            "output_tokens"
-                        ]
-                        .contains(&key.as_str()),
-                        "Setting {key} is managed in human connection setup"
-                    );
-                    v[key] = val.clone();
-                }
-                let proposed: runner::Config = serde_json::from_value(v.clone())?;
-                proposed.active_hours.at(chrono::Utc::now())?;
-                proposed.helpers.validate()?;
-                runner::validate_token_limits(proposed.context_tokens, proposed.output_tokens)?;
-                ensure!(
-                    !proposed.model.trim().is_empty() && proposed.command_review_seconds > 0,
-                    "Invalid model or working settings"
-                );
-                crate::setup::save(&self.path, &v)?;
-                if patch.contains_key("active_hours") {
-                    self.controls.respect_schedule();
-                }
-                Ok(json!({"revision":config_revision(&self.path)?,"settings":v}))
-            }
+            "update_settings" => self.update_working_settings(args, false),
             "set_goal" => {
                 let _guard = self.settings.lock().unwrap();
                 check_revision(&self.path, args)?;
@@ -682,7 +755,7 @@ impl Controller {
                         "Show preview_restore and obtain the user's restoration request first"
                     );
                     ensure!(
-                        project::active_checks().is_empty(),
+                        crate::command_session::workspace_checks().is_empty(),
                         "Finish commands before restoring"
                     );
                     let target = restore_target(&c, text(args, "target")?)?;
@@ -703,7 +776,7 @@ impl Controller {
                 }
                 if name == "commit_changes" {
                     ensure!(
-                        project::active_checks().is_empty(),
+                        crate::command_session::workspace_checks().is_empty(),
                         "Finish running commands before committing"
                     );
                     let tree = crate::workspace::tree(&c.repo, Some(&c.state_dir))?;
@@ -729,6 +802,13 @@ impl Controller {
                     return Ok(json!({"reference":reference,"changed":changed}));
                 }
                 if name == "run_command" || name == "run_checks" {
+                    let mode = if name == "run_command" {
+                        serde_json::from_value(args.get("mode").cloned().unwrap_or(json!("finite")))
+                            .context("mode must be finite or background")?
+                    } else {
+                        crate::command_jobs::CommandMode::Finite
+                    };
+                    let purpose = args["reason"].as_str().unwrap_or("");
                     let checks = if name == "run_checks" {
                         c.checks.clone()
                     } else {
@@ -748,13 +828,14 @@ impl Controller {
                         checks,
                         name == "run_checks",
                         false,
-                    )?;
-                    job.poll(0, &AtomicBool::new(false))?;
+                    )?
+                    .with_mode(mode, purpose)?;
+                    let result = job.poll(0, &AtomicBool::new(false))?;
                     self.commands
                         .lock()
                         .unwrap()
                         .insert(command.clone(), (session.into(), Arc::new(Mutex::new(job))));
-                    return Ok(json!({"command_id":command,"running":true}));
+                    return Ok(result);
                 }
                 let file = text(args, "path")?;
                 ensure!(
@@ -763,7 +844,7 @@ impl Controller {
                 );
                 project::safe_path(&c.repo, file)?;
                 ensure!(
-                    project::active_checks().is_empty(),
+                    crate::command_session::workspace_checks().is_empty(),
                     "A command is still using the workspace; inspect or finish it before editing"
                 );
                 self.controls.changed.fetch_add(1, Ordering::SeqCst);
@@ -808,7 +889,12 @@ impl Controller {
                 };
                 let mut job = job.lock().unwrap();
                 if name == "stop_command" {
-                    job.terminate(args["reason"].as_str().unwrap_or("Stopped by operator"))?;
+                    let reason = text(args, "reason")?;
+                    ensure!(
+                        !reason.trim().is_empty(),
+                        "Supply a reason for stopping this command"
+                    );
+                    job.terminate(reason)?;
                 }
                 if name == "command_input" {
                     job.input(args)?;

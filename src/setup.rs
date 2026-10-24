@@ -17,6 +17,10 @@ pub struct Settings {
     pub active_hours: crate::schedule::Schedule,
     pub ollama_url: String,
     pub model: String,
+    pub setup_model: String,
+    pub reasoning: crate::reasoning::Setting,
+    pub setup_reasoning: crate::reasoning::Setting,
+    pub chat_reasoning: crate::reasoning::Setting,
     pub context_tokens: u32,
     pub output_tokens: u32,
     pub implementation_calls: u32,
@@ -30,6 +34,10 @@ impl Default for Settings {
             active_hours: crate::schedule::Schedule::Always,
             ollama_url: "http://localhost:11434".into(),
             model: String::new(),
+            setup_model: String::new(),
+            reasoning: crate::reasoning::Setting::default(),
+            setup_reasoning: crate::reasoning::Setting::default(),
+            chat_reasoning: crate::reasoning::Setting::default(),
             context_tokens: 32768,
             output_tokens: 4096,
             implementation_calls: 48,
@@ -56,6 +64,10 @@ pub fn settings() -> Result<Settings> {
 }
 const DRAFT_SETTING_FIELDS: &[&str] = &[
     "model",
+    "setup_model",
+    "reasoning",
+    "setup_reasoning",
+    "chat_reasoning",
     "ollama_url",
     "context_tokens",
     "output_tokens",
@@ -127,18 +139,21 @@ fn draft_config_with(root: &Path, defaults: &Settings, draft: &Value) -> Result<
         (1..=86400).contains(&config.command_review_seconds),
         "Command review interval must be 1–86400 seconds"
     );
-    for (label, name) in [("Model", &config.model), ("Chat model", &config.chat_model)] {
+    for (label, name) in [
+        ("Loop model", &config.model),
+        ("Setup model", &config.setup_model),
+        ("Chat model", &config.chat_model),
+    ] {
         anyhow::ensure!(
             !name.chars().any(char::is_whitespace),
             "{label} must be an exact model name without spaces"
         );
     }
-    let url = reqwest::Url::parse(&config.ollama_url).context("Enter a valid Ollama server URL")?;
-    anyhow::ensure!(
-        matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
-        "Ollama server must be an HTTP or HTTPS URL"
-    );
+    runner::validate_inference_connections(&config)?;
     config.helpers.validate()?;
+    config.reasoning.validate()?;
+    config.setup_reasoning.validate()?;
+    config.chat_reasoning.validate()?;
     if let crate::schedule::Schedule::Custom { window } = &config.active_hours {
         window.validate()?;
     }
@@ -308,27 +323,30 @@ pub fn configure(show: bool) -> Result<()> {
             .to_string(),
     );
     if io::stdin().is_terminal() {
-        let names = select_provider_models(&s)?;
-        let selected = names.iter().position(|n| n == &s.model).unwrap_or(0);
-        let Some(index) = crate::menu::select("Default model", &names, selected)? else {
-            anyhow::bail!("Setup cancelled");
+        let Some(selection) =
+            crate::model_picker::choose(&s.model, &s.ollama_url, "Choose default model · global")?
+        else {
+            return Ok(());
         };
-        s.model = names[index].clone();
-        s.ollama_url = settings()?.ollama_url;
+        s = settings()?;
+        s.model = selection.model;
+        if let Some(url) = selection.local_url {
+            s.ollama_url = url;
+        }
     } else {
-        s.ollama_url = ask("Ollama server", &s.ollama_url)?
-            .trim_end_matches('/')
-            .into();
-        let names = available_models(&s)?;
-        let chosen = ask("Model name or number", &s.model)?;
-        s.model = chosen
-            .parse::<usize>()
-            .ok()
-            .and_then(|n| n.checked_sub(1))
-            .and_then(|n| names.get(n))
-            .cloned()
-            .unwrap_or(chosen);
-        anyhow::ensure!(names.contains(&s.model), "Choose an installed Ollama model");
+        s.model = ask(
+            "Model ID (local name, groq/, chatgpt/, zen/, or openrouter/)",
+            &s.model,
+        )?;
+        if crate::model_picker::Provider::for_model(&s.model)
+            == Some(crate::model_picker::Provider::Ollama)
+        {
+            s.ollama_url = ask("Ollama server", &s.ollama_url)?
+                .trim_end_matches('/')
+                .into();
+            let names = available_models(&s)?;
+            anyhow::ensure!(names.contains(&s.model), "Choose an installed Ollama model");
+        }
     }
     s.context_tokens = token_selector(
         "Default context window",
@@ -430,94 +448,88 @@ pub fn wizard() -> Result<PathBuf> {
         }
     }
     let s = draft_config(&root)?;
-    crate::ui::clear_notes();
-    crate::ui::notice(format!(
-        "Give a short description of this project: what you want to accomplish, any important requirements, and what a successful result would look like. Chuggin will draft a goal for you to review before work starts.\n\nProject: {}\nGoal drafting model: {} on {} (change from Project model on the home menu).",
-        root.display(),
-        s.model,
-        crate::cloud::label(&s.ollama_url, &s.model)
-    ));
-    let draft_path = root.join(".chuggin/goal-draft.json");
-    let mut draft = if draft_path.exists() {
-        crate::ui::notice("Resuming your unfinished goal draft.".to_string());
-        serde_json::from_slice::<Draft>(&fs::read(&draft_path)?)?
+    let goal = if io::stdin().is_terminal() {
+        crate::goal_setup::choose_goal(&root, &s)?
     } else {
-        Draft {
-            pitch: ask("Describe what you want to build", "")?,
-            goal: String::new(),
-            feedback: String::new(),
-        }
-    };
-    save(&draft_path, &draft)?;
-    loop {
-        if draft.goal.is_empty() || !draft.feedback.is_empty() {
-            crate::ui::clear_notes();
-            crate::ui::notice("Drafting your project goal…".to_string());
-            let current = draft_config(&root)?;
-            let model = Model::new(
-                &current.ollama_url,
-                &current.model,
-                current.context_tokens,
-                current.output_tokens,
-                Arc::new(AtomicBool::new(false)),
-            )?;
-            let input = json!({"pitch":draft.pitch,"current_draft":draft.goal,"requested_changes":draft.feedback});
-            let result = crate::ui::busy("Drafting your project goal", move || {
-                model.structured::<GoalReply>(
-                "Help define a project goal for software, documents, data, or other artifacts as appropriate to the user’s pitch. Return JSON {goal: string}. Expand the user's pitch into a clear goal with concrete capabilities, quality expectations, constraints, and observable success criteria. Preserve the user's ambition and explicit version/feature targets; do not silently narrow them to an MVP. Do not invent user requirements: label assumptions and leave genuinely unspecified choices flexible. Incorporate requested revisions. Keep under 700 words. This is goal drafting only, not implementation.",
-                input)
-            });
-            match result {
-                Ok(value) if !value.goal.trim().is_empty() && value.goal.len() <= 12000 => {
-                    draft.goal = value.goal;
-                    draft.feedback.clear();
-                    save(&draft_path, &draft)?;
-                }
-                Ok(_) => {
-                    draft_recovery(&root, "The reply did not contain a usable project goal.")?;
-                    continue;
-                }
-                Err(e) => {
-                    draft_recovery(&root, &format!("{e:#}"))?;
-                    continue;
-                }
-            }
-        }
+        let setup_model = if s.setup_model.is_empty() {
+            &s.model
+        } else {
+            &s.setup_model
+        };
         crate::ui::clear_notes();
         crate::ui::notice(format!(
-            "Proposed project goal\n\n{}\n\nAccept this goal, request changes, or return to the menu with the draft saved. Work starts when you later select Resume project.",
-            draft.goal
+            "Give a short description of this project: what you want to accomplish, any important requirements, and what a successful result would look like. Chuggin will draft a goal for you to review before work starts.\n\nProject: {}\nGoal drafting model: {} on {} (change Setup model in More project settings).",
+            root.display(),
+            setup_model,
+            crate::cloud::label(&s.ollama_url, setup_model)
         ));
-        let action = if io::stdin().is_terminal() {
-            match crate::menu::select(
-                "Review your goal",
-                &[
-                    "Accept goal".into(),
-                    "Request changes".into(),
-                    "Back to menu".into(),
-                ],
-                0,
-            )? {
-                Some(0) => "accept".into(),
-                Some(1) => {
-                    crate::ui::clear_notes();
-                    crate::ui::notice(format!(
-                        "Describe what should change in this goal: add requirements, correct assumptions, or explain what you want to keep.\n\nCurrent goal\n{}",
-                        draft.goal
-                    ));
-                    ask("What should change?", "")?
-                }
-                _ => anyhow::bail!("Goal draft saved. Continue setup when you are ready."),
-            }
+        let draft_path = root.join(".chuggin/goal-draft.json");
+        let mut draft = if draft_path.exists() {
+            crate::ui::notice("Resuming your unfinished goal draft.".to_string());
+            serde_json::from_slice::<Draft>(&fs::read(&draft_path)?)?
         } else {
-            ask("Type accept, or describe the changes you want", "")?
+            Draft {
+                pitch: ask("Describe what you want to build", "")?,
+                goal: String::new(),
+                feedback: String::new(),
+            }
         };
-        if action.eq_ignore_ascii_case("accept") {
-            break;
-        }
-        draft.feedback = action;
         save(&draft_path, &draft)?;
-    }
+        loop {
+            if draft.goal.is_empty() || !draft.feedback.is_empty() {
+                crate::ui::clear_notes();
+                crate::ui::notice("Drafting your project goal…".to_string());
+                let current = draft_config(&root)?;
+                let setup_model = if current.setup_model.is_empty() {
+                    &current.model
+                } else {
+                    &current.setup_model
+                };
+                let mut model = Model::new(
+                    &current.ollama_url,
+                    setup_model,
+                    current.context_tokens,
+                    current.output_tokens,
+                    Arc::new(AtomicBool::new(false)),
+                )?;
+                model.set_reasoning(current.setup_reasoning.clone());
+                model.set_request_timeout(current.request_timeout_seconds);
+                let input = json!({"pitch":draft.pitch,"current_draft":draft.goal,"requested_changes":draft.feedback});
+                let result = crate::ui::busy("Drafting your project goal", move || {
+                    model.structured::<GoalReply>(
+                    "Help define a project goal for software, documents, data, or other artifacts as appropriate to the user’s pitch. Return JSON {goal: string}. Expand the user's pitch into a clear goal with concrete capabilities, quality expectations, constraints, and observable success criteria. Preserve the user's ambition and explicit version/feature targets; do not silently narrow them to an MVP. Do not invent user requirements: label assumptions and leave genuinely unspecified choices flexible. Incorporate requested revisions. Keep under 700 words. This is goal drafting only, not implementation.",
+                    input)
+                });
+                match result {
+                    Ok(value) if !value.goal.trim().is_empty() && value.goal.len() <= 12000 => {
+                        draft.goal = value.goal;
+                        draft.feedback.clear();
+                        save(&draft_path, &draft)?;
+                    }
+                    Ok(_) => {
+                        draft_recovery(&root, "The reply did not contain a usable project goal.")?;
+                        continue;
+                    }
+                    Err(e) => {
+                        draft_recovery(&root, &format!("{e:#}"))?;
+                        continue;
+                    }
+                }
+            }
+            crate::ui::clear_notes();
+            crate::ui::notice(format!(
+                "Proposed project goal\n\n{}\n\nAccept this goal, request changes, or return to the menu with the draft saved. Work starts when you later select Resume project.",
+                draft.goal
+            ));
+            let action = ask("Type accept, or describe the changes you want", "")?;
+            if action.eq_ignore_ascii_case("accept") {
+                break;
+            }
+            draft.feedback = action;
+            save(&draft_path, &draft)?;
+        }
+        draft.goal
+    };
     crate::ui::clear_notes();
     crate::ui::notice("Choose a check Chuggin can use to guide refinement. All work is saved even when checks fail.\nChoose validation appropriate to this project: tests, a document linter, a data checker, or your own validation script.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
     let check = loop {
@@ -631,7 +643,10 @@ pub fn wizard() -> Result<PathBuf> {
         project::git(&root, &commit)?;
         crate::ui::notice("Created the first commit.".to_string());
     }
-    let mut accepted = json!({"repo":".","goal":draft.goal,"state_dir":".chuggin","helpers":draft_config(&root)?.helpers,"active_hours":{"mode":"shared"},
+    let preferences = draft_config(&root)?;
+    let mut accepted = json!({"repo":".","goal":goal,"state_dir":".chuggin","helpers":preferences.helpers,"active_hours":{"mode":"shared"},
+        "model":preferences.model,"setup_model":preferences.setup_model,
+        "reasoning":preferences.reasoning,"setup_reasoning":preferences.setup_reasoning,"chat_reasoning":preferences.chat_reasoning,
         "command_review_seconds":timeout,"checks":[{"argv":check,"timeout_seconds":timeout}]});
     for (key, value) in draft_settings(&root)?.as_object().unwrap() {
         accepted[key] = value.clone();
@@ -679,53 +694,227 @@ fn available_models(s: &Settings) -> Result<Vec<String>> {
     Ok(names)
 }
 pub fn choose_model(project: Option<&Path>) -> Result<()> {
-    let mut s = settings()?;
-    if let Some(path) = project {
-        let effective = runner::load(path)?;
-        s.ollama_url = effective.ollama_url;
-        s.model = effective.model;
-    }
-    let names = select_provider_models(&s)?;
-    let selected = names.iter().position(|n| n == &s.model).unwrap_or(0);
+    let defaults = settings()?;
+    let (model, url) = if let Some(path) = project {
+        let config = runner::load(path)?;
+        (config.model, config.ollama_url)
+    } else {
+        (defaults.model, defaults.ollama_url)
+    };
     let title = if project.is_some() {
         "Choose model for this project"
     } else {
         "Choose default model · global"
     };
-    if let Some(index) = crate::menu::select(title, &names, selected)? {
-        s.model = names[index].clone();
-        if let Some(path) = project {
-            if runner::needs_migration(path)? {
-                let mut config: Value = serde_json::from_slice(&fs::read(path)?)?;
-                config["model"] = json!(s.model);
-                save(path, &config)?;
-            } else {
-                save_live_setting(path, 0, &s.model)?;
+    let Some(selection) = crate::model_picker::choose(&model, &url, title)? else {
+        return Ok(());
+    };
+    if let Some(path) = project {
+        if runner::needs_migration(path)? {
+            let mut config: Value = serde_json::from_slice(&fs::read(path)?)?;
+            for (key, value) in selection.patch("model").as_object().unwrap() {
+                config[key] = value.clone();
             }
+            save(path, &config)?;
         } else {
-            save(&settings_path()?, &s)?;
+            save_project_patch(Some(path), selection.patch("model"))?;
         }
-        crate::ui::notice(format!("Model saved: {}", s.model));
+    } else {
+        let mut defaults = settings()?;
+        defaults.model = selection.model.clone();
+        if let Some(url) = &selection.local_url {
+            defaults.ollama_url = url.clone();
+        }
+        save(&settings_path()?, &defaults)?;
     }
+    crate::ui::notice(format!("Model saved: {}", selection.model));
     Ok(())
 }
+
 pub fn choose_project_model(project: Option<&Path>) -> Result<()> {
     if project.is_some() {
         return choose_model(project);
     }
     let root = std::env::current_dir()?;
-    let effective = draft_config(&root)?;
-    let mut connection = settings()?;
-    connection.model = effective.model;
-    connection.ollama_url = effective.ollama_url;
-    let names = select_provider_models(&connection)?;
-    let selected = names
+    let config = draft_config(&root)?;
+    if let Some(selection) = crate::model_picker::choose(
+        &config.model,
+        &config.ollama_url,
+        "Choose model for this project",
+    )? {
+        save_draft_patch(&root, selection.patch("model"))?;
+        crate::ui::notice(format!("Project model saved: {}", selection.model));
+    }
+    Ok(())
+}
+
+fn role_model_choice(
+    name: &str,
+    loop_model: &str,
+    url: &str,
+    title: &str,
+) -> Result<Option<crate::model_picker::Selection>> {
+    crate::ui::clear_notes();
+    crate::ui::notice(format!(
+        "Choose an independent model for this role, or use the loop model ({loop_model}). This does not change the model used by project loops. Catalog requests do not generate model output."
+    ));
+    match crate::menu::select(
+        title,
+        &[
+            "Use loop model".into(),
+            "Choose a model and inference provider…".into(),
+            "Back".into(),
+        ],
+        usize::from(!name.is_empty()),
+    )? {
+        Some(0) => Ok(Some(crate::model_picker::Selection {
+            model: String::new(),
+            local_url: None,
+        })),
+        Some(1) => {
+            crate::model_picker::choose(if name.is_empty() { loop_model } else { name }, url, title)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Setup may use a larger model without changing the project's looping model.
+pub fn choose_setup_model(project: Option<&Path>) -> Result<()> {
+    let config = editing_config(project)?;
+    if let Some(selection) = role_model_choice(
+        &config.setup_model,
+        &config.model,
+        &config.ollama_url,
+        "Setup model · this project",
+    )? {
+        save_project_patch(project, selection.patch("setup_model"))?;
+    }
+    Ok(())
+}
+
+fn thinking_choice(
+    current: &crate::reasoning::Setting,
+    model: &str,
+    url: &str,
+    output_tokens: u32,
+    title: &str,
+) -> Result<Option<crate::reasoning::Setting>> {
+    use crate::reasoning::Setting;
+    crate::ui::clear_notes();
+    let model_name = model.to_owned();
+    let server = url.to_owned();
+    let discovered = if model.is_empty() {
+        Err(anyhow::anyhow!(
+            "Select a model first to discover its thinking controls."
+        ))
+    } else {
+        crate::ui::busy("Checking model thinking controls", move || {
+            crate::reasoning::discover(&server, &model_name)
+        })
+    };
+    let (mut options, budget, detail) = match &discovered {
+        Ok(capabilities) => (
+            capabilities.options.clone(),
+            capabilities.supports_token_budget && output_tokens > 1,
+            format!(
+                "Model: {model}\nSource: {}\n{}{}",
+                capabilities.source,
+                capabilities.detail,
+                capabilities
+                    .default
+                    .as_ref()
+                    .map(|value| format!("\nProvider default: {value}"))
+                    .unwrap_or_default()
+            ),
+        ),
+        Err(error) => (
+            vec![Setting::Default],
+            false,
+            format!(
+                "Model: {model}\nThinking controls could not be verified: {error:#}\nModel default sends no thinking override and remains available."
+            ),
+        ),
+    };
+    if !options.iter().any(Setting::is_default) {
+        options.insert(0, Setting::Default);
+    }
+    crate::ui::notice(format!(
+        "{detail}\n\nCurrent: {}. Only confirmed controls are offered. Model default lets the provider choose; it does not force thinking off. Changes apply to the next model call.",
+        current.label()
+    ));
+    let mut rows: Vec<String> = options.iter().map(Setting::label).collect();
+    if budget {
+        rows.push(format!(
+            "Custom reasoning token budget… · response allowance: {} tokens",
+            token_count(output_tokens)
+        ));
+    }
+    rows.push("Back".into());
+    let selected = options
         .iter()
-        .position(|name| name == &connection.model)
-        .unwrap_or(0);
-    if let Some(index) = crate::menu::select("Choose model for this project", &names, selected)? {
-        save_draft_patch(&root, json!({"model": names[index]}))?;
-        crate::ui::notice(format!("Project model saved: {}", names[index]));
+        .position(|option| option == current)
+        .unwrap_or({
+            if budget && matches!(current, Setting::TokenBudget(_)) {
+                options.len()
+            } else {
+                0
+            }
+        });
+    let Some(choice) = crate::menu::select(title, &rows, selected)? else {
+        return Ok(None);
+    };
+    let setting = if let Some(option) = options.get(choice) {
+        option.clone()
+    } else if budget && choice == options.len() {
+        let default = match current {
+            Setting::TokenBudget(tokens) => *tokens,
+            _ => 4096.min(output_tokens / 2),
+        };
+        Setting::TokenBudget(number(
+            "Reasoning token budget · must leave room for the answer",
+            default.min(output_tokens - 1),
+            1,
+            output_tokens - 1,
+        )?)
+    } else {
+        return Ok(None);
+    };
+    setting.validate()?;
+    if let Ok(capabilities) = discovered {
+        capabilities.validate_selection(&setting)?;
+    }
+    Ok(Some(setting))
+}
+
+pub fn choose_project_reasoning(project: Option<&Path>) -> Result<()> {
+    let config = editing_config(project)?;
+    if let Some(setting) = thinking_choice(
+        &config.reasoning,
+        &config.model,
+        &config.ollama_url,
+        config.output_tokens,
+        "Loop thinking · this project",
+    )? {
+        save_project_patch(project, json!({"reasoning":setting}))?;
+    }
+    Ok(())
+}
+
+pub fn choose_setup_reasoning(project: Option<&Path>) -> Result<()> {
+    let config = editing_config(project)?;
+    let name = if config.setup_model.is_empty() {
+        &config.model
+    } else {
+        &config.setup_model
+    };
+    if let Some(setting) = thinking_choice(
+        &config.setup_reasoning,
+        name,
+        &config.ollama_url,
+        config.output_tokens,
+        "Setup thinking · this project",
+    )? {
+        save_project_patch(project, json!({"setup_reasoning":setting}))?;
     }
     Ok(())
 }
@@ -741,15 +930,10 @@ fn save_project_patch(project: Option<&Path>, patch: Value) -> Result<()> {
     let Some(path) = project else {
         return save_draft_patch(&std::env::current_dir()?, patch);
     };
-    let client = crate::engine::Client::connect(path)?;
+    let client = crate::engine::Client::connect_interactive(path)?;
     let session = client.open_session(None)?;
     let current = client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
-    let reply = client.call(
-        &session,
-        "update_settings",
-        json!({"expected_revision":current["result"]["revision"],"settings":patch}),
-        &crate::operator::id(),
-    )?;
+    let reply = client.update_human_settings(&current["result"]["revision"], patch)?;
     anyhow::ensure!(reply["status"] == "complete", "{}", reply["error"]);
     Ok(())
 }
@@ -759,9 +943,9 @@ pub fn settings_menu() -> Result<()> {
         crate::ui::clear_notes();
         crate::ui::notice("Global connections are shared across projects. These model and working defaults apply where a project has no override; changing them preserves existing project overrides.".into());
         let items = vec![
-            format!("Ollama server     {}", s.ollama_url),
+            "Inference providers…".into(),
             format!(
-                "Default model     {}",
+                "Default loop model     {}",
                 if s.model.is_empty() {
                     "Not selected"
                 } else {
@@ -786,9 +970,18 @@ pub fn settings_menu() -> Result<()> {
             ),
             "Test Brave connection".into(),
             "Default active hours".into(),
-            "Groq connection and limits".into(),
             "Investigation helpers · defaults for new projects".into(),
-            "OpenRouter · free cloud models and connection".into(),
+            format!(
+                "Default setup model     {}",
+                if s.setup_model.is_empty() {
+                    "Use loop model"
+                } else {
+                    &s.setup_model
+                }
+            ),
+            format!("Default loop thinking     {}", s.reasoning.label()),
+            format!("Default setup thinking    {}", s.setup_reasoning.label()),
+            format!("Default chat thinking     {}", s.chat_reasoning.label()),
             "Back".into(),
         ];
         let Some(index) =
@@ -798,14 +991,8 @@ pub fn settings_menu() -> Result<()> {
         };
         match index {
             0 => {
-                let url = ask("Ollama server", &s.ollama_url)?;
-                let parsed = reqwest::Url::parse(&url)
-                    .context("Enter a full server address, such as http://localhost:11434")?;
-                anyhow::ensure!(
-                    matches!(parsed.scheme(), "http" | "https"),
-                    "Server must use http or https."
-                );
-                s.ollama_url = url.trim_end_matches('/').into();
+                crate::model_picker::connections_menu()?;
+                continue;
             }
             1 => {
                 choose_model(None)?;
@@ -900,16 +1087,68 @@ pub fn settings_menu() -> Result<()> {
                 continue;
             }
             10 => {
-                groq_settings()?;
-                continue;
-            }
-            11 => {
                 helpers_menu(None)?;
                 continue;
             }
+            11 => {
+                let Some(model) = role_model_choice(
+                    &s.setup_model,
+                    &s.model,
+                    &s.ollama_url,
+                    "Default setup model · global",
+                )?
+                else {
+                    continue;
+                };
+                s = settings()?;
+                s.setup_model = model.model;
+                if let Some(url) = model.local_url {
+                    s.ollama_url = url;
+                }
+            }
             12 => {
-                openrouter_settings()?;
-                continue;
+                let Some(setting) = thinking_choice(
+                    &s.reasoning,
+                    &s.model,
+                    &s.ollama_url,
+                    s.output_tokens,
+                    "Default loop thinking · global",
+                )?
+                else {
+                    continue;
+                };
+                s.reasoning = setting;
+            }
+            13 => {
+                let model = if s.setup_model.is_empty() {
+                    &s.model
+                } else {
+                    &s.setup_model
+                };
+                let Some(setting) = thinking_choice(
+                    &s.setup_reasoning,
+                    model,
+                    &s.ollama_url,
+                    s.output_tokens,
+                    "Default setup thinking · global",
+                )?
+                else {
+                    continue;
+                };
+                s.setup_reasoning = setting;
+            }
+            14 => {
+                let Some(setting) = thinking_choice(
+                    &s.chat_reasoning,
+                    &s.model,
+                    &s.ollama_url,
+                    s.output_tokens,
+                    "Default chat thinking · global",
+                )?
+                else {
+                    continue;
+                };
+                s.chat_reasoning = setting;
             }
             _ => return Ok(()),
         }
@@ -953,7 +1192,7 @@ fn save_project_setting(project: Option<&Path>, field: usize, input: &str) -> Re
         let config = editing_config(None)?;
         return save_project_patch(None, setting_patch(&config, field, input)?);
     };
-    let client = crate::engine::Client::connect(path)?;
+    let client = crate::engine::Client::connect_interactive(path)?;
     let session = client.open_session(None)?;
     let current = client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
     let config: runner::Config = serde_json::from_value(current["result"]["settings"].clone())?;
@@ -1173,6 +1412,7 @@ pub fn external_control_info(path: &Path) -> Result<()> {
 #[derive(Clone, Copy)]
 pub enum ProjectSetting {
     Model,
+    Thinking,
     Context,
     Output,
     Timeout,
@@ -1182,8 +1422,9 @@ pub enum ProjectSetting {
     More,
     Global,
 }
-pub const PROJECT_SETTINGS: [ProjectSetting; 9] = [
+pub const PROJECT_SETTINGS: [ProjectSetting; 10] = [
     ProjectSetting::Model,
+    ProjectSetting::Thinking,
     ProjectSetting::Context,
     ProjectSetting::Output,
     ProjectSetting::Timeout,
@@ -1197,6 +1438,7 @@ impl ProjectSetting {
     pub fn label(self) -> &'static str {
         match self {
             Self::Model => "Project model",
+            Self::Thinking => "Loop thinking",
             Self::Context => "Context window (tokens)",
             Self::Output => "Response limit (tokens)",
             Self::Timeout => "Request timeout (minutes; 0 unlimited)",
@@ -1210,6 +1452,7 @@ impl ProjectSetting {
     pub fn value(self, c: &runner::Config) -> String {
         match self {
             Self::Model => c.model.clone(),
+            Self::Thinking => c.reasoning.label(),
             Self::Context => token_count(c.context_tokens),
             Self::Output => token_count(c.output_tokens),
             Self::Timeout => (c.request_timeout_seconds as f64 / 60.0).to_string(),
@@ -1220,7 +1463,7 @@ impl ProjectSetting {
                 .map(|s| s.description)
                 .unwrap_or_else(|e| e.to_string()),
             Self::Completion => if c.allow_goal_completion { "on" } else { "off" }.into(),
-            Self::More => "Chat model, helpers, tool requests, command review, MCP".into(),
+            Self::More => "Setup and chat models, thinking, helpers, tool requests, MCP".into(),
             Self::Global => "Shared connections and defaults for projects".into(),
         }
     }
@@ -1257,6 +1500,7 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
         };
         match setting {
             ProjectSetting::Model => choose_project_model(path)?,
+            ProjectSetting::Thinking => choose_project_reasoning(path)?,
             ProjectSetting::ActiveHours => project_active_hours_menu(path)?,
             ProjectSetting::More => more_project_settings(path)?,
             ProjectSetting::Global => settings_menu()?,
@@ -1305,13 +1549,23 @@ pub fn more_project_settings(path: Option<&Path>) -> Result<()> {
                     c.command_review_seconds
                 ),
                 format!(
+                    "Setup model · {}",
+                    if c.setup_model.is_empty() {
+                        "Use loop model"
+                    } else {
+                        &c.setup_model
+                    }
+                ),
+                format!("Setup thinking · {}", c.setup_reasoning.label()),
+                format!(
                     "Chat model · {}",
                     if c.chat_model.is_empty() {
-                        "Use project model"
+                        "Use loop model"
                     } else {
                         &c.chat_model
                     }
                 ),
+                format!("Chat thinking · {}", c.chat_reasoning.label()),
                 format!(
                     "Investigation helpers · {}",
                     if c.helpers.enabled {
@@ -1338,23 +1592,39 @@ pub fn more_project_settings(path: Option<&Path>) -> Result<()> {
                 save_project_setting(path, 3, &value)?;
             }
             1 => {
-                let model = ask(
-                    "Chat model (enter 'default' to use project model)",
-                    if c.chat_model.is_empty() {
-                        "default"
-                    } else {
-                        &c.chat_model
-                    },
-                )?;
-                save_project_patch(
-                    path,
-                    json!({"chat_model":if model=="default"{""}else{&model}}),
-                )?;
+                choose_setup_model(path)?;
             }
             2 => {
-                helpers_scope(path, true)?;
+                choose_setup_reasoning(path)?;
             }
             3 => {
+                if let Some(model) = role_model_choice(
+                    &c.chat_model,
+                    &c.model,
+                    &c.ollama_url,
+                    "Chat model · this project",
+                )? {
+                    save_project_patch(path, model.patch("chat_model"))?;
+                }
+            }
+            4 => {
+                let name = if c.chat_model.is_empty() {
+                    &c.model
+                } else {
+                    &c.chat_model
+                };
+                if let Some(setting) = thinking_choice(
+                    &c.chat_reasoning,
+                    name,
+                    &c.ollama_url,
+                    c.output_tokens,
+                    "Chat thinking · this project",
+                )? {
+                    save_project_patch(path, json!({"chat_reasoning":setting}))?;
+                }
+            }
+            5 => helpers_scope(path, true)?,
+            6 => {
                 if let Some(path) = path {
                     external_control_info(path)?;
                 } else {
@@ -1364,7 +1634,7 @@ pub fn more_project_settings(path: Option<&Path>) -> Result<()> {
                     )?;
                 }
             }
-            4 => {
+            7 => {
                 if let Some(path) = path {
                     crate::tool_requests::menu(path)?;
                 } else {
@@ -1398,6 +1668,7 @@ fn helper_rows(helpers: &crate::agents::Settings) -> Vec<String> {
             }
         ),
         format!("Model responses per helper · {}", helpers.max_calls),
+        format!("Thinking · {}", helpers.reasoning.label()),
         "Back".into(),
     ]
 }
@@ -1419,12 +1690,13 @@ fn helpers_scope(project: Option<&Path>, project_scope: bool) -> Result<()> {
         };
         crate::ui::clear_notes();
         crate::ui::notice(
-            "Optional helpers investigate a specific question with fresh context and return evidence to the main conversation. They can read files, search, inspect saved logs, and use enabled web tools; they cannot edit or run commands. The main model chooses when a helper is useful.\n\nUse project model shares its connection and budget. Ollama requests to the same server run one at a time. Cloud helpers use the selected provider's connection and limits. OpenCode Zen needs no account; OpenRouter needs a key. Free models can have capacity limits or temporary availability. Changes apply to the next helper; running helpers keep their model. The response allowance ends the investigation with its available findings, without rejecting the main work."
+            "Optional helpers investigate a specific question with fresh context and return evidence to the main conversation. They can read files, search, inspect saved logs, and use enabled web tools; they cannot edit or run commands. The main model chooses when a helper is useful.\n\nUse project model shares its connection and budget. Ollama requests to the same server run one at a time. Cloud helpers use the selected provider's connection and limits. OpenCode Zen needs no account; OpenRouter needs a key. Free models can have capacity limits or temporary availability. Model and response allowance changes apply to the next investigation; running helpers keep their model and allowance. Helper thinking changes apply to its next model call. The response allowance ends the investigation with its available findings, without rejecting the main work."
                 .into(),
         );
         let Some(choice) = crate::menu::select(title, &helper_rows(&helpers), 0)? else {
             return Ok(());
         };
+        let mut selected_local_url = None;
         match choice {
             0 => helpers.enabled = !helpers.enabled,
             1 => {
@@ -1453,15 +1725,13 @@ fn helpers_scope(project: Option<&Path>, project_scope: bool) -> Result<()> {
                     if !helpers.model.is_empty() {
                         connection.model = helpers.model.clone();
                     }
-                    let names = select_provider_models(&connection)?;
-                    let selected = names
-                        .iter()
-                        .position(|name| name == &connection.model)
-                        .unwrap_or(0);
-                    if let Some(index) =
-                        crate::menu::select("Choose investigation model", &names, selected)?
-                    {
-                        helpers.model = names[index].clone();
+                    if let Some(selection) = crate::model_picker::choose(
+                        &connection.model,
+                        &connection.ollama_url,
+                        "Choose investigation model",
+                    )? {
+                        helpers.model = selection.model;
+                        selected_local_url = selection.local_url;
                     } else {
                         continue;
                     }
@@ -1477,169 +1747,56 @@ fn helpers_scope(project: Option<&Path>, project_scope: bool) -> Result<()> {
                     1000,
                 )?;
             }
+            3 => {
+                let (model, url, output_tokens) = if project.is_some() || project_scope {
+                    let config = editing_config(project)?;
+                    (config.model, config.ollama_url, config.output_tokens)
+                } else {
+                    let defaults = settings()?;
+                    (defaults.model, defaults.ollama_url, defaults.output_tokens)
+                };
+                let name = if helpers.model.is_empty() {
+                    &model
+                } else {
+                    &helpers.model
+                };
+                let Some(setting) = thinking_choice(
+                    &helpers.reasoning,
+                    name,
+                    &url,
+                    output_tokens,
+                    "Investigation helper thinking",
+                )?
+                else {
+                    continue;
+                };
+                helpers.reasoning = setting;
+            }
             _ => return Ok(()),
         }
-        if let Some(path) = project {
-            let client = crate::engine::Client::connect(path)?;
-            let session = client.open_session(None)?;
-            let current =
-                client.call(&session, "get_settings", json!({}), &crate::operator::id())?;
-            let reply = client.update_helpers(&current["result"]["revision"], &helpers)?;
-            anyhow::ensure!(reply["status"] == "complete", "{}", reply["error"]);
-        } else if project_scope {
-            save_project_patch(None, json!({"helpers":helpers}))?;
+        if project.is_some() || project_scope {
+            let mut patch = json!({"helpers":helpers});
+            if let Some(url) = selected_local_url {
+                patch["ollama_url"] = json!(url);
+            }
+            save_project_patch(project, patch)?;
         } else {
             let mut defaults = settings()?;
             defaults.helpers = helpers;
+            if let Some(url) = selected_local_url {
+                defaults.ollama_url = url;
+            }
             save(&settings_path()?, &defaults)?;
         }
     }
 }
 
-fn select_provider_models(s: &Settings) -> Result<Vec<String>> {
-    crate::ui::clear_notes();
-    crate::ui::notice("Choose an inference provider, then a model from its catalog. Loading the catalog does not generate a response. Shared connections can be configured in Global settings.".into());
-    let selected = match crate::cloud::provider(&s.model) {
-        Some(crate::cloud::Provider::Zen) => 2,
-        Some(crate::cloud::Provider::OpenRouter) => 3,
-        None => usize::from(crate::groq::model_id(&s.model).is_some()),
-    };
-    let choice = crate::menu::select(
-        "Inference provider",
-        &[
-            format!("Ollama · {}", s.ollama_url),
-            "Groq · cloud API".into(),
-            "OpenCode Zen · free models, no account needed".into(),
-            "OpenRouter · free models, API key needed".into(),
-        ],
-        selected,
-    )?;
-    match choice {
-        Some(0) => {
-            let mut connection = s.clone();
-            if s.model.is_empty() {
-                connection.ollama_url = ask("Ollama server", &s.ollama_url)?;
-                let mut defaults = settings()?;
-                defaults.ollama_url = connection.ollama_url.clone();
-                save(&settings_path()?, &defaults)?;
-            }
-            crate::ui::busy("Loading Ollama models", move || {
-                available_models(&connection)
-            })
-        }
-        Some(1) => {
-            if crate::groq::key().is_err() {
-                groq_settings()?;
-            }
-            crate::ui::busy("Loading Groq models", crate::groq::models)
-        }
-        Some(2) => {
-            crate::ui::clear_notes();
-            crate::ui::notice("OpenCode Zen offers free models without an account. Some models are temporary previews; availability, capacity, and rate limits can change. Chuggin waits and retries provider errors, and never falls back to a paid model. Loading the catalog does not generate a response.".into());
-            crate::ui::busy("Loading free OpenCode Zen models", || {
-                crate::cloud::models(crate::cloud::Provider::Zen)
-            })
-        }
-        Some(3) => {
-            if crate::cloud::key("openrouter/connection-check")?.is_none() {
-                openrouter_settings()?;
-            }
-            anyhow::ensure!(
-                crate::cloud::key("openrouter/connection-check")?.is_some(),
-                "Add an OpenRouter API key in Global settings before selecting its models"
-            );
-            crate::ui::clear_notes();
-            crate::ui::notice("Only free OpenRouter models are offered here. Free-tier rate and capacity limits can require waiting; Chuggin retries without switching to a paid model. Your project context and response settings remain unchanged.".into());
-            crate::ui::busy("Loading free OpenRouter models", || {
-                crate::cloud::models(crate::cloud::Provider::OpenRouter)
-            })
-        }
-        _ => anyhow::bail!("Model selection cancelled; settings unchanged"),
-    }
-}
-
-pub fn openrouter_settings() -> Result<()> {
-    loop {
-        let key_set = crate::cloud::key("openrouter/connection-check")?.is_some();
-        crate::ui::clear_notes();
-        crate::ui::notice("This shared connection is used only when you select an openrouter/ model. Chuggin offers free models and does not switch to paid models. Free capacity and rate limits vary; exhausted capacity uses provider backoff. A catalog check lists models without generating a response or consuming an inference request.".into());
-        let rows = vec![
-            format!(
-                "API key · {}",
-                if key_set {
-                    "Configured"
-                } else {
-                    "Not configured"
-                }
-            ),
-            "Test catalog connection / list free models".into(),
-            "Free providers and availability".into(),
-            "Back".into(),
-        ];
-        match crate::menu::select("OpenRouter · shared free-model connection", &rows, 0)? {
-            Some(0) => match crate::menu::select(
-                "OpenRouter API key",
-                &[
-                    "Enter or replace key".into(),
-                    "Remove key".into(),
-                    "Back".into(),
-                ],
-                0,
-            )? {
-                Some(0) => {
-                    let value = if crate::ui::active() {
-                        crate::ui::ask_secret("OpenRouter API key · input is masked")?
-                    } else {
-                        dialoguer::Password::new()
-                            .with_prompt("OpenRouter API key")
-                            .interact()?
-                    };
-                    crate::web_tools::save_key(&crate::groq::path("openrouter.key")?, &value)?;
-                }
-                Some(1) => {
-                    let path = crate::groq::path("openrouter.key")?;
-                    if path.exists() {
-                        fs::remove_file(path)?;
-                    }
-                }
-                _ => {}
-            },
-            Some(1) => {
-                let names = crate::ui::busy("Checking OpenRouter's free-model catalog", || {
-                    crate::cloud::models(crate::cloud::Provider::OpenRouter)
-                })?;
-                crate::ui::show(
-                    "OpenRouter · free models",
-                    &format!(
-                        "The catalog connection works. This check lists models; it does not generate a response or verify your inference allowance.\n\n{}",
-                        names.join("\n")
-                    ),
-                )?;
-            }
-            Some(2) => {
-                crate::ui::show(
-                    "Free cloud providers",
-                    "OpenCode Zen needs no account for the free models in its picker. Some entries are temporary previews and may disappear or reach capacity.\n\nOpenRouter requires your API key for inference. Its picker includes only tool-capable models with free pricing. Providers may restrict requests, daily usage, context, or simultaneous responses.\n\nChuggin keeps your selected model and retries capacity/rate errors with backoff. It never authorizes a paid fallback. Selecting a cloud model does not change your saved local context or response settings.",
-                )?;
-            }
-            _ => return Ok(()),
-        }
-    }
-}
-pub fn groq_settings() -> Result<()> {
+pub fn groq_limits_menu() -> Result<()> {
     loop {
         let mut limits = crate::groq::Limits::load()?;
-        let key_set = crate::groq::key().is_ok();
+        crate::ui::clear_notes();
+        crate::ui::notice("These budgets are shared across all Groq connections on this machine. They do not change local or other cloud providers. Set them to match your account allowance.".into());
         let rows = vec![
-            format!(
-                "API key · {}",
-                if key_set {
-                    "Configured"
-                } else {
-                    "Not configured"
-                }
-            ),
-            "Test connection / list models".into(),
             format!("Requests per minute · {}", limits.requests_per_minute),
             format!("Requests per day · {}", limits.requests_per_day),
             format!("Tokens per minute · {}", limits.tokens_per_minute),
@@ -1656,23 +1813,38 @@ pub fn groq_settings() -> Result<()> {
             format!("Maximum response tokens · {}", limits.max_response_tokens),
             "Back".into(),
         ];
-        match crate::menu::select("Groq · shared connection and budgets", &rows, 0)? {
-            Some(0) => {
-                let value = if crate::ui::active() { crate::ui::ask_secret("Groq API key · input is masked")? } else { dialoguer::Password::new().with_prompt("Groq API key").interact()? };
-                crate::web_tools::save_key(&crate::groq::path("groq.key")?, &value)?;
-            }
-            Some(1) => {
-                let models = crate::ui::busy("Testing Groq connection", crate::groq::models)?;
-                crate::ui::notice(format!("Groq connection works. Available chat models:\n{}", models.join("\n")));
-            }
-            Some(i @ 2..=7) => {
-                let fields = [&mut limits.requests_per_minute, &mut limits.requests_per_day, &mut limits.tokens_per_minute, &mut limits.tokens_per_day, &mut limits.input_tokens_per_minute, &mut limits.output_tokens_per_minute];
-                let value = fields.into_iter().nth(i-2).unwrap();
-                *value = number("Shared Groq limit", *value as u32, if i>=6 {0}else{1}, 1_000_000_000)? as u64;
+        match crate::menu::select("Groq · shared usage budgets", &rows, 0)? {
+            Some(i @ 0..=5) => {
+                let fields = [
+                    &mut limits.requests_per_minute,
+                    &mut limits.requests_per_day,
+                    &mut limits.tokens_per_minute,
+                    &mut limits.tokens_per_day,
+                    &mut limits.input_tokens_per_minute,
+                    &mut limits.output_tokens_per_minute,
+                ];
+                let value = fields.into_iter().nth(i).unwrap();
+                *value = number(
+                    "Shared Groq limit",
+                    *value as u32,
+                    if i >= 4 { 0 } else { 1 },
+                    1_000_000_000,
+                )? as u64;
                 save(&crate::groq::path("groq-limits.json")?, &limits)?;
             }
-            Some(9) => { limits.max_response_tokens = number("Maximum Groq response tokens", limits.max_response_tokens, 128, 32768)?; save(&crate::groq::path("groq-limits.json")?, &limits)?; }
-            Some(8) => crate::ui::notice("Free-tier defaults leave headroom: 24 requests/minute, 900/day, 7,200 tokens/minute, 180,000/day. All Chuggin projects and chats on this machine share this budget. Usage survives restarts and model changes. Each request reserves estimated input plus maximum output; final usage replaces that reservation. Interrupted requests keep their reservation. Daily limits use a conservative rolling 24-hour window. Groq headers can impose stricter waits. Other apps using the account are only visible through those headers. Manual retry rechecks budgets and never bypasses them. Raise limits only to match your Groq account. Requests use a smaller working context when necessary; full request logs remain available. Groq responses default to a 1,024-token cap, adjustable here.".into()),
+            Some(7) => {
+                limits.max_response_tokens = number(
+                    "Maximum Groq response tokens",
+                    limits.max_response_tokens,
+                    128,
+                    32768,
+                )?;
+                save(&crate::groq::path("groq-limits.json")?, &limits)?;
+            }
+            Some(6) => crate::ui::show(
+                "Groq usage budgets",
+                "Free-tier defaults leave headroom: 24 requests/minute, 900/day, 7,200 tokens/minute, 180,000/day. All Chuggin projects and chats on this machine share this budget. Usage survives restarts and model changes. Each request reserves estimated input plus maximum output; final usage replaces that reservation. Interrupted requests keep their reservation. Daily limits use a conservative rolling 24-hour window. Groq headers can impose stricter waits. Other apps using the account are only visible through those headers. Manual retry rechecks budgets and never bypasses them. Raise limits only to match your Groq account. Requests use a smaller working context when necessary; full request logs remain available. Groq responses default to a 1,024-token cap, adjustable here.",
+            )?,
             _ => return Ok(()),
         }
     }
@@ -1681,6 +1853,58 @@ pub fn groq_settings() -> Result<()> {
 #[cfg(test)]
 mod project_draft_tests {
     use super::*;
+
+    #[test]
+    fn existing_settings_keep_provider_default_thinking_for_every_role() {
+        let defaults: Settings = serde_json::from_value(json!({"model":"existing-model"})).unwrap();
+        assert!(defaults.setup_model.is_empty());
+        assert!(defaults.reasoning.is_default());
+        assert!(defaults.setup_reasoning.is_default());
+        assert!(defaults.chat_reasoning.is_default());
+        assert!(defaults.helpers.reasoning.is_default());
+    }
+
+    #[test]
+    fn independent_model_and_thinking_choices_survive_goal_setup_preferences() {
+        use crate::reasoning::Setting;
+        let root = tempfile::tempdir().unwrap();
+        let defaults = Settings {
+            model: "local-loop-model".into(),
+            setup_model: "cloud-setup-model".into(),
+            setup_reasoning: Setting::Effort("high".into()),
+            ..Settings::default()
+        };
+        let inherited = draft_config_with(root.path(), &defaults, &json!({})).unwrap();
+        assert_eq!(inherited.model, "local-loop-model");
+        assert_eq!(inherited.setup_model, "cloud-setup-model");
+        assert_eq!(inherited.setup_reasoning, Setting::Effort("high".into()));
+        assert!(inherited.reasoning.is_default());
+        save_draft_patch_with(
+            root.path(),
+            json!({
+                "setup_model":"different-setup-model",
+                "setup_reasoning":{"mode":"token_budget","value":8192},
+                "reasoning":{"mode":"on"},
+                "chat_reasoning":{"mode":"off"},
+                "helpers":{"reasoning":{"mode":"effort","value":"low"}}
+            }),
+            &defaults,
+        )
+        .unwrap();
+        let selected = draft_config_with(
+            root.path(),
+            &defaults,
+            &draft_settings(root.path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(selected.model, "local-loop-model");
+        assert_eq!(selected.setup_model, "different-setup-model");
+        assert_eq!(selected.setup_reasoning, Setting::TokenBudget(8192));
+        assert_eq!(selected.reasoning, Setting::On);
+        assert_eq!(selected.chat_reasoning, Setting::Off);
+        assert_eq!(selected.helpers.reasoning, Setting::Effort("low".into()));
+        assert!(!root.path().join("chuggin.json").exists());
+    }
 
     #[test]
     fn draft_preferences_follow_defaults_without_becoming_a_configured_project() {
@@ -1739,6 +1963,10 @@ mod project_draft_tests {
         for patch in [
             json!({"goal":"Must not turn preferences into an accepted goal"}),
             json!({"model":"invalid model name"}),
+            json!({"setup_model":"invalid model name"}),
+            json!({"reasoning":{"mode":"effort","value":"invalid\neffort"}}),
+            json!({"setup_reasoning":{"mode":"token_budget","value":0}}),
+            json!({"chat_reasoning":{"mode":"unrecognized"}}),
             json!({"ollama_url":"not a URL"}),
             json!({"context_tokens":2048}),
             json!({"output_tokens":32768}),
@@ -1749,7 +1977,10 @@ mod project_draft_tests {
             json!({"helpers":{"max_calls":0}}),
             json!({"active_hours":{"mode":"custom","window":{"start":"01:00","end":"01:00","timezone":"UTC","days":[0]}}}),
         ] {
-            assert!(save_draft_patch_with(root.path(), patch, &defaults).is_err());
+            assert!(
+                save_draft_patch_with(root.path(), patch.clone(), &defaults).is_err(),
+                "Unexpectedly accepted {patch}"
+            );
             assert_eq!(fs::read(&path).unwrap(), before);
         }
         fs::write(root.path().join("chuggin.json"), "{}").unwrap();

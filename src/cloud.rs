@@ -2,6 +2,7 @@
 //! requests must also use Zen's anonymous credential or OpenRouter's zero-price
 //! routing cap so a promotion ending cannot charge an account between refreshes.
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -46,6 +47,41 @@ impl Provider {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceStatus {
+    Free,
+    Paid,
+    Unknown,
+}
+
+/// Live provider metadata, retaining unavailable/unknown entries so a selector
+/// can explain why an old model is no longer a valid free choice.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ModelEntry {
+    /// Stored model identity, including Chuggin's provider prefix.
+    pub id: String,
+    pub name: String,
+    pub context_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    pub tools: Option<bool>,
+    pub pricing: PriceStatus,
+    pub compatible: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl ModelEntry {
+    pub fn selectable(&self) -> bool {
+        self.compatible && self.pricing == PriceStatus::Free
+    }
+
+    pub fn detail(&self) -> &str {
+        self.unavailable_reason.as_deref().unwrap_or(
+            "Currently listed at zero cost; provider access, capacity and rate limits can change.",
+        )
+    }
+}
+
 pub fn provider(name: &str) -> Option<Provider> {
     [Provider::Zen, Provider::OpenRouter]
         .into_iter()
@@ -53,10 +89,14 @@ pub fn provider(name: &str) -> Option<Provider> {
 }
 
 pub fn model_id(name: &str) -> Option<&str> {
-    provider(name).and_then(|provider| name.strip_prefix(provider.prefix()))
+    crate::chatgpt::model_id(name)
+        .or_else(|| provider(name).and_then(|provider| name.strip_prefix(provider.prefix())))
 }
 
 pub fn url(ollama: &str, name: &str) -> String {
+    if crate::chatgpt::model_id(name).is_some() {
+        return "https://api.openai.com/v1/responses".into();
+    }
     provider(name).map_or_else(
         || crate::groq::url(ollama, name),
         |provider| format!("{}/chat/completions", provider.endpoint()),
@@ -66,6 +106,7 @@ pub fn url(ollama: &str, name: &str) -> String {
 pub fn label<'a>(ollama: &'a str, name: &str) -> &'a str {
     match provider(name) {
         Some(provider) => provider.label(),
+        None if crate::chatgpt::model_id(name).is_some() => "OpenAI · ChatGPT plan",
         None if crate::groq::model_id(name).is_some() => "Groq",
         None => ollama,
     }
@@ -95,17 +136,17 @@ fn cache() -> &'static Mutex<CatalogCache> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cached_catalog(provider: Provider) -> Option<Value> {
-    cache()
+fn cached_catalog(provider: Provider, cache: &Mutex<CatalogCache>) -> Option<Value> {
+    cache
         .lock()
         .ok()?
         .get(&provider)
         .and_then(|(at, value)| (at.elapsed() < CATALOG_TTL).then(|| value.clone()))
 }
 
-fn store_catalog(provider: Provider, value: &Value) -> Result<()> {
+fn store_catalog(provider: Provider, value: &Value, cache: &Mutex<CatalogCache>) -> Result<()> {
     entries(value)?;
-    cache()
+    cache
         .lock()
         .map_err(|_| anyhow::anyhow!("Cloud model catalog cache is unavailable"))?
         .insert(provider, (Instant::now(), value.clone()));
@@ -115,9 +156,36 @@ fn store_catalog(provider: Provider, value: &Value) -> Result<()> {
 /// Get current public metadata. Expired metadata never substitutes for a failed
 /// refresh. No credentials or project content are sent by catalog requests.
 pub fn catalog(provider: Provider) -> Result<Value> {
-    if let Some(value) = cached_catalog(provider) {
+    resolve_catalog(provider, false, cache(), || fetch_catalog(provider))
+}
+
+/// Explicit user refresh always contacts the public APIs, including inside the
+/// normal TTL. A failed refresh retires the prior cache instead of showing stale
+/// free pricing as current availability.
+pub fn refresh_catalog(provider: Provider) -> Result<Value> {
+    resolve_catalog(provider, true, cache(), || fetch_catalog(provider))
+}
+
+fn resolve_catalog(
+    provider: Provider,
+    refresh: bool,
+    cache: &Mutex<CatalogCache>,
+    fetch: impl FnOnce() -> Result<Value>,
+) -> Result<Value> {
+    if refresh {
+        cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cloud model catalog cache is unavailable"))?
+            .remove(&provider);
+    } else if let Some(value) = cached_catalog(provider, cache) {
         return Ok(value);
     }
+    let value = fetch()?;
+    store_catalog(provider, &value, cache)?;
+    Ok(value)
+}
+
+fn fetch_catalog(provider: Provider) -> Result<Value> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
@@ -130,7 +198,6 @@ pub fn catalog(provider: Provider) -> Result<Value> {
     } else {
         available
     };
-    store_catalog(provider, &value)?;
     Ok(value)
 }
 
@@ -138,6 +205,7 @@ fn fetch_json(client: &reqwest::blocking::Client, url: &str) -> Result<Value> {
     let response = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .timeout(Duration::from_secs(20))
         .send()
         .map_err(|_| crate::provider::Unavailable {
@@ -198,14 +266,22 @@ fn merge_zen_catalog(available: &Value, metadata: &Value) -> Result<Value> {
         let Some(id) = entry["id"].as_str() else {
             continue;
         };
-        let Some(model) = models.get(id) else {
-            continue;
-        };
-        let mut model = model.clone();
-        ensure!(
-            model["id"] == id,
-            "OpenCode model metadata ID does not match availability"
-        );
+        let mut model = models
+            .get(id)
+            .filter(|model| model["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| entry.clone());
+        // Preserve newly available IDs even if the descriptive database has
+        // not caught up: their pricing/capabilities stay unknown. If Zen starts
+        // returning richer authoritative metadata, prefer it over that database.
+        if let (Some(model), Some(entry)) = (model.as_object_mut(), entry.as_object()) {
+            model.extend(entry.clone());
+            // An authoritative pricing payload must not be ignored in favor
+            // of older database costs. Unrecognized fields fail closed below.
+            if entry.contains_key("pricing") && !entry.contains_key("cost") {
+                model.insert("cost".into(), entry["pricing"].clone());
+            }
+        }
         if model["provider"]["npm"].as_str().is_none() {
             model["provider"] = json!({"npm":default_sdk});
         }
@@ -214,11 +290,90 @@ fn merge_zen_catalog(available: &Value, metadata: &Value) -> Result<Value> {
     Ok(json!({"data":merged}))
 }
 
-pub fn models(provider: Provider) -> Result<Vec<String>> {
-    models_from_catalog(provider, &catalog(provider)?)
+pub fn model_entries(provider: Provider, refresh: bool) -> Result<Vec<ModelEntry>> {
+    let catalog = if refresh {
+        refresh_catalog(provider)?
+    } else {
+        catalog(provider)?
+    };
+    model_entries_from_catalog(provider, &catalog)
+}
+
+pub fn model_entries_from_catalog(provider: Provider, catalog: &Value) -> Result<Vec<ModelEntry>> {
+    let entries = entries(catalog)?;
+    let mut counts = BTreeMap::new();
+    for entry in entries {
+        if let Some(id) = entry["id"].as_str() {
+            *counts.entry(id).or_insert(0usize) += 1;
+        }
+    }
+    let mut models: Vec<_> = entries.iter().filter_map(|model| {
+        let id = model["id"].as_str()?;
+        if !valid_id(id) { return None; }
+        let prices = match provider {
+            Provider::Zen => &model["cost"],
+            Provider::OpenRouter => &model["pricing"],
+        };
+        let (input, output) = match provider {
+            Provider::Zen => ("input", "output"),
+            Provider::OpenRouter => ("prompt", "completion"),
+        };
+        let pricing = if free_prices(prices, input, output) {
+            PriceStatus::Free
+        } else if known_charge(prices) {
+            PriceStatus::Paid
+        } else {
+            PriceStatus::Unknown
+        };
+        let tools = match provider {
+            Provider::Zen => model["tool_call"].as_bool(),
+            Provider::OpenRouter => model["supported_parameters"].as_array().map(|_|contains(&model["supported_parameters"], "tools")),
+        };
+        let duplicate = counts.get(id) != Some(&1);
+        let compatible = !duplicate && chat_model(provider, model);
+        let unavailable_reason = if duplicate {
+            Some("Provider returned conflicting duplicate entries; refresh before choosing this model.".into())
+        } else if model["status"] == "deprecated" {
+            Some("Provider metadata marks this model as deprecated.".into())
+        } else if pricing == PriceStatus::Paid {
+            Some("Provider metadata includes a charge; Chuggin's free connection does not select paid models.".into())
+        } else if pricing == PriceStatus::Unknown {
+            Some("Complete zero-cost pricing is not published or cannot be verified.".into())
+        } else if tools != Some(true) {
+            Some("Tool calling is not advertised by this provider.".into())
+        } else if !compatible {
+            Some("This model does not advertise the text Chat Completions protocol supported by this connection.".into())
+        } else {
+            None
+        };
+        let context = match provider {
+            Provider::Zen => model["limit"]["context"].as_u64(),
+            Provider::OpenRouter => model["context_length"].as_u64().or_else(||model["top_provider"]["context_length"].as_u64()),
+        };
+        let output = match provider {
+            Provider::Zen => model["limit"]["output"].as_u64(),
+            Provider::OpenRouter => model["top_provider"]["max_completion_tokens"].as_u64(),
+        };
+        let name: String = model["name"].as_str().unwrap_or(id).chars().filter(|character| !character.is_control()).collect();
+        Some(ModelEntry {
+            id:format!("{}{id}",provider.prefix()),
+            name:if name.trim().is_empty() { id.into() } else {name.trim().into()},
+            context_tokens:context.and_then(|value|u32::try_from(value).ok()).filter(|value|*value>0),
+            output_tokens:output.and_then(|value|u32::try_from(value).ok()).filter(|value|*value>0),
+            tools,pricing,compatible,unavailable_reason,
+        })
+    }).collect();
+    models.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(models)
 }
 
 /// Pure catalog filtering, also used by discovery and request validation.
+#[cfg(test)]
 pub fn models_from_catalog(provider: Provider, catalog: &Value) -> Result<Vec<String>> {
     let entries = entries(catalog)?;
     let mut counts = BTreeMap::new();
@@ -293,29 +448,73 @@ fn contains(values: &Value, value: &str) -> bool {
 }
 
 fn free_chat_model(provider: Provider, model: &Value) -> bool {
+    chat_model(provider, model)
+        && match provider {
+            Provider::Zen => free_prices(&model["cost"], "input", "output"),
+            Provider::OpenRouter => free_prices(&model["pricing"], "prompt", "completion"),
+        }
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+}
+
+fn chat_model(provider: Provider, model: &Value) -> bool {
     let Some(id) = model["id"].as_str() else {
         return false;
     };
-    if id.is_empty() || id.chars().any(char::is_whitespace) || model["status"] == "deprecated" {
+    if !valid_id(id) || model["status"] == "deprecated" {
         return false;
     }
     match provider {
         Provider::Zen => {
-            (id.ends_with("-free") || id == "big-pickle")
-                && model["tool_call"] == true
+            model["tool_call"] == true
                 && contains(&model["modalities"]["input"], "text")
                 && contains(&model["modalities"]["output"], "text")
                 && model["provider"]["npm"] == "@ai-sdk/openai-compatible"
-                && free_prices(&model["cost"], "input", "output")
         }
         Provider::OpenRouter => {
+            // Router aliases do not identify the concrete model or its limits.
+            // Offer the individual live models instead.
             !id.starts_with("openrouter/")
                 && contains(&model["supported_parameters"], "tools")
                 && contains(&model["architecture"]["input_modalities"], "text")
                 && contains(&model["architecture"]["output_modalities"], "text")
-                && free_prices(&model["pricing"], "prompt", "completion")
         }
     }
+}
+
+fn known_charge(prices: &Value) -> bool {
+    let Some(prices) = prices.as_object() else {
+        return false;
+    };
+    prices.iter().any(|(name, value)| {
+        if name == "overrides" {
+            value.as_array().is_some_and(|tiers| {
+                tiers.iter().any(|tier| {
+                    tier.as_object().is_some_and(|tier| {
+                        tier.iter().any(|(name, value)| {
+                            !matches!(name.as_str(), "min_prompt_tokens" | "max_prompt_tokens")
+                                && positive_price(value)
+                        })
+                    })
+                })
+            })
+        } else {
+            positive_price(value)
+        }
+    })
+}
+
+fn positive_price(value: &Value) -> bool {
+    value.as_f64().is_some_and(|number| number > 0.0)
+        || value
+            .as_str()
+            .and_then(decimal_parts)
+            .is_some_and(|(negative, nonzero)| !negative && nonzero)
 }
 
 fn free_prices(prices: &Value, input: &str, output: &str) -> bool {
@@ -349,12 +548,17 @@ fn zero_price(value: &Value) -> bool {
         // official costs use integer zero and OpenRouter uses decimal strings.
         return number.as_u64() == Some(0) || number.as_i64() == Some(0);
     }
-    let Some(value) = value.as_str() else {
-        return false;
-    };
+    value
+        .as_str()
+        .and_then(decimal_parts)
+        .is_some_and(|(_, nonzero)| !nonzero)
+}
+
+fn decimal_parts(value: &str) -> Option<(bool, bool)> {
     // Do not use floating-point parsing: a small nonzero decimal such as
     // "1e-999" can underflow to zero and must never qualify as free.
     let value = value.trim();
+    let negative = value.starts_with('-');
     let value = value.strip_prefix(['+', '-']).unwrap_or(value);
     let (mantissa, exponent) = value
         .split_once(['e', 'E'])
@@ -363,23 +567,28 @@ fn zero_price(value: &Value) -> bool {
         let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
         digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit())
     }) {
-        return false;
+        return None;
     }
     let mut digits = 0;
     let mut points = 0;
+    let mut nonzero = false;
     for byte in mantissa.bytes() {
         match byte {
             b'0' => digits += 1,
+            b'1'..=b'9' => {
+                digits += 1;
+                nonzero = true;
+            }
             b'.' => points += 1,
-            _ => return false,
+            _ => return None,
         }
     }
-    digits > 0 && points <= 1
+    (digits > 0 && points <= 1).then_some((negative, nonzero))
 }
 
 #[cfg(test)]
 pub(crate) fn seed_catalog(provider: Provider, catalog: &Value) -> Result<()> {
-    store_catalog(provider, catalog)
+    store_catalog(provider, catalog, cache())
 }
 
 #[cfg(test)]
@@ -542,6 +751,175 @@ mod tests {
             "prompt",
             "completion"
         ));
+    }
+
+    #[test]
+    fn zen_discovery_uses_live_prices_not_free_names_or_stale_descriptors() {
+        let mut current = zen("new-preview", json!(0), json!(0));
+        current["name"] = json!("New Preview");
+        current["limit"] = json!({"context":1048576,"output":65536});
+        let metadata = json!({"opencode":{"npm":"@ai-sdk/openai-compatible","models":{
+            "new-preview":current,
+            "old-free":zen("old-free",json!(0),json!(0)),
+            "new-pricing":zen("new-pricing",json!(0),json!(0))
+        }}});
+        let available = json!({"data":[
+            {"id":"new-preview"},
+            {"id":"old-free","cost":{"input":"0.1","output":0}},
+            {"id":"new-pricing","pricing":{"prompt":"0.1","completion":"0"}},
+            {"id":"unpublished-free"}
+        ]});
+        let catalog = merge_zen_catalog(&available, &metadata).unwrap();
+        assert_eq!(
+            models_from_catalog(Provider::Zen, &catalog).unwrap(),
+            ["zen/new-preview"]
+        );
+        let entries = model_entries_from_catalog(Provider::Zen, &catalog).unwrap();
+        let preview = entries
+            .iter()
+            .find(|entry| entry.id == "zen/new-preview")
+            .unwrap();
+        assert_eq!(preview.name, "New Preview");
+        assert_eq!(preview.context_tokens, Some(1048576));
+        assert_eq!(preview.output_tokens, Some(65536));
+        assert!(preview.selectable());
+        assert!(preview.detail().contains("rate limits can change"));
+        for id in ["zen/old-free", "zen/new-pricing"] {
+            let entry = entries.iter().find(|entry| entry.id == id).unwrap();
+            assert_eq!(entry.pricing, PriceStatus::Paid);
+            assert!(!entry.selectable());
+            assert!(entry.detail().contains("charge"));
+        }
+        let unknown = entries
+            .iter()
+            .find(|entry| entry.id == "zen/unpublished-free")
+            .unwrap();
+        assert_eq!(unknown.pricing, PriceStatus::Unknown);
+        assert_eq!(unknown.tools, None);
+        assert!(!unknown.selectable());
+        assert!(unknown.detail().contains("cannot be verified"));
+    }
+
+    #[test]
+    fn typed_catalog_preserves_capability_and_pricing_uncertainty() {
+        let mut supported = router("lab/current", json!({"prompt":"0","completion":"0"}));
+        supported["name"] = json!("Current\u{1b} Model");
+        supported["context_length"] = json!(200000);
+        supported["top_provider"] = json!({"max_completion_tokens":32768});
+        let mut missing_tools = router("lab/unknown-tools", json!({"prompt":"0","completion":"0"}));
+        missing_tools
+            .as_object_mut()
+            .unwrap()
+            .remove("supported_parameters");
+        let mut no_tools = router("lab/no-tools", json!({"prompt":"0","completion":"0"}));
+        no_tools["supported_parameters"] = json!([]);
+        let mut image = router("lab/image", json!({"prompt":"0","completion":"0"}));
+        image["architecture"]["output_modalities"] = json!(["image"]);
+        let duplicate = router("lab/duplicate", json!({"prompt":"0","completion":"0"}));
+        let entries = model_entries_from_catalog(
+            Provider::OpenRouter,
+            &json!({"data":[
+                supported,missing_tools,no_tools,image,duplicate.clone(),duplicate,
+                router("lab/unknown-price",json!({"prompt":"0","completion":"free"})),
+                router("lab/tiny-charge",json!({"prompt":"1e-999","completion":"0"})),
+                router("lab/invalid\nidentity",json!({"prompt":"0","completion":"0"}))
+            ]}),
+        )
+        .unwrap();
+        let selected: Vec<_> = entries.iter().filter(|entry| entry.selectable()).collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "openrouter/lab/current");
+        assert_eq!(selected[0].name, "Current Model");
+        assert_eq!(selected[0].context_tokens, Some(200000));
+        assert_eq!(selected[0].output_tokens, Some(32768));
+        assert!(entries.iter().all(|entry| !entry.id.contains('\n')));
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id.ends_with("unknown-tools"))
+                .unwrap()
+                .tools,
+            None
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id.ends_with("no-tools"))
+                .unwrap()
+                .tools,
+            Some(false)
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id.ends_with("unknown-price"))
+                .unwrap()
+                .pricing,
+            PriceStatus::Unknown
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id.ends_with("tiny-charge"))
+                .unwrap()
+                .pricing,
+            PriceStatus::Paid
+        );
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.id.ends_with("duplicate"))
+        {
+            assert!(!entry.selectable());
+            assert!(entry.detail().contains("duplicate"));
+        }
+        assert!(!known_charge(
+            &json!({"prompt":"0","completion":"0","overrides":[{"min_prompt_tokens":1000,"prompt":"0","completion":"0"}]})
+        ));
+        assert!(known_charge(
+            &json!({"prompt":"0","completion":"0","overrides":[{"min_prompt_tokens":1000,"completion":"0.1"}]})
+        ));
+        assert!(!known_charge(&json!({"prompt":"-1","completion":"NaN"})));
+    }
+
+    #[test]
+    fn explicit_refresh_bypasses_and_retires_cached_free_metadata() {
+        let cache = Mutex::new(CatalogCache::new());
+        let free = json!({"data":[router("lab/current",json!({"prompt":"0","completion":"0"}))]});
+        let paid = json!({"data":[router("lab/current",json!({"prompt":"0.1","completion":"0"}))]});
+        assert_eq!(
+            resolve_catalog(Provider::OpenRouter, false, &cache, || Ok(free.clone())).unwrap(),
+            free
+        );
+        assert_eq!(
+            resolve_catalog(Provider::OpenRouter, false, &cache, || panic!(
+                "TTL cache should avoid fetch"
+            ))
+            .unwrap(),
+            free
+        );
+        assert_eq!(
+            resolve_catalog(Provider::OpenRouter, true, &cache, || Ok(paid.clone())).unwrap(),
+            paid
+        );
+        assert!(
+            validate_catalog(
+                Provider::OpenRouter,
+                &cached_catalog(Provider::OpenRouter, &cache).unwrap(),
+                "openrouter/lab/current"
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_catalog(Provider::OpenRouter, true, &cache, || anyhow::bail!(
+                "temporary metadata failure"
+            ))
+            .is_err()
+        );
+        assert!(cached_catalog(Provider::OpenRouter, &cache).is_none());
+        assert_eq!(
+            resolve_catalog(Provider::OpenRouter, false, &cache, || Ok(free.clone())).unwrap(),
+            free
+        );
     }
 
     #[test]

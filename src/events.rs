@@ -40,6 +40,7 @@ pub enum Event {
         generated: u64,
         seconds: f64,
     },
+    ContextUsage(crate::context_usage::Usage),
     Tool(String),
     Check {
         command: String,

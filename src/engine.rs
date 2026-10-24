@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -64,36 +64,114 @@ fn socket_path(path: &Path) -> Result<PathBuf> {
     }
     Ok(base.join(format!("{:016x}.sock", h.finish())))
 }
+
+/// Serialize viewers opening the same checkout, including controller upgrades.
+/// The kernel releases this lock if a viewer exits; the file itself is retained.
+fn startup_lock(socket: &Path, deadline: Instant) -> Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(socket.with_extension("startup.lock"))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK)
+                && error.raw_os_error() != Some(libc::EAGAIN)
+            {
+                return Err(error).context("Could not lock controller startup");
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "Another window is opening this project. Return home and try again shortly."
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Ok(file)
+}
+
+/// Read only this startup attempt, retaining the newest useful failure output.
+fn startup_output(log_path: &Path, offset: u64) -> Result<String> {
+    let mut file = fs::File::open(log_path)?;
+    let end = file.metadata()?.len();
+    let offset = offset.min(end);
+    let start = offset.max(end.saturating_sub(4000));
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(end - start).read_to_end(&mut bytes)?;
+    let output = String::from_utf8_lossy(&bytes);
+    let prefix = if start > offset {
+        "[Earlier output from this startup omitted]\n"
+    } else {
+        ""
+    };
+    if output.trim().is_empty() {
+        Ok("The controller did not write an error message during this startup.".into())
+    } else {
+        Ok(format!("{prefix}{}", output.trim()))
+    }
+}
 impl Client {
+    pub fn connect_interactive(path: &Path) -> Result<Self> {
+        let path = fs::canonicalize(path)?;
+        let client = Self {
+            socket: socket_path(&path)?,
+        };
+        // Settings often reuse a controller that is already open. Avoid a
+        // loading surface (and its input handling) for that ordinary RPC.
+        if let Ok(status) = client.request(json!({"action":"status"}))
+            && status["version"] == env!("CARGO_PKG_VERSION")
+            && status["config"].as_str() == path.to_str()
+            && status["closing"] != true
+        {
+            return Ok(client);
+        }
+        crate::ui::busy("Opening project controller", move || Self::connect(&path))
+    }
+
     pub fn connect(path: &Path) -> Result<Self> {
         let path = fs::canonicalize(path)?;
         let client = Self {
             socket: socket_path(&path)?,
         };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let _startup = startup_lock(&client.socket, deadline)?;
         if let Ok(status) = client.request(json!({"action":"status"})) {
             ensure!(
                 status["config"].as_str() == path.to_str(),
                 "This checkout is already controlled with a different project configuration"
             );
-            if status["version"] == env!("CARGO_PKG_VERSION") {
+            let closing = status["closing"] == true;
+            if status["version"] == env!("CARGO_PKG_VERSION") && !closing {
                 return Ok(client);
             }
-            ensure!(
-                status["running"] == false,
-                "The previous Chuggin version ({}) still has a running or paused loop. Stop that loop in its original window before opening this version. Saved files remain available.",
-                status["version"].as_str().unwrap_or("unknown"),
-            );
-            // The old owner must agree it is idle: shutdown also refuses active
-            // chats, editing ownership and commands. Never force an upgrade.
-            client.request(json!({"action":"shutdown"})).context(
-                "The previous Chuggin controller still has active work. Finish its chat, editing session or commands in the original window before upgrading",
-            )?;
-            let deadline = Instant::now() + Duration::from_secs(10);
+            crate::events::send(crate::events::Event::Phase(
+                "Closing previous controller… waiting for shutdown to finish".into(),
+            ));
+            if !closing {
+                ensure!(
+                    status["running"] == false,
+                    "The previous Chuggin version ({}) still has a running or paused loop. Stop that loop in its original window before opening this version. Saved files remain available.",
+                    status["version"].as_str().unwrap_or("unknown"),
+                );
+                // The old owner must be idle. Loop-owned commands receive targeted
+                // cleanup and a saved explanation; operator commands still block upgrade.
+                client.request(json!({"action":"shutdown","cleanup_commands":true,"reason":"Controller version upgrade; loop-owned commands closed before restarting. Resume by inspecting saved files and command evidence."})).context(
+                    "The previous Chuggin controller still has active work. Finish its chat, editing session or commands in the original window before upgrading",
+                )?;
+            }
             while client.socket.exists() {
                 // Another new-version viewer may complete the upgrade first.
                 if let Ok(updated) = client.request(json!({"action":"status"}))
                     && updated["version"] == env!("CARGO_PKG_VERSION")
                     && updated["config"].as_str() == path.to_str()
+                    && updated["closing"] != true
                 {
                     return Ok(client);
                 }
@@ -104,10 +182,18 @@ impl Client {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        // Socket removal announces shutdown before the old process actually
+        // exits. Wait for both checkout locks, not just the socket pathname.
+        crate::runner::wait_project_idle(&crate::runner::load(&path)?, deadline)?;
+        crate::events::send(crate::events::Event::Phase(
+            "Starting project controller…".into(),
+        ));
+        let log_path = client.socket.with_extension("log");
         let mut log = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(client.socket.with_extension("log"))?;
+            .open(&log_path)?;
+        let log_offset = log.metadata()?.len();
         let mut child = std::process::Command::new(std::env::current_exe()?)
             .arg("engine")
             .stdin(std::process::Stdio::piped())
@@ -121,9 +207,13 @@ impl Client {
                 .context("Controller startup pipe missing")?,
             &path,
         )?;
-        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if client.request(json!({"action":"status"})).is_ok() {
+            if let Ok(status) = client.request(json!({"action":"status"})) {
+                ensure!(
+                    status["config"].as_str() == path.to_str()
+                        && status["version"] == env!("CARGO_PKG_VERSION"),
+                    "Another controller opened this checkout with a different configuration or version"
+                );
                 std::thread::spawn(move || match child.wait() {
                     Ok(status) if !status.success() => {
                         let _ = writeln!(
@@ -139,13 +229,12 @@ impl Client {
                 });
                 return Ok(client);
             }
-            if child.try_wait()?.is_some() {
+            if let Some(status) = child.try_wait()? {
                 anyhow::bail!(
-                    "Could not open project controller: {}. See {}",
-                    fs::read_to_string(client.socket.with_extension("log"))
-                        .map(|s| crate::project::excerpt(&s, 4000))
-                        .unwrap_or_default(),
-                    client.socket.with_extension("log").display()
+                    "Could not open project controller ({status}).\n\n{}\n\nController log: {}",
+                    startup_output(&log_path, log_offset)
+                        .unwrap_or_else(|error| format!("Could not read startup details: {error}")),
+                    log_path.display()
                 );
             }
             ensure!(
@@ -216,13 +305,9 @@ impl Client {
         self.request(json!({"action":"call","session_id":session,"name":name,"arguments":args,"operation_id":operation}))
     }
     /// Human UI only: this operation is deliberately absent from chat/MCP schemas.
-    pub fn update_helpers(
-        &self,
-        revision: &Value,
-        helpers: &crate::agents::Settings,
-    ) -> Result<Value> {
+    pub fn update_human_settings(&self, revision: &Value, settings: Value) -> Result<Value> {
         self.request(
-            json!({"action":"helper_settings","expected_revision":revision,"helpers":helpers}),
+            json!({"action":"human_settings","expected_revision":revision,"settings":settings}),
         )
     }
 }
@@ -298,19 +383,35 @@ impl Engine {
             }
             "retry" => Ok(json!({"retry_queued":self.controller.controls.retry_now()})),
             "helper_settings" => self.controller.update_helpers(&v),
+            "human_settings" => self.controller.update_human_settings(&v),
             "force_stop" => {
+                let _admission = self.controller.lifecycle.lock().unwrap();
+                self.controller.force_stop_loop_commands()?;
                 crate::project::kill_active_check();
+                self.controller.closing.store(true, Ordering::SeqCst);
                 self.quit.store(true, Ordering::SeqCst);
                 Ok(json!({"stopped":true}))
             }
             "shutdown" => {
+                let _admission = self.controller.lifecycle.lock().unwrap();
                 ensure!(
                     !self.controller.running.load(Ordering::SeqCst)
                         && !self.chats.any_running()
-                        && !self.controller.has_editor()
-                        && crate::project::active_checks().is_empty(),
-                    "Stop the loop and finish commands before quitting the controller"
+                        && !self.controller.has_editor(),
+                    "Stop the loop and finish chat/editing before quitting the controller"
                 );
+                if v["cleanup_commands"] == true {
+                    self.controller.shutdown_loop_commands(
+                        v["reason"].as_str().filter(|reason| !reason.trim().is_empty())
+                            .unwrap_or("Controller explicitly closed; loop-owned commands stopped, not verified"),
+                    )?;
+                } else {
+                    ensure!(
+                        crate::project::active_checks().is_empty(),
+                        "Commands remain owned by the controller. Finish them or explicitly close with cleanup_commands=true"
+                    );
+                }
+                self.controller.closing.store(true, Ordering::SeqCst);
                 self.quit.store(true, Ordering::SeqCst);
                 Ok(json!({"closing":true}))
             }
@@ -324,10 +425,22 @@ impl Engine {
             "tools" => Ok(crate::operator::schemas()),
             "call" => {
                 let session = text(&v, "session_id")?;
+                let name = text(&v, "name")?;
+                let _admission = if name != "resume_loop"
+                    && (name == "begin_edit" || crate::operator::is_mutation(name))
+                {
+                    Some(self.controller.lifecycle.lock().unwrap())
+                } else {
+                    None
+                };
+                ensure!(
+                    !self.controller.closing.load(Ordering::SeqCst),
+                    "Controller is closing; reconnect before continuing"
+                );
                 crate::events::set_actor(session);
                 self.controller.call(
                     session,
-                    text(&v, "name")?,
+                    name,
                     v["arguments"].clone(),
                     text(&v, "operation_id")?,
                 )
@@ -337,11 +450,18 @@ impl Engine {
                     .controller
                     .operation_path(text(&v, "session_id")?, text(&v, "operation_id")?)?,
             ),
-            "chat_send" => self.chats.send(
-                self.controller.clone(),
-                text(&v, "session_id")?,
-                text(&v, "message")?,
-            ),
+            "chat_send" => {
+                let _admission = self.controller.lifecycle.lock().unwrap();
+                ensure!(
+                    !self.controller.closing.load(Ordering::SeqCst),
+                    "Controller is closing; reconnect before continuing"
+                );
+                self.chats.send(
+                    self.controller.clone(),
+                    text(&v, "session_id")?,
+                    text(&v, "message")?,
+                )
+            }
             "chat_status" => self.chats.status(&self.controller, text(&v, "session_id")?),
             "chat_cancel" => {
                 self.chats.cancel(text(&v, "session_id")?);
@@ -534,9 +654,13 @@ pub fn close_idle(path: &Path) -> Result<()> {
     let client = Client {
         socket: socket_path(path)?,
     };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let _startup = startup_lock(&client.socket, deadline)?;
     if client.request(json!({"action":"status"})).is_ok() {
+        crate::events::send(crate::events::Event::Phase(
+            "Closing project controller… waiting for shutdown to finish".into(),
+        ));
         client.request(json!({"action":"shutdown"}))?;
-        let deadline = Instant::now() + Duration::from_secs(3);
         while client.socket.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(30));
         }
@@ -545,12 +669,75 @@ pub fn close_idle(path: &Path) -> Result<()> {
             "The project controller is still closing; try again shortly"
         );
     }
+    crate::runner::wait_project_idle(&crate::runner::load(path)?, deadline)?;
     Ok(())
+}
+
+pub fn close_idle_interactive(path: &Path) -> Result<()> {
+    let path = path.to_owned();
+    crate::ui::busy("Closing project controller", move || close_idle(&path))
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_error_omits_logs_from_previous_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.log");
+        let old = "OLD_RUN_OUTPUT\n".repeat(1000);
+        fs::write(&path, &old).unwrap();
+        let mut log = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(log, "CURRENT_STARTUP_FAILURE").unwrap();
+        let output = startup_output(&path, old.len() as u64).unwrap();
+        assert_eq!(output, "CURRENT_STARTUP_FAILURE");
+        assert!(!output.contains("OLD_RUN_OUTPUT"));
+    }
+
+    #[test]
+    fn startup_error_keeps_a_bounded_tail_and_handles_unicode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.log");
+        fs::write(&path, format!("{}\nLAST_FAILURE", "é".repeat(4000))).unwrap();
+        let output = startup_output(&path, 0).unwrap();
+        assert!(output.starts_with("[Earlier output from this startup omitted]"));
+        assert!(output.ends_with("LAST_FAILURE"));
+        assert!(output.len() < 4100);
+    }
+
+    #[test]
+    fn empty_startup_does_not_reuse_an_old_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.log");
+        fs::write(&path, "OLD_FAILURE").unwrap();
+        let output = startup_output(&path, 11).unwrap();
+        assert!(output.contains("did not write an error message"));
+        assert!(!output.contains("OLD_FAILURE"));
+    }
+
+    #[test]
+    fn startup_admission_waits_for_other_viewer_and_preserves_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("controller.sock");
+        let owner = startup_lock(&socket, Instant::now() + Duration::from_secs(1)).unwrap();
+        let lock_path = socket.with_extension("startup.lock");
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&lock_path).unwrap().ino()
+        };
+        assert!(startup_lock(&socket, Instant::now()).is_err());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(owner);
+        });
+        let next = startup_lock(&socket, Instant::now() + Duration::from_secs(1)).unwrap();
+        release.join().unwrap();
+        assert!(lock_path.exists());
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fs::metadata(&lock_path).unwrap().ino(), inode);
+        drop(next);
+    }
 
     fn request_with_reply(reply: &'static str) -> anyhow::Error {
         let dir = tempfile::tempdir().unwrap();

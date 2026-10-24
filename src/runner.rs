@@ -32,10 +32,19 @@ pub struct Config {
     pub active_hours: crate::schedule::Schedule,
     pub repo: PathBuf,
     pub goal: String,
+    #[serde(default)]
     pub ollama_url: String,
     pub model: String,
     #[serde(default)]
+    pub reasoning: crate::reasoning::Setting,
+    #[serde(default)]
+    pub setup_model: String,
+    #[serde(default)]
+    pub setup_reasoning: crate::reasoning::Setting,
+    #[serde(default)]
     pub chat_model: String,
+    #[serde(default)]
+    pub chat_reasoning: crate::reasoning::Setting,
     #[serde(default)]
     pub helpers: crate::agents::Settings,
     pub context_tokens: u32,
@@ -58,6 +67,41 @@ pub fn default_command_review() -> u64 {
 }
 pub fn default_request_timeout() -> u64 {
     1800
+}
+
+/// Local roles require an endpoint; cloud routes derive theirs from the model.
+pub(crate) fn validate_inference_connections(c: &Config) -> Result<()> {
+    let local_role = [
+        ("loop", c.model.as_str()),
+        ("setup", c.setup_model.as_str()),
+        ("chat", c.chat_model.as_str()),
+        (
+            "helper",
+            if c.helpers.enabled {
+                c.helpers.model.as_str()
+            } else {
+                ""
+            },
+        ),
+    ]
+    .into_iter()
+    .find(|(_, name)| {
+        !name.trim().is_empty()
+            && crate::cloud::provider(name).is_none()
+            && crate::groq::model_id(name).is_none()
+            && crate::chatgpt::model_id(name).is_none()
+    });
+    let Some((role, _)) = local_role else {
+        return Ok(());
+    };
+    let url = reqwest::Url::parse(&c.ollama_url).with_context(|| {
+        format!("The {role} model uses Ollama; configure a valid Ollama server URL")
+    })?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+        "The {role} model uses Ollama; its server must be an HTTP or HTTPS URL"
+    );
+    Ok(())
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -135,6 +179,7 @@ struct Conversation {
     migration_handoff_seen: Option<String>,
     migration_handoff: Option<Value>,
     helper_links: std::collections::BTreeMap<String, String>,
+    last_context_usage: Option<crate::context_usage::Usage>,
 }
 
 /// Compact evidence accompanies the transcript and survives conversation handoffs.
@@ -388,8 +433,21 @@ fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 pub fn load(path: &Path) -> Result<Config> {
-    let mut merged = serde_json::to_value(crate::setup::settings()?)?;
     let project: Value = serde_json::from_slice(&fs::read(path)?)?;
+    load_value(path, &project)
+}
+
+/// Validate a proposed project document with the same defaults as a saved one.
+pub(crate) fn load_value(path: &Path, project: &Value) -> Result<Config> {
+    load_value_with_settings(path, project, &crate::setup::settings()?)
+}
+
+fn load_value_with_settings(
+    path: &Path,
+    project: &Value,
+    defaults: &crate::setup::Settings,
+) -> Result<Config> {
+    let mut merged = serde_json::to_value(defaults)?;
     let fields = project
         .as_object()
         .context("Project configuration must be an object")?;
@@ -400,6 +458,13 @@ pub fn load(path: &Path) -> Result<Config> {
     // an existing project into helper traffic (including cloud spending).
     if !fields.contains_key("helpers") {
         merged["helpers"] = serde_json::to_value(crate::agents::Settings::default())?;
+    }
+    // A newly changed global thinking preference must not change the behavior
+    // of an existing project which predates explicit role settings.
+    for field in ["reasoning", "setup_reasoning", "chat_reasoning"] {
+        if !fields.contains_key(field) {
+            merged[field] = serde_json::to_value(crate::reasoning::Setting::default())?;
+        }
     }
     let mut c: Config = serde_json::from_value(merged)?;
     let parent = fs::canonicalize(
@@ -430,6 +495,10 @@ pub fn load(path: &Path) -> Result<Config> {
     );
     anyhow::ensure!(c.retry_seconds >= 1, "retry_seconds must be positive");
     c.helpers.validate()?;
+    c.reasoning.validate()?;
+    c.setup_reasoning.validate()?;
+    c.chat_reasoning.validate()?;
+    validate_inference_connections(&c)?;
     anyhow::ensure!(
         (1..=86400).contains(&c.command_review_seconds),
         "Command review interval must be 1–86400 seconds"
@@ -442,6 +511,133 @@ pub fn load(path: &Path) -> Result<Config> {
     }
     Ok(c)
 }
+
+#[cfg(test)]
+mod inference_connection_tests {
+    use super::*;
+
+    fn config(model: &str) -> Config {
+        serde_json::from_value(json!({
+            "repo":".", "state_dir":".chuggin", "goal":"Validate routes",
+            "model":model, "context_tokens":4096, "output_tokens":1024,
+            "implementation_calls":4, "checks":[{"argv":["true"],"timeout_seconds":10}],
+            "retry_seconds":1
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn cloud_roles_allow_missing_or_unused_local_endpoint() {
+        for main in [
+            "groq/example",
+            "zen/example",
+            "openrouter/vendor/example:free",
+            "chatgpt/example",
+        ] {
+            let mut c = config(main);
+            assert!(c.ollama_url.is_empty(), "Absent URL must default to empty");
+            c.setup_model = "zen/setup".into();
+            c.chat_model = "groq/chat".into();
+            c.helpers.enabled = true;
+            c.helpers.model = "openrouter/vendor/helper:free".into();
+            validate_inference_connections(&c).unwrap();
+            c.ollama_url = "unused endpoint from a retired connection".into();
+            validate_inference_connections(&c).unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_draft_and_disabled_local_helper_do_not_require_endpoint() {
+        let mut c = config("");
+        c.helpers.model = "local-helper".into();
+        validate_inference_connections(&c).unwrap();
+        c.model = "zen/example".into();
+        validate_inference_connections(&c).unwrap();
+        c.helpers.enabled = true;
+        let error = validate_inference_connections(&c).unwrap_err();
+        assert!(error.to_string().contains("helper model uses Ollama"));
+    }
+
+    #[test]
+    fn every_configured_local_role_requires_a_valid_endpoint() {
+        for role in ["loop", "setup", "chat", "helper"] {
+            let mut c = config("zen/example");
+            match role {
+                "loop" => c.model = "local-model".into(),
+                "setup" => c.setup_model = "local-model".into(),
+                "chat" => c.chat_model = "local-model".into(),
+                "helper" => {
+                    c.helpers.enabled = true;
+                    c.helpers.model = "local-model".into();
+                }
+                _ => unreachable!(),
+            }
+            for url in ["", "not a URL", "ftp://localhost"] {
+                c.ollama_url = url.into();
+                let error = validate_inference_connections(&c).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("{role} model uses Ollama"))
+                );
+            }
+            for url in ["http://localhost:11434", "https://ollama.example.test"] {
+                c.ollama_url = url.into();
+                validate_inference_connections(&c).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn namespaced_local_models_keep_the_ollama_route() {
+        let mut c = config("hf.co/vendor/model-GGUF:Q4_K_M");
+        assert!(validate_inference_connections(&c).is_err());
+        c.ollama_url = "http://localhost:11434".into();
+        validate_inference_connections(&c).unwrap();
+    }
+
+    #[test]
+    fn sparse_settings_update_inherits_limits_without_an_ollama_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chuggin.json");
+        let mut defaults = crate::setup::Settings {
+            ollama_url: String::new(),
+            context_tokens: 8192,
+            output_tokens: 2048,
+            implementation_calls: 7,
+            retry_seconds: 3,
+            ..Default::default()
+        };
+        defaults.helpers.enabled = true;
+        defaults.reasoning = crate::reasoning::Setting::On;
+        let mut proposed = json!({
+            "repo":".", "state_dir":".chuggin", "goal":"Keep a saved project working",
+            "model":"zen/example", "checks":[{"argv":["true"],"timeout_seconds":10}]
+        });
+        let c = load_value_with_settings(&path, &proposed, &defaults).unwrap();
+        assert!(c.ollama_url.is_empty());
+        assert_eq!(c.context_tokens, 8192);
+        assert_eq!(c.output_tokens, 2048);
+        assert_eq!(c.implementation_calls, 7);
+        assert_eq!(c.retry_seconds, 3);
+        assert_eq!(c.repo, fs::canonicalize(dir.path()).unwrap());
+        assert_eq!(c.state_dir, dir.path().join(".chuggin"));
+        assert!(
+            !c.helpers.enabled,
+            "Existing projects must not opt into helpers"
+        );
+        assert_eq!(c.reasoning, crate::reasoning::Setting::default());
+        // The same proposed JSON is revalidated after a live model switch.
+        proposed["model"] = json!("hf.co/vendor/model");
+        assert!(load_value_with_settings(&path, &proposed, &defaults).is_err());
+        proposed["ollama_url"] = json!("http://localhost:11434");
+        load_value_with_settings(&path, &proposed, &defaults).unwrap();
+        proposed["model"] = json!("groq/example");
+        proposed.as_object_mut().unwrap().remove("ollama_url");
+        load_value_with_settings(&path, &proposed, &defaults).unwrap();
+    }
+}
+
 pub fn init(path: &Path, repo: &Path, goal: &str) -> Result<()> {
     anyhow::ensure!(!path.exists(), "Config already exists: {}", path.display());
     let repo = fs::canonicalize(repo)?;
@@ -485,35 +681,253 @@ fn emit(art: &Path, stage: &str, value: &impl Serialize) -> Result<()> {
     save(&art.join(format!("{stage}.json")), value)
 }
 
+#[derive(Debug)]
+pub(crate) struct ProjectLocked {
+    pub(crate) path: PathBuf,
+    message: &'static str,
+}
+impl std::fmt::Display for ProjectLocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.message, self.path.display())
+    }
+}
+impl std::error::Error for ProjectLocked {}
+
+#[cfg(unix)]
+fn acquire_project_lock(file: &fs::File, path: &Path, message: &'static str) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error
+        .raw_os_error()
+        .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+    {
+        return Err(ProjectLocked {
+            path: path.into(),
+            message,
+        }
+        .into());
+    }
+    Err(error).with_context(|| format!("Cannot lock {}", path.display()))
+}
+
+#[cfg(unix)]
+fn release_project_lock(file: &fs::File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error).context("Cannot release temporary project ownership");
+        }
+    }
+}
+
 pub(crate) fn lock_project(c: &Config) -> Result<Vec<fs::File>> {
     fs::create_dir_all(&c.state_dir)?;
+    // Resolve Git before taking ownership: subprocesses should not inherit
+    // temporary state ownership while the second lock is still being acquired.
+    let checkout_path = crate::workspace::git_dir(&c.repo)?.join("chuggin-run.lock");
+    let run_path = c.state_dir.join("run.lock");
     let file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .open(c.state_dir.join("run.lock"))?;
+        .open(&run_path)?;
     #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        anyhow::ensure!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "Another Chuggin process is already running this project"
-        );
-    }
-    let checkout_lock = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(crate::workspace::git_dir(&c.repo)?.join("chuggin-run.lock"))?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        anyhow::ensure!(
-            unsafe { libc::flock(checkout_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "Another Chuggin process owns this checkout"
-        );
-    }
+    acquire_project_lock(
+        &file,
+        &run_path,
+        "Another Chuggin process is already running this project",
+    )?;
+    let checkout = (|| -> Result<fs::File> {
+        let checkout_lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&checkout_path)?;
+        #[cfg(unix)]
+        acquire_project_lock(
+            &checkout_lock,
+            &checkout_path,
+            "Another Chuggin process owns this checkout",
+        )?;
+        Ok(checkout_lock)
+    })();
+    let checkout_lock = match checkout {
+        Ok(checkout) => checkout,
+        Err(error) => {
+            // A concurrent fork can keep a dropped File's open description
+            // alive until exec. Explicitly undo only this partial ownership.
+            #[cfg(unix)]
+            release_project_lock(&file)?;
+            return Err(error);
+        }
+    };
     Ok(vec![file, checkout_lock])
+}
+
+/// Socket removal precedes process exit, so it does not establish lock release.
+/// Probe ownership without deleting lock files or retaining their descriptors.
+pub(crate) fn wait_project_idle(c: &Config, deadline: Instant) -> Result<()> {
+    let mut waiting_reported = false;
+    loop {
+        match lock_project(c) {
+            Ok(locks) => {
+                #[cfg(unix)]
+                for lock in locks.iter().rev() {
+                    release_project_lock(lock)?;
+                }
+                drop(locks);
+                return Ok(());
+            }
+            Err(error) if error.downcast_ref::<ProjectLocked>().is_some() => {
+                if !waiting_reported {
+                    crate::events::send(crate::events::Event::Phase(
+                        "Waiting for project ownership to be released…".into(),
+                    ));
+                    waiting_reported = true;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(
+                        error.context("Timed out waiting for project ownership to be released")
+                    );
+                }
+                thread::sleep(remaining.min(Duration::from_millis(50)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod project_lock_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    fn config(root: &Path) -> Config {
+        project::git(root, &["init", "-q"]).unwrap();
+        serde_json::from_value(json!({
+            "repo":root,"state_dir":root.join(".chuggin"),"goal":"Inspect lock ownership",
+            "ollama_url":"http://127.0.0.1:1","model":"fixture","context_tokens":8192,
+            "output_tokens":512,"implementation_calls":1,"checks":[],"retry_seconds":0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn waits_for_delayed_owner_release_and_drops_its_probe_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        let locks = lock_project(&c).unwrap();
+        let started = Instant::now();
+        let owner = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            drop(locks);
+        });
+        let actor = crate::events::actor();
+        crate::events::set_actor("project-lock-test");
+        let events = crate::events::subscribe_actor("project-lock-test");
+        wait_project_idle(&c, started + Duration::from_secs(2)).unwrap();
+        crate::events::set_actor(&actor);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_eq!(
+            events
+                .try_iter()
+                .filter(|event| matches!(event, crate::events::Event::Phase(_)))
+                .count(),
+            1,
+            "Wait phase must be emitted only once across retries"
+        );
+        owner.join().unwrap();
+        let _owner = lock_project(&c).expect("Idle probe must not retain lock ownership");
+    }
+
+    #[test]
+    fn a_genuine_owner_times_out_without_replacing_or_unlocking_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        let owner = lock_project(&c).unwrap();
+        let paths = [
+            c.state_dir.join("run.lock"),
+            c.repo.join(".git/chuggin-run.lock"),
+        ];
+        let inodes: Vec<u64> = paths
+            .iter()
+            .map(|path| {
+                fs::write(path, "owner evidence").unwrap();
+                fs::metadata(path).unwrap().ino()
+            })
+            .collect();
+        let error = wait_project_idle(&c, Instant::now() + Duration::from_millis(120)).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProjectLocked>().unwrap().path,
+            paths[0]
+        );
+        assert!(
+            lock_project(&c)
+                .unwrap_err()
+                .downcast_ref::<ProjectLocked>()
+                .is_some()
+        );
+        for (path, inode) in paths.iter().zip(inodes) {
+            assert_eq!(fs::metadata(path).unwrap().ino(), inode);
+            assert_eq!(fs::read_to_string(path).unwrap(), "owner evidence");
+        }
+        drop(owner);
+        let _owner = lock_project(&c).unwrap();
+    }
+
+    #[test]
+    fn non_contention_errors_are_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        fs::create_dir_all(c.state_dir.join("run.lock")).unwrap();
+        let started = Instant::now();
+        let error = wait_project_idle(&c, started + Duration::from_secs(10)).unwrap_err();
+        assert!(error.downcast_ref::<ProjectLocked>().is_none());
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn checkout_contention_releases_the_partially_acquired_state_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        let mut locks = lock_project(&c).unwrap();
+        let checkout = locks.pop().unwrap();
+        // Keep an inherited open description alive to exercise the distinction
+        // between closing a descriptor and explicitly releasing flock.
+        let inherited_state = locks[0].try_clone().unwrap();
+        release_project_lock(&locks[0]).unwrap();
+        drop(locks);
+        let error = lock_project(&c).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProjectLocked>().unwrap().path,
+            c.repo.join(".git/chuggin-run.lock")
+        );
+        let state_lock = fs::OpenOptions::new()
+            .write(true)
+            .open(c.state_dir.join("run.lock"))
+            .unwrap();
+        acquire_project_lock(
+            &state_lock,
+            &c.state_dir.join("run.lock"),
+            "State lock busy",
+        )
+        .unwrap();
+        release_project_lock(&state_lock).unwrap();
+        drop(state_lock);
+        drop(inherited_state);
+        release_project_lock(&checkout).unwrap();
+        drop(checkout);
+        let _owner = lock_project(&c).unwrap();
+    }
 }
 fn verify_workspace(c: &Config, workspace: &Path) -> Result<()> {
     anyhow::ensure!(
@@ -919,6 +1333,12 @@ fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
     } else {
         Conversation::default()
     };
+    if session.last_context_usage.is_none() {
+        // Preserve an older transcript's reported usage before adding the new field.
+        // An explicitly unknown field makes the reader skip legacy traces.
+        session.last_context_usage =
+            crate::context_usage::load(&c.state_dir, &c.model, c.context_tokens);
+    }
     if session.messages.is_empty() {
         session.messages = vec![
             json!({"role":"system","content":crate::prompts::WORK}),
@@ -1333,7 +1753,183 @@ struct WorkResult {
     project_completion: Option<Value>,
     summary: String,
 }
-type ValidationTickets = std::collections::HashMap<String, (Option<u64>, String)>;
+struct ValidationTicket {
+    task_id: Option<u64>,
+    tree: String,
+    cycle: u64,
+    art: PathBuf,
+}
+type ValidationTickets = std::collections::HashMap<String, ValidationTicket>;
+
+/// The controller owns commands independently of any inference turn or loop run.
+/// A soft stop retains this object and its validation provenance for resume.
+pub struct Commands {
+    jobs: crate::command_jobs::Jobs,
+    validation_tickets: ValidationTickets,
+    verification: Option<Verification>,
+    shutdown_updates: Vec<Value>,
+}
+struct Verification {
+    id: String,
+    tree: String,
+    task_id: Option<u64>,
+    checks: String,
+    art: PathBuf,
+    cycle: u64,
+}
+struct Verified {
+    results: Vec<CheckResult>,
+    tree: String,
+    art: PathBuf,
+    cycle: u64,
+}
+impl Commands {
+    pub fn new(controls: Arc<crate::run_control::RunControl>) -> Self {
+        Self {
+            jobs: crate::command_jobs::Jobs::with_controls(controls),
+            validation_tickets: ValidationTickets::new(),
+            verification: None,
+            shutdown_updates: Vec::new(),
+        }
+    }
+    pub fn owned_pids(&self) -> Vec<i32> {
+        self.jobs.owned_pids()
+    }
+    fn verify(
+        &mut self,
+        c: &Config,
+        state: &State,
+        m: &Model,
+        art: &Path,
+        stop: &AtomicBool,
+    ) -> Result<Option<Verified>> {
+        let tree = working_tree(&state.working_workspace, &c.state_dir)?;
+        if c.checks.is_empty() && !self.jobs.finite_running() {
+            return Ok(Some(Verified {
+                results: Vec::new(),
+                tree,
+                art: art.into(),
+                cycle: state.cycle,
+            }));
+        }
+        let task_id = state.current_task.as_ref().map(|_| state.task_serial);
+        let checks_key = serde_json::to_string(&c.checks)?;
+        if let Some(verification) = &self.verification {
+            let snapshot = self
+                .jobs
+                .get(&verification.id)
+                .ok()
+                .map(|job| job.poll(0, stop))
+                .transpose()?;
+            if let Some(snapshot) = snapshot {
+                if snapshot["running"] == true {
+                    return Ok(None);
+                }
+                if !self.jobs.finite_running()
+                    && verification.tree == tree
+                    && verification.task_id == task_id
+                    && verification.checks == checks_key
+                    && snapshot["passed"] == true
+                    && snapshot["checks_complete"] == true
+                {
+                    return Ok(Some(Verified {
+                        results: serde_json::from_value(snapshot["checks"].clone())?,
+                        tree: verification.tree.clone(),
+                        art: verification.art.clone(),
+                        cycle: verification.cycle,
+                    }));
+                }
+            }
+        }
+        if self.jobs.finite_running() {
+            return Ok(None);
+        }
+        self.verification = None;
+        let id = format!("cycle-{:06}-verification", state.cycle);
+        let checks = c
+            .checks
+            .iter()
+            .cloned()
+            .map(|mut check| {
+                check.timeout_seconds = check
+                    .timeout_seconds
+                    .min(m.command_review_seconds(c.command_review_seconds));
+                check
+            })
+            .collect();
+        let job =
+            crate::command_jobs::Job::new(&state.working_workspace, art, &id, checks, true, false)?
+                .with_origin(task_id, state.current_task.as_ref());
+        self.jobs.start(job, stop)?;
+        self.validation_tickets.insert(
+            id.clone(),
+            ValidationTicket {
+                task_id,
+                tree: tree.clone(),
+                cycle: state.cycle,
+                art: art.into(),
+            },
+        );
+        self.verification = Some(Verification {
+            id: id.clone(),
+            tree: tree.clone(),
+            task_id,
+            checks: checks_key,
+            art: art.into(),
+            cycle: state.cycle,
+        });
+        // This grace period waits for output, never kills the process. Longer
+        // checks remain owned and give the main agent control on the next cycle.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let job = self.jobs.get(&id)?;
+            let snapshot = job.poll(100, stop)?;
+            if snapshot["running"] == false {
+                return Ok(Some(Verified {
+                    results: serde_json::from_value(snapshot["checks"].clone())?,
+                    tree,
+                    art: art.into(),
+                    cycle: state.cycle,
+                }));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            job.review(c, state.current_task.as_ref(), m, stop)?;
+        }
+    }
+    pub fn shutdown(&mut self, state_dir: &Path, reason: &str) -> Result<()> {
+        let updates = self.jobs.shutdown(reason, &AtomicBool::new(false))?;
+        self.shutdown_updates.extend(updates);
+        self.validation_tickets.clear();
+        self.verification = None;
+        if !self.shutdown_updates.is_empty() {
+            let path = state_dir.join("command-lifecycle.json");
+            let mut notices: Vec<Value> = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            notices.push(json!({"command_updates":self.shutdown_updates,"reason":reason,"instruction":"Chuggin explicitly closed these owned command sessions. Treat stop_reason as a harness interruption, not an application crash or a passing check. Inspect saved output before retrying; terminated commands and unrun checks were not verified."}));
+            if notices.len() > 32 {
+                notices.drain(..notices.len() - 32);
+            }
+            save(&path, &notices)?;
+            self.shutdown_updates.clear();
+        }
+        Ok(())
+    }
+}
+
+fn command_key(update: &Value, fallback: &Path, id: &str) -> String {
+    let origin = update["artifact_directory"]
+        .as_str()
+        .map(Path::new)
+        .unwrap_or(fallback);
+    format!(
+        "{}/{id}",
+        origin.file_name().unwrap_or_default().to_string_lossy()
+    )
+}
 fn observe_command_validation(
     c: &Config,
     s: &State,
@@ -1348,10 +1944,7 @@ fn observe_command_validation(
     let Some(id) = update["command_id"].as_str() else {
         return Ok(());
     };
-    let command_key = format!(
-        "{}/{id}",
-        art.file_name().unwrap_or_default().to_string_lossy()
-    );
+    let command_key = command_key(update, art, id);
     if !session.command_watch.has_pending(&command_key) && !tickets.contains_key(id) {
         return Ok(());
     }
@@ -1368,17 +1961,17 @@ fn observe_command_validation(
         )?;
         crate::events::log(session.command_watch.notice());
     }
-    let Some((task_id, checked_tree)) = tickets.remove(id) else {
+    let Some(ticket) = tickets.remove(id) else {
         return Ok(());
     };
     let results = update["checks"].clone();
     let logs = if let Some(rows) = results.as_array() {
         (0..rows.len())
-            .filter(|i| art.join(format!("command-{id}-{i}.log")).is_file())
+            .filter(|i| ticket.art.join(format!("command-{id}-{i}.log")).is_file())
             .map(|i| {
                 format!(
                     "{}/command-{id}-{i}.log",
-                    art.file_name().unwrap_or_default().to_string_lossy()
+                    ticket.art.file_name().unwrap_or_default().to_string_lossy()
                 )
             })
             .collect()
@@ -1386,23 +1979,31 @@ fn observe_command_validation(
         Vec::new()
     };
     session.note.validation(
-        (task_id, s.cycle),
-        &checked_tree,
+        (ticket.task_id, ticket.cycle),
+        &ticket.tree,
         results,
         logs,
-        current == checked_tree,
+        current == ticket.tree,
     );
     Ok(())
+}
+struct WorkSession<'a> {
+    conversation: &'a mut Conversation,
+    commands: &'a mut Commands,
 }
 fn work(
     config_path: &Path,
     c: &Config,
     s: &mut State,
     m: &Model,
-    session: &mut Conversation,
+    work_session: WorkSession<'_>,
     art: &Path,
     stop: &AtomicBool,
 ) -> Result<WorkResult> {
+    let WorkSession {
+        conversation: session,
+        commands,
+    } = work_session;
     crate::events::send(crate::events::Event::Phase("Orient".into()));
     session
         .note
@@ -1411,10 +2012,17 @@ fn work(
         json!({"id":task.id,"title":task.title,"checkpoint":task.checkpoint,"summary_available_in_history":true})
     } else { serde_json::to_value(task).unwrap_or_default() });
     session.messages.push(json!({"role":"user","content":json!({"cycle":s.cycle,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":completed,"working_checkpoint":s.working_ref,"instruction":if s.current_task.is_some() {"Continue the active task from existing files and the latest check feedback. Investigate and repair unresolved failures. All work is retained."} else {"There is no active task. Previous completions are already saved. Inspect what is needed toward the main goal and use set_task for the next useful task, then work on it. Research and foundational work count; do not report an old task complete again."}}).to_string()}));
-    save_conversation(c, session)?;
     let mut research = crate::web_tools::Research::default();
-    let mut jobs = crate::command_jobs::Jobs::with_controls(m.controls.clone());
-    let mut validation_tickets = ValidationTickets::new();
+    let Commands {
+        jobs,
+        validation_tickets,
+        ..
+    } = commands;
+    let active = jobs.running_snapshots()?;
+    if !active.is_empty() {
+        session.messages.push(json!({"role":"user","content":json!({"running_commands":active,"instruction":"These controller-owned commands remain alive across cycles and soft stops. Reuse their command_id to inspect, supply input, or explicitly stop them; do not launch duplicates. Background apps can remain open while you work. Finite commands must finish before new writes or validation; an unfinished command is not a passing check. The next cycle gives you control again even when a process remains running."}).to_string()}));
+    }
+    save_conversation(c, session)?;
     let mut finish_requested = None;
     let mut project_completion = None;
     let mut summary = String::new();
@@ -1439,12 +2047,12 @@ fn work(
             session.observed_tree = tree;
         }
         for update in command_updates {
-            observe_command_validation(c, s, session, &update, &mut validation_tickets, art)?;
+            observe_command_validation(c, s, session, &update, validation_tickets, art)?;
             session.messages.push(
                 json!({"role":"user","content":json!({"command_update":update}).to_string()}),
             );
         }
-        if !jobs.running() {
+        if !jobs.finite_running() {
             recover_commands(c, s, m, session, art)?;
         }
         if std::mem::take(&mut session.command_watch.notice_pending) {
@@ -1522,7 +2130,7 @@ fn work(
                 .push(crate::model::goal_completion_tool());
         }
         crate::events::send(crate::events::Event::Phase("Work".into()));
-        let proposal_has_commands = jobs.running();
+        let proposal_has_commands = jobs.finite_running();
         let proposal_tree = working_tree(&s.working_workspace, &c.state_dir)?;
         if !session.observed_tree.is_empty()
             && session.observed_tree != proposal_tree
@@ -1544,7 +2152,13 @@ fn work(
         }
         session.observed_tree = proposal_tree.clone();
         let proposal_generation = m.controls.changed.load(Ordering::SeqCst);
-        let response = match m.chat(&session.messages, Some(session.tools.clone()), false) {
+        let requested = m.chat(&session.messages, Some(session.tools.clone()), false);
+        if let Some(usage) = m.take_context_usage() {
+            session.last_context_usage = Some(usage.clone());
+            save_conversation(c, session)?;
+            crate::events::send(crate::events::Event::ContextUsage(usage));
+        }
+        let response = match requested {
             Ok(response) => response,
             Err(error) => {
                 if error.downcast_ref::<crate::provider::Stopped>().is_some() {
@@ -1632,7 +2246,7 @@ fn work(
                 .into());
             }
             crate::workspace::check(&s.working_workspace, &s.working_branch)?;
-            let had_running_commands = jobs.running();
+            let had_running_commands = jobs.finite_running();
             completed_commands.extend(jobs.refresh_finished(stop)?);
             let now_tree = working_tree(&s.working_workspace, &c.state_dir)?;
             if now_tree != observed_tree && !had_running_commands {
@@ -1652,7 +2266,7 @@ fn work(
             )));
             let root = s.working_workspace.clone();
             let command = matches!(name, "run_command" | "run_checks" | "compiler_diagnostics");
-            let before_command = if command && !jobs.running() {
+            let before_command = if command && !jobs.finite_running() {
                 working_tree(&root, &c.state_dir).ok()
             } else {
                 None
@@ -1708,7 +2322,7 @@ fn work(
                         "Project files changed while this response was pending. These actions were not executed. Re-read the current files before proposing edits or completion."
                     );
                 }
-                if jobs.running()
+                if jobs.finite_running()
                     && matches!(
                         name,
                         "run_command"
@@ -1723,7 +2337,7 @@ fn work(
                     )
                 {
                     anyhow::bail!(
-                        "A command is still running: {}. Use command_status with command_id and wait_ms (up to 60000), or read_command_log with log_id. Read files, update the task plan, or request a read-only investigation while waiting. Finish or explicitly stop the command before edits, more commands, or task completion.",
+                        "A finite command is still running: {}. Use command_status with command_id and wait_ms (up to 60000), or read_command_log with log_id. Read files, update the task plan, or request a read-only investigation while waiting. Finish or explicitly stop the finite command before edits, more commands, or task completion. A cycle boundary does not close it; you retain control in the next cycle.",
                         serde_json::to_string(&jobs.running_snapshots()?)?
                     );
                 }
@@ -1761,6 +2375,10 @@ fn work(
                         Ok(json!({"task_id":s.task_serial,"message":"Task recorded. Files and criteria are planning hints, not edit restrictions. Existing work is retained."}).to_string())
                     }
                     "finish_project" => {
+                        anyhow::ensure!(
+                            !jobs.running(),
+                            "Commands are still running. Inspect and explicitly stop background apps before reporting the overall goal complete; wait for finite checks to finish."
+                        );
                         anyhow::ensure!(
                             allow_completion && load(config_path)?.allow_goal_completion,
                             "Goal completion is not enabled by the user"
@@ -2002,11 +2620,20 @@ fn work(
                         let job = crate::command_jobs::Job::new(
                             &root,
                             art,
-                            &format!("{step}-{index}"),
+                            &format!("cycle-{:06}-{step}-{index}", s.cycle),
                             checks,
                             name == "run_checks",
                             name == "compiler_diagnostics",
-                        )?;
+                        )?
+                        .with_mode(
+                            match args["mode"].as_str().unwrap_or("finite") {
+                                "finite" => crate::command_jobs::CommandMode::Finite,
+                                "background" if name == "run_command" => crate::command_jobs::CommandMode::Background,
+                                _ => anyhow::bail!("mode must be finite or background; only run_command supports background apps"),
+                            },
+                            args["reason"].as_str().unwrap_or(""),
+                        )?
+                        .with_origin(s.current_task.as_ref().map(|_| s.task_serial), s.current_task.as_ref());
                         let mut output = jobs.start(job, stop)?;
                         if name == "run_checks" {
                             validation_tickets.insert(
@@ -2014,12 +2641,14 @@ fn work(
                                     .as_str()
                                     .context("Missing started command id")?
                                     .to_owned(),
-                                (
-                                    s.current_task.as_ref().map(|_| s.task_serial),
-                                    before_command
+                                ValidationTicket {
+                                    task_id: s.current_task.as_ref().map(|_| s.task_serial),
+                                    tree: before_command
                                         .clone()
                                         .context("Missing validation file state")?,
-                                ),
+                                    cycle: s.cycle,
+                                    art: art.into(),
+                                },
                             );
                         }
                         output["arguments_normalized"] = json!(args["argv"].is_string());
@@ -2095,7 +2724,7 @@ fn work(
                     s,
                     session,
                     &value["result"],
-                    &mut validation_tickets,
+                    validation_tickets,
                     art,
                 )?;
             }
@@ -2174,7 +2803,7 @@ fn work(
             save_conversation(c, session)?;
         }
         for update in completed_commands {
-            observe_command_validation(c, s, session, &update, &mut validation_tickets, art)?;
+            observe_command_validation(c, s, session, &update, validation_tickets, art)?;
             session.messages.push(
                 json!({"role":"user","content":json!({"command_update":update}).to_string()}),
             );
@@ -2204,11 +2833,14 @@ fn work(
         }
     }
     m.pause_point();
-    for update in jobs.drain(c, s.current_task.as_ref(), m, stop)? {
-        observe_command_validation(c, s, session, &update, &mut validation_tickets, art)?;
+    for update in jobs.refresh_finished(stop)? {
+        observe_command_validation(c, s, session, &update, validation_tickets, art)?;
         session.messages.push(
             json!({"role":"user","content":json!({"command_final_result":update}).to_string()}),
         );
+    }
+    if jobs.running() {
+        session.messages.push(json!({"role":"user","content":json!({"running_commands":jobs.running_snapshots()?,"instruction":"This response batch ended, but these commands remain owned and running. Continue managing them on the next cycle; there is no wait-for-all barrier and no automatic closure at this boundary. Validation stays pending while finite commands run."}).to_string()}));
     }
     let tree = working_tree(&s.working_workspace, &c.state_dir)?;
     if tree != session.observed_tree {
@@ -2228,11 +2860,12 @@ fn work(
 pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()> {
     crate::engine::run(path, count, stop)
 }
-pub fn run_controlled(
+pub fn run_controlled_with_commands(
     path: &Path,
     count: Option<u64>,
     stop: Arc<AtomicBool>,
     controls: Arc<crate::run_control::RunControl>,
+    commands: &mut Commands,
 ) -> Result<()> {
     controls.bind_stop(stop.clone());
     controls.configure(path);
@@ -2256,6 +2889,48 @@ pub fn run_controlled(
         fs::remove_file(c.state_dir.join("goal-completion.json"))?;
     }
     let mut session = load_conversation(&c, &state)?;
+    let lifecycle_path = c.state_dir.join("command-lifecycle.json");
+    let mut notices: Vec<Value> = fs::read(&lifecycle_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    if !commands.shutdown_updates.is_empty() {
+        notices.push(json!({"command_updates":commands.shutdown_updates,"instruction":"A previous controller cleanup stopped these commands but could not save its notice. The recorded stop_reason explains intentional harness interruption, not an application crash or a passing check. Inspect saved output before retrying."}));
+    }
+    let closed: std::collections::HashSet<String> = notices
+        .iter()
+        .flat_map(|notice| notice["command_updates"].as_array().into_iter().flatten())
+        .filter_map(|update| {
+            update["command_id"]
+                .as_str()
+                .map(|id| command_key(update, &c.state_dir, id))
+        })
+        .collect();
+    let known: std::collections::HashSet<String> = commands
+        .jobs
+        .known_ids()
+        .into_iter()
+        .map(|id| {
+            // A loop command ID embeds its originating artifact directory.
+            let cycle = id.split('-').take(2).collect::<Vec<_>>().join("-");
+            format!("{cycle}/{id}")
+        })
+        .collect();
+    let unattached: Vec<String> = session
+        .command_watch
+        .pending_ids()
+        .into_iter()
+        .filter(|id| !known.contains(id) && !closed.contains(id))
+        .collect();
+    session.command_watch.retain_pending(&known);
+    for notice in &notices {
+        session
+            .messages
+            .push(json!({"role":"user","content":notice.to_string()}));
+    }
+    if !unattached.is_empty() {
+        session.messages.push(json!({"role":"user","content":json!({"unattached_commands":unattached,"instruction":"These saved command handles belong to a previous controller and are not reattached. Their execution status is unknown; inspect saved command logs and the current project before retrying. Do not assume they crashed or completed successfully, and do not send tools to retired handles."}).to_string()}));
+    }
     let resumed_context = json!({"role":"user","content":format!("Current overall goal: {}. Current visible project folder: {}. Branch: {}. HEAD: {}. Work directly here. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work; completed tasks may create normal commits.",c.goal,state.working_workspace.display(),state.working_branch,state.branch_head)});
     if crate::groq::model_id(&c.model).is_some() && session.messages.len() >= 2 {
         // Groq's free request allowance cannot afford a second copy of a long goal.
@@ -2265,6 +2940,10 @@ pub fn run_controlled(
         session.messages.push(resumed_context);
     }
     save_conversation(&c, &session)?;
+    commands.shutdown_updates.clear();
+    if !notices.is_empty() && lifecycle_path.is_file() {
+        fs::remove_file(lifecycle_path)?;
+    }
     crate::events::log(format!(
         "Working directly in {} on {}",
         state.working_workspace.display(),
@@ -2340,7 +3019,10 @@ pub fn run_controlled(
             &c,
             &mut state,
             &model,
-            &mut session,
+            WorkSession {
+                conversation: &mut session,
+                commands,
+            },
             &art,
             &stage_stop,
         );
@@ -2370,32 +3052,38 @@ pub fn run_controlled(
         }
         let check_generation = controls.changed.load(Ordering::SeqCst);
         let before_check = working_tree(&state.working_workspace, &c.state_dir)?;
-        let validation = (|| -> Result<Vec<CheckResult>> {
-            if c.checks.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut job = crate::command_jobs::Job::new(
-                &state.working_workspace,
+        for update in commands.jobs.refresh_finished(&stage_stop)? {
+            observe_command_validation(
+                &c,
+                &state,
+                &mut session,
+                &update,
+                &mut commands.validation_tickets,
                 &art,
-                "verification",
-                c.checks
-                    .iter()
-                    .cloned()
-                    .map(|mut check| {
-                        check.timeout_seconds = check
-                            .timeout_seconds
-                            .min(model.command_review_seconds(c.command_review_seconds));
-                        check
-                    })
-                    .collect(),
-                true,
-                false,
             )?;
-            job.wait(&c, state.current_task.as_ref(), &model, &stage_stop)
-        })();
+            session.messages.push(
+                json!({"role":"user","content":json!({"command_update":update}).to_string()}),
+            );
+        }
+        let validation = commands.verify(&c, &state, &model, &art, &stage_stop);
         let after_check = working_tree(&state.working_workspace, &c.state_dir)?;
-        let check_error = validation.as_ref().err().map(|e| format!("{e:#}"));
-        let results = validation.unwrap_or_default();
+        let checks_pending = validation.as_ref().is_ok_and(Option::is_none);
+        let check_error = if checks_pending {
+            Some("Validation is pending while a finite command runs. Manage the existing command_id next cycle; no check has been assumed to pass.".into())
+        } else {
+            validation.as_ref().err().map(|e| format!("{e:#}"))
+        };
+        let verified = validation.ok().flatten();
+        let checked_tree = verified
+            .as_ref()
+            .map(|v| v.tree.clone())
+            .unwrap_or_else(|| before_check.clone());
+        let verification_art = verified
+            .as_ref()
+            .map(|v| v.art.clone())
+            .unwrap_or_else(|| art.clone());
+        let verification_cycle = verified.as_ref().map(|v| v.cycle).unwrap_or(state.cycle);
+        let results = verified.map(|v| v.results).unwrap_or_default();
         emit(&art, "verification", &results)?;
         model.pause_point();
         if controls.stopped_while_held() {
@@ -2411,8 +3099,11 @@ pub fn run_controlled(
             }
         }
         let saved_candidate = working_tree(&state.working_workspace, &c.state_dir)?;
-        let mut checked_same_files =
-            same_generation && before_check == after_check && after_check == saved_candidate;
+        let mut checked_same_files = !checks_pending
+            && same_generation
+            && checked_tree == before_check
+            && before_check == after_check
+            && after_check == saved_candidate;
         let mut passed =
             !results.is_empty() && results.iter().all(|r| r.passed) && checked_same_files;
         crate::events::send(crate::events::Event::Phase("Review".into()));
@@ -2427,7 +3118,7 @@ pub fn run_controlled(
             .map(|r| r.summary.as_str())
             .unwrap_or("Model request interrupted");
         let unfinished=results.iter().filter(|r|!r.passed).map(|r|json!({"argv":r.argv,"exit_code":r.exit_code,"timed_out":r.timed_out,"output":r.output})).collect::<Vec<_>>();
-        let mut feedback = json!({"summary":summary,"checks_passed":passed,"check_results":unfinished,"check_error":check_error,"checked_snapshot_unchanged":checked_same_files,"request_error":error,"instruction":crate::prompts::REVIEW});
+        let mut feedback = json!({"summary":summary,"checks_passed":passed,"checks_pending":checks_pending,"running_commands":commands.jobs.running_snapshots()?,"check_results":unfinished,"check_error":check_error,"checked_snapshot_unchanged":checked_same_files,"request_error":error,"instruction":crate::prompts::REVIEW});
         state.feedback = feedback.to_string();
         // Save the complete working tree even if requests or checks failed.
         crate::events::send(crate::events::Event::Phase("Checkpoint".into()));
@@ -2500,24 +3191,35 @@ pub fn run_controlled(
         if changed || finished {
             session.feedback_narration_archived = false;
         }
-        session.note.validation(
-            (
-                state.current_task.as_ref().map(|_| state.task_serial),
-                state.cycle,
-            ),
-            &before_check,
-            serde_json::to_value(&results)?,
-            (0..results.len())
-                .filter(|i| art.join(format!("command-verification-{i}.log")).is_file())
-                .map(|i| {
-                    format!(
-                        "{}/command-verification-{i}.log",
-                        art.file_name().unwrap_or_default().to_string_lossy()
-                    )
-                })
-                .collect(),
-            checked_same_files,
-        );
+        if !checks_pending {
+            session.note.validation(
+                (
+                    state.current_task.as_ref().map(|_| state.task_serial),
+                    verification_cycle,
+                ),
+                &checked_tree,
+                serde_json::to_value(&results)?,
+                (0..results.len())
+                    .filter(|i| {
+                        verification_art
+                            .join(format!(
+                                "command-cycle-{verification_cycle:06}-verification-{i}.log"
+                            ))
+                            .is_file()
+                    })
+                    .map(|i| {
+                        format!(
+                            "{}/command-cycle-{verification_cycle:06}-verification-{i}.log",
+                            verification_art
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                        )
+                    })
+                    .collect(),
+                checked_same_files,
+            );
+        }
         emit(&art, "repair-note", &session.note)?;
         if finished {
             session.prose_watch.progress();
@@ -2591,6 +3293,8 @@ pub fn run_controlled(
             .ok()
             .and_then(|r| r.project_completion.clone())
             && load(path)?.allow_goal_completion
+            && !checks_pending
+            && !commands.jobs.running()
         {
             report["checkpoint"] = json!(state.working_ref);
             report["cycle"] = json!(state.cycle);
@@ -2646,6 +3350,102 @@ pub fn run_controlled(
 #[cfg(test)]
 mod conversation_tests {
     use super::*;
+    #[test]
+    fn saved_context_usage_survives_legacy_resume_and_conversation_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let c: Config = serde_json::from_value(json!({
+            "repo":dir.path(),"state_dir":dir.path(),"goal":"Retain context evidence",
+            "ollama_url":"http://unused","model":"unused","context_tokens":4096,
+            "output_tokens":1024,"implementation_calls":4,"checks":[],"retry_seconds":0
+        }))
+        .unwrap();
+        let s = State {
+            working_workspace: dir.path().into(),
+            ..State::default()
+        };
+        save(
+            &c.state_dir.join("conversation.json"),
+            &json!({"messages":[],"tools":[]}),
+        )
+        .unwrap();
+        let art = c.state_dir.join("cycle-000001");
+        fs::create_dir(&art).unwrap();
+        save(
+            &art.join("request-000.json"),
+            &json!({"model":"unused","messages":[],"options":{"num_ctx":4096},
+                "tools":[{"function":{"name":"set_task"}}]}),
+        )
+        .unwrap();
+        fs::write(
+            art.join("response-000.ndjson"),
+            json!({"done":true,"prompt_eval_count":321,"eval_count":10}).to_string(),
+        )
+        .unwrap();
+
+        let mut session = load_conversation(&c, &s).unwrap();
+        assert_eq!(session.last_context_usage.as_ref().unwrap().prompt, 321);
+        // Saving the new field must not discard a legacy count on the next resume.
+        session = load_conversation(&c, &s).unwrap();
+        assert_eq!(session.last_context_usage.as_ref().unwrap().prompt, 321);
+        refresh_conversation(&c, &s, &mut session, &art, "Capacity handoff", false).unwrap();
+        let resumed = load_conversation(&c, &s).unwrap();
+        assert_eq!(resumed.last_context_usage.as_ref().unwrap().prompt, 321);
+        assert!(
+            resumed
+                .messages
+                .iter()
+                .all(|message| message.get("last_context_usage").is_none()),
+            "Display metadata must remain outside the model conversation"
+        );
+
+        session.last_context_usage = None;
+        save_conversation(&c, &session).unwrap();
+        assert!(
+            load_conversation(&c, &s)
+                .unwrap()
+                .last_context_usage
+                .is_none()
+        );
+    }
+    #[test]
+    fn failed_cleanup_notice_write_can_be_retried_without_losing_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let art = dir.path().join("cycle-000001");
+        fs::create_dir(&art).unwrap();
+        let mut commands = Commands::new(Arc::new(crate::run_control::RunControl::default()));
+        let job = crate::command_jobs::Job::new(
+            dir.path(),
+            &art,
+            "cycle-000001-app",
+            vec![Check {
+                argv: vec!["sh".into(), "-c".into(), "printf ready; read reply".into()],
+                timeout_seconds: 300,
+            }],
+            false,
+            false,
+        )
+        .unwrap();
+        commands.jobs.start(job, &AtomicBool::new(false)).unwrap();
+        let path = dir.path().join("command-lifecycle.json");
+        fs::create_dir(&path).unwrap();
+        assert!(
+            commands
+                .shutdown(dir.path(), "Controller intentionally closed")
+                .is_err()
+        );
+        assert!(!commands.jobs.running());
+        assert!(!commands.shutdown_updates.is_empty());
+        fs::remove_dir(&path).unwrap();
+        commands
+            .shutdown(dir.path(), "Retry cleanup notice")
+            .unwrap();
+        let notices: Vec<Value> = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let update = &notices[0]["command_updates"][0];
+        assert_eq!(update["command_id"], "cycle-000001-app");
+        assert_eq!(update["stop_reason"], "Controller intentionally closed");
+        assert_eq!(update["passed"], false);
+        assert!(commands.shutdown_updates.is_empty());
+    }
     #[test]
     fn repetition_recovery_keeps_goal_nudge_and_facts_without_reseeding_narration() {
         let dir = tempfile::tempdir().unwrap();
@@ -3000,7 +3800,7 @@ pub fn migration_preview(path: &Path) -> Result<String> {
 }
 pub fn migration_apply(path: &Path, clear_staging: bool) -> Result<()> {
     let c = load(path)?;
-    crate::engine::close_idle(path)?;
+    crate::engine::close_idle_interactive(path)?;
     let _lock = lock_project(&c)?;
     let mut s: State = serde_json::from_slice(&fs::read(c.state_dir.join("state.json"))?)?;
     let preview = crate::migration::load(&c.state_dir)?;

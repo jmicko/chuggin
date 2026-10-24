@@ -161,6 +161,325 @@ impl Drop for Fixture {
         let _ = self.child.wait();
     }
 }
+
+struct StartupMcp {
+    child: Child,
+    input: std::process::ChildStdin,
+    responses: std::sync::mpsc::Receiver<String>,
+    error_log: PathBuf,
+    next_id: u64,
+}
+impl StartupMcp {
+    fn start(fixture: &Fixture, label: &str) -> Self {
+        let error_log = fixture
+            .dir
+            .path()
+            .join("config")
+            .join(format!("{label}.log"));
+        let log = fs::File::create(&error_log).unwrap();
+        let mut child = Command::new(BIN)
+            .args(["mcp", "--project"])
+            .arg(fixture.dir.path())
+            .env("XDG_CONFIG_HOME", fixture.dir.path().join("config"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (tx, responses) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+        let mut process = Self {
+            child,
+            input,
+            responses,
+            error_log,
+            next_id: 2,
+        };
+        writeln!(process.input, "{}", json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"startup-regression","version":"1"}}})).unwrap();
+        process
+    }
+    fn initialized(&mut self) {
+        let response = self.receive(1);
+        assert!(response.get("result").is_some(), "{response}");
+        writeln!(
+            self.input,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .unwrap();
+    }
+    fn receive(&self, id: u64) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let line = self
+                .responses
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "MCP startup failed: {error}; {}",
+                        fs::read_to_string(&self.error_log).unwrap_or_default()
+                    )
+                });
+            let response: Value = serde_json::from_str(&line).unwrap();
+            if response["id"] == id {
+                assert!(response.get("error").is_none(), "{response}");
+                return response;
+            }
+        }
+    }
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        writeln!(
+            self.input,
+            "{}",
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+        )
+        .unwrap();
+        self.receive(id)["result"].clone()
+    }
+    fn status(&mut self) -> Value {
+        let response = self.request("resources/read", json!({"uri":"chuggin://project/status"}));
+        serde_json::from_str(response["contents"][0]["text"].as_str().unwrap()).unwrap()
+    }
+}
+impl Drop for StartupMcp {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn close_startup_fixture_controller(fixture: &Fixture) {
+    fixture.rpc(json!({"action":"shutdown"}));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fixture.socket.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "Controller did not release its socket"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn hold_startup_fixture_locks(fixture: &Fixture) -> Vec<fs::File> {
+    use std::os::fd::AsRawFd;
+    [".chuggin/run.lock", ".git/chuggin-run.lock"]
+        .into_iter()
+        .map(|name| {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(fixture.dir.path().join(name))
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            file
+        })
+        .collect()
+}
+
+#[test]
+fn upgrading_waits_for_old_controller_locks_after_its_socket_disappears() {
+    use std::os::unix::net::UnixListener;
+    let model = Model::new(|_, _| answer());
+    let mut fixture = Fixture::new(&model.url);
+    close_startup_fixture_controller(&fixture);
+    fixture.child.wait().unwrap();
+    let held = hold_startup_fixture_locks(&fixture);
+    let listener = UnixListener::bind(&fixture.socket).unwrap();
+    let socket = fixture.socket.clone();
+    let config = fs::canonicalize(fixture.dir.path().join("chuggin.json")).unwrap();
+    let owner = thread::spawn(move || {
+        for connection in listener.incoming() {
+            let mut stream = connection.unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            if request["action"] == "shutdown" {
+                writeln!(stream, "{}", json!({"ok":true,"result":{"closing":true}})).unwrap();
+                fs::remove_file(&socket).unwrap();
+                // The lock lifetime outlasts the socket lifetime during normal
+                // shutdown. A new viewer must wait for the actual owner to leave.
+                thread::sleep(Duration::from_millis(300));
+                drop(held);
+                return;
+            }
+            assert_eq!(request["action"], "status");
+            writeln!(stream, "{}", json!({"ok":true,"result":{"version":"older-startup-fixture","config":config,"running":false}})).unwrap();
+        }
+    });
+    let mut mcp = StartupMcp::start(&fixture, "old-owner-upgrade");
+    mcp.initialized();
+    owner.join().unwrap();
+    let status = mcp.status();
+    assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(status["running"], false);
+    assert!(model.requests.lock().unwrap().is_empty());
+    let log = fs::read_to_string(fixture.socket.with_extension("log")).unwrap();
+    assert!(!log.contains("Another Chuggin process"), "{log}");
+    close_startup_fixture_controller(&fixture);
+}
+
+#[test]
+fn opening_waits_for_a_current_version_controller_that_is_already_closing() {
+    use std::os::unix::net::UnixListener;
+    let model = Model::new(|_, _| answer());
+    let mut fixture = Fixture::new(&model.url);
+    close_startup_fixture_controller(&fixture);
+    fixture.child.wait().unwrap();
+    let held = hold_startup_fixture_locks(&fixture);
+    let listener = UnixListener::bind(&fixture.socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let socket = fixture.socket.clone();
+    let config = fs::canonicalize(fixture.dir.path().join("chuggin.json")).unwrap();
+    let observed = Arc::new(AtomicU64::new(0));
+    let requests = observed.clone();
+    let owner = thread::spawn(move || {
+        let mut closing_deadline: Option<Instant> = None;
+        let first_request_deadline = Instant::now() + Duration::from_secs(5);
+        while closing_deadline.is_none_or(|deadline| Instant::now() < deadline) {
+            assert!(
+                closing_deadline.is_some() || Instant::now() < first_request_deadline,
+                "The new client never inspected the closing owner"
+            );
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                request["action"], "status",
+                "An owner already closing must not receive another shutdown request"
+            );
+            requests.fetch_add(1, Ordering::SeqCst);
+            closing_deadline.get_or_insert_with(|| Instant::now() + Duration::from_millis(300));
+            writeln!(stream, "{}", json!({"ok":true,"result":{"version":env!("CARGO_PKG_VERSION"),"config":config,"running":false,"closing":true}})).unwrap();
+        }
+        fs::remove_file(&socket).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        drop(held);
+    });
+    let mut mcp = StartupMcp::start(&fixture, "already-closing-owner");
+    mcp.initialized();
+    owner.join().unwrap();
+    assert!(observed.load(Ordering::SeqCst) > 0);
+    let status = mcp.status();
+    assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(status["closing"], false);
+    assert_eq!(status["running"], false);
+    let marker: Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .dir
+                .path()
+                .join(".chuggin/operator/controller-running.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let pid = marker["pid"].as_u64().unwrap() as i32;
+    assert_ne!(pid, fixture.child.id() as i32);
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    assert!(model.requests.lock().unwrap().is_empty());
+    let log = fs::read_to_string(fixture.socket.with_extension("log")).unwrap();
+    assert!(!log.contains("Another Chuggin process"), "{log}");
+    close_startup_fixture_controller(&fixture);
+}
+
+#[test]
+fn simultaneous_mcp_clients_share_one_controller_without_startup_losers() {
+    let model = Model::new(|_, _| answer());
+    let mut fixture = Fixture::new(&model.url);
+    close_startup_fixture_controller(&fixture);
+    fixture.child.wait().unwrap();
+    let mut first = StartupMcp::start(&fixture, "concurrent-first");
+    let mut second = StartupMcp::start(&fixture, "concurrent-second");
+    first.initialized();
+    second.initialized();
+    let marker_path = fixture
+        .dir
+        .path()
+        .join(".chuggin/operator/controller-running.json");
+    let first_marker: Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+    let opened = first.request(
+        "tools/call",
+        json!({"name":"open_operator_session","arguments":{}}),
+    );
+    let opened: Value =
+        serde_json::from_str(opened["content"][0]["text"].as_str().unwrap()).unwrap();
+    let changed = first.request("tools/call", json!({"name":"set_nudge","arguments":{"session_id":opened["session_id"],"operation_id":"concurrent-project-nudge","request":"Shared startup fixture nudge"}}));
+    assert_ne!(changed["isError"], true, "{changed}");
+    let shared = second.status();
+    assert_eq!(shared["nudges"]["revision"], 1);
+    assert_eq!(
+        shared["nudges"]["active"]["request"],
+        "Shared startup fixture nudge"
+    );
+    let second_marker: Value = serde_json::from_slice(&fs::read(marker_path).unwrap()).unwrap();
+    assert_eq!(first_marker["pid"], second_marker["pid"]);
+    assert!(model.requests.lock().unwrap().is_empty());
+    let log = fs::read_to_string(fixture.socket.with_extension("log")).unwrap();
+    assert!(!log.contains("Another Chuggin process"), "{log}");
+    assert!(!log.contains("exited unexpectedly"), "{log}");
+    close_startup_fixture_controller(&fixture);
+}
+
+#[test]
+fn startup_does_not_bypass_real_project_locks_and_recovers_after_release() {
+    let model = Model::new(|_, _| answer());
+    let mut fixture = Fixture::new(&model.url);
+    close_startup_fixture_controller(&fixture);
+    fixture.child.wait().unwrap();
+    let held = hold_startup_fixture_locks(&fixture);
+    let mut blocked = StartupMcp::start(&fixture, "busy-owner");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = blocked.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Busy-owner startup never returned an error"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success());
+    let message = fs::read_to_string(&blocked.error_log).unwrap();
+    assert!(
+        message.contains("Another Chuggin process") || message.to_lowercase().contains("busy"),
+        "{message}"
+    );
+    assert!(!fixture.socket.exists());
+    assert!(model.requests.lock().unwrap().is_empty());
+    assert!(fixture.dir.path().join(".chuggin/run.lock").exists());
+    assert!(fixture.dir.path().join(".git/chuggin-run.lock").exists());
+    drop(held);
+    let mut resumed = StartupMcp::start(&fixture, "released-owner");
+    resumed.initialized();
+    assert_eq!(resumed.status()["running"], false);
+    assert!(model.requests.lock().unwrap().is_empty());
+    close_startup_fixture_controller(&fixture);
+}
+
 struct Model {
     url: String,
     requests: Arc<Mutex<Vec<Value>>>,
@@ -169,6 +488,11 @@ struct Model {
 }
 impl Model {
     fn new(mut reply: impl FnMut(&Value, usize) -> Value + Send + 'static) -> Self {
+        Self::with_usage(move |body, n| (reply(body, n), 100, 10))
+    }
+    fn with_usage(
+        mut reply: impl FnMut(&Value, usize) -> (Value, u64, u64) + Send + 'static,
+    ) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -208,8 +532,8 @@ impl Model {
                 let body: Value = serde_json::from_slice(&b).unwrap();
                 let n = req.lock().unwrap().len();
                 req.lock().unwrap().push(body.clone());
-                let message = reply(&body, n);
-                let response=json!({"model":"test-model","message":message,"done":true,"prompt_eval_count":100,"eval_count":10,"eval_duration":100000000}).to_string()+"\n";
+                let (message, prompt, generated) = reply(&body, n);
+                let response=json!({"model":"test-model","message":message,"done":true,"prompt_eval_count":prompt,"eval_count":generated,"eval_duration":100000000}).to_string()+"\n";
                 let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -432,6 +756,150 @@ fn chat_history_is_durable_and_does_not_start_the_loop() {
     assert!(!f.dir.path().join(".chuggin/conversation.json").exists());
 }
 #[test]
+fn main_context_usage_persists_without_diagnostic_or_cold_start_overwrites() {
+    let diagnostic_seen = Arc::new(AtomicBool::new(false));
+    let next_main_started = Arc::new(AtomicBool::new(false));
+    let release_main = Arc::new(AtomicBool::new(false));
+    let seen = diagnostic_seen.clone();
+    let started = next_main_started.clone();
+    let release = release_main.clone();
+    let mut main_calls = 0;
+    let model = Model::with_usage(move |body, _| {
+        let diagnostic = body["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == "report_diagnosis")
+        });
+        if diagnostic {
+            seen.store(true, Ordering::SeqCst);
+            return (
+                tool(
+                    "report_diagnosis",
+                    json!({"verdict":"productive","reason":"The fixture waits for input intentionally; this is not a hang.","next_action":"Return control to the main agent so it can supply the expected input.","expected_new_evidence":"The managed command exits after its input is supplied."}),
+                ),
+                700,
+                70,
+            );
+        }
+        main_calls += 1;
+        if main_calls == 1 {
+            return (
+                task_and_tool(
+                    "run_command",
+                    json!({"argv":["sh","-c","read instruction; printf FINISHED"],"timeout_seconds":1}),
+                ),
+                100,
+                10,
+            );
+        }
+        assert_eq!(main_calls, 2);
+        started.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !release.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "The test never released its main response"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let command_id = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|message| {
+                if message["tool_name"] != "run_command" {
+                    return None;
+                }
+                let result: Value = serde_json::from_str(message["content"].as_str()?).ok()?;
+                Some(result["result"]["command_id"].clone())
+            })
+            .unwrap();
+        (
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"supply-input","function":{"name":"command_input","arguments":{"command_id":command_id,"text":"finish\n","close_stdin":true}}},
+                {"id":"collect-result","function":{"name":"command_status","arguments":{"command_id":command_id,"wait_ms":1000}}}
+            ]}),
+            200,
+            20,
+        )
+    });
+    let mut fixture = Fixture::new(&model.url);
+    let path = fixture.dir.path().join("chuggin.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["implementation_calls"] = json!(1);
+    fs::write(path, config.to_string()).unwrap();
+    let conversation = fixture.dir.path().join(".chuggin/conversation.json");
+    let read_usage = || -> Value {
+        let saved: Value = serde_json::from_slice(&fs::read(&conversation).unwrap()).unwrap();
+        saved["last_context_usage"].clone()
+    };
+
+    fixture.rpc(json!({"action":"start","mode":"one_cycle"}));
+    fixture.wait(|| fixture.rpc(json!({"action":"status"}))["running"] == false);
+    let first = read_usage();
+    assert_eq!(first["prompt"], 100);
+    assert_eq!(first["model"], "test-model");
+    assert_eq!(first["context_tokens"], 8192);
+    assert!(
+        first["recorded_at"]
+            .as_str()
+            .is_some_and(|time| !time.is_empty())
+    );
+
+    fixture.rpc(json!({"action":"start","mode":"one_cycle"}));
+    fixture.wait(|| {
+        diagnostic_seen.load(Ordering::SeqCst) && next_main_started.load(Ordering::SeqCst)
+    });
+    assert_eq!(
+        read_usage(),
+        first,
+        "The watchdog's 700-token prompt must not replace the last main response's 100-token prompt"
+    );
+    release_main.store(true, Ordering::SeqCst);
+    fixture.wait(|| fixture.rpc(json!({"action":"status"}))["running"] == false);
+    let second = read_usage();
+    assert_eq!(second["prompt"], 200);
+    assert_eq!(second["model"], "test-model");
+    assert_eq!(second["context_tokens"], 8192);
+    let requests = model.requests.lock().unwrap().len();
+    assert_eq!(requests, 3);
+    fixture.wait(|| {
+        fixture
+            .rpc(json!({"action":"events","after":0}))
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["event"]["ContextUsage"]["prompt"] == 200)
+    });
+    let records = fixture.rpc(json!({"action":"events","after":0}));
+    let snapshots: Vec<_> = records
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|record| record["event"]["ContextUsage"]["prompt"].as_u64())
+        .collect();
+    assert_eq!(snapshots, [100, 200]);
+
+    close_startup_fixture_controller(&fixture);
+    fixture.child.wait().unwrap();
+    let mut cold = StartupMcp::start(&fixture, "saved-context-reopen");
+    cold.initialized();
+    assert_eq!(cold.status()["running"], false);
+    assert_eq!(read_usage(), second);
+    let cold_records = fixture.rpc(json!({"action":"events","after":0}));
+    assert!(cold_records.as_array().unwrap().iter().all(|record| {
+        record["event"] != "Request" && record["event"].get("Metrics").is_none()
+    }));
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        requests,
+        "Reopening saved usage must not count as a new inference request"
+    );
+    close_startup_fixture_controller(&fixture);
+}
+
+#[test]
 fn mcp_stdio_exposes_same_tools_without_starting_inference() {
     let model = Model::new(|_, _| answer());
     let f = Fixture::new(&model.url);
@@ -535,6 +1003,41 @@ fn settings(f: &Fixture, s: &str, patch: Value) {
         json!({"expected_revision":current["result"]["revision"],"settings":patch}),
     );
     assert_eq!(response["status"], "complete", "{response}");
+}
+
+#[test]
+fn thinking_and_setup_settings_are_independent_and_invalid_updates_are_atomic() {
+    let f = Fixture::new("http://127.0.0.1:1");
+    let session = f.session();
+    let patch = json!({
+        "reasoning":{"mode":"default"},
+        "setup_model":"setup-model",
+        "setup_reasoning":{"mode":"effort","value":"high"},
+        "chat_model":"chat-model",
+        "chat_reasoning":{"mode":"off"}
+    });
+    settings(&f, &session, patch.clone());
+    let current = f.call(&session, "get_settings", json!({}));
+    for (field, expected) in patch.as_object().unwrap() {
+        assert_eq!(&current["result"]["settings"][field], expected, "{field}");
+    }
+    assert_eq!(current["result"]["settings"]["model"], "test-model");
+    let path = f.dir.path().join("chuggin.json");
+    let saved = fs::read(&path).unwrap();
+    for invalid in [
+        json!({"reasoning":{"mode":"effort","value":""}}),
+        json!({"setup_reasoning":{"mode":"token_budget","value":0}}),
+        json!({"chat_reasoning":{"mode":"effort","value":"invalid\nlevel"}}),
+        json!({"reasoning":{"mode":"unrecognized"}}),
+    ] {
+        let reply = f.call(
+            &session,
+            "update_settings",
+            json!({"expected_revision":current["result"]["revision"],"settings":invalid}),
+        );
+        assert_ne!(reply["status"], "complete", "{reply}");
+        assert_eq!(fs::read(&path).unwrap(), saved);
+    }
 }
 
 #[test]

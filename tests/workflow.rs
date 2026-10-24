@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -17,6 +17,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_chuggin");
 struct Server {
     url: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    catalog: Arc<Mutex<Value>>,
+    catalog_requests: Arc<AtomicUsize>,
     done: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -48,6 +50,18 @@ impl Server {
         let mut awaiting_completion = false;
         Self::custom(delay, timeout_review, repetition_stage, move |body, n| {
             if wizard {
+                if body["tools"].as_array().is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "propose_goal")
+                }) {
+                    return (
+                        String::new(),
+                        json!([{"function":{"name":"propose_goal","arguments":{
+                            "goal":format!("Build a useful editor. Draft {}.", n+1)
+                        }}}]),
+                    );
+                }
                 return (
                     json!({"goal":format!("Build a useful editor. Draft {}.", n+1)}).to_string(),
                     json!([]),
@@ -83,10 +97,15 @@ impl Server {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let calls = requests.clone();
+        let catalog = Arc::new(Mutex::new(json!({"models":[{"name":"fake"}]})));
+        let served_catalog = catalog.clone();
+        let catalog_requests = Arc::new(AtomicUsize::new(0));
+        let catalog_reads = catalog_requests.clone();
         let done = Arc::new(AtomicBool::new(false));
         let stop = done.clone();
         let handle = thread::spawn(move || {
             let mut review_timed_out = false;
+            let mut response_workers = Vec::new();
             while !stop.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     thread::sleep(Duration::from_millis(10));
@@ -111,12 +130,16 @@ impl Server {
                         length = v.trim().parse().unwrap();
                     }
                 }
+                let generation = !first.starts_with("GET") && !first.starts_with("POST /api/show ");
                 let data = if first.starts_with("GET") {
-                    json!({"models":[{"name":"fake"}]}).to_string()
+                    catalog_reads.fetch_add(1, Ordering::SeqCst);
+                    served_catalog.lock().unwrap().to_string()
                 } else if first.starts_with("POST /api/show ") {
                     let mut data = vec![0; length];
                     reader.read_exact(&mut data).unwrap();
-                    json!({"capabilities":["completion","tools","vision"]}).to_string()
+                    json!({"capabilities":["completion","tools","vision"],
+                        "thinking":{"values":[true,false,"low","high"],"default":"low"}})
+                    .to_string()
                 } else {
                     let mut data = vec![0; length];
                     reader.read_exact(&mut data).unwrap();
@@ -125,9 +148,6 @@ impl Server {
                     requests.push(body.clone());
                     let n = requests.len() - 1;
                     drop(requests);
-                    if delay {
-                        thread::sleep(Duration::from_millis(800));
-                    }
                     if timeout_review && n == 1 && !review_timed_out {
                         review_timed_out = true;
                         thread::sleep(Duration::from_millis(1200));
@@ -174,12 +194,26 @@ Connection: close
                     data.len(),
                     data
                 );
-                let _ = stream.write_all(response.as_bytes());
+                if delay && generation {
+                    // Metadata lookups stay responsive while an older generation
+                    // finishes, as they do on a real inference server.
+                    response_workers.push(thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(800));
+                        let _ = stream.write_all(response.as_bytes());
+                    }));
+                } else {
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+            for worker in response_workers {
+                worker.join().unwrap();
             }
         });
         Self {
             url,
             requests,
+            catalog,
+            catalog_requests,
             done,
             handle: Some(handle),
         }
@@ -401,6 +435,47 @@ fn run_cycles(root: &Path, cycles: u64) {
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout)
     );
+}
+fn run_cycles_bounded(root: &Path, cycles: u64) {
+    let log_path = root.join("bounded-run.log");
+    let log = fs::File::create(&log_path).unwrap();
+    let mut child = command(root)
+        .args(["run", "--cycles", &cycles.to_string()])
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "{}",
+                fs::read_to_string(log_path).unwrap()
+            );
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            #[cfg(unix)]
+            if let Ok(entries) = fs::read_dir(root.join(".chuggin/global/chuggin/runtime")) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().is_some_and(|ext| ext == "sock")
+                        && let Ok(mut stream) =
+                            std::os::unix::net::UnixStream::connect(entry.path())
+                    {
+                        let _ = stream.write_all(b"{\"action\":\"force_stop\"}\n");
+                    }
+                }
+            }
+            panic!(
+                "The run did not return control while its command remained alive: {}",
+                fs::read_to_string(log_path).unwrap()
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 fn git(repo: &Path, args: &[&str]) -> String {
     let o = Command::new("git")
@@ -1685,8 +1760,8 @@ fn setup_revises_goal_and_reuses_global_settings() {
     let server = Server::new(true, false);
     let root = tempfile::tempdir().unwrap();
     let input = format!(
-        "{}
-fake
+        "fake
+{}
 32768
 4096
 16
@@ -2824,6 +2899,7 @@ mod terminal_ui {
         ui.wait("Inference provider");
         ui.send(b"\r");
         ui.wait("Choose model for this project");
+        ui.wait("selectable only");
         ui.send(b"\r");
         ui.wait("Resume project");
         ui.wait("fake");
@@ -2833,6 +2909,143 @@ mod terminal_ui {
         let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved, config);
         assert_eq!(fs::read_to_string(shared).unwrap(), defaults);
+    }
+
+    #[test]
+    fn project_model_picker_refreshes_live_catalog_without_generation_or_global_changes() {
+        let server = Server::new(false, false);
+        *server.catalog.lock().unwrap() = json!({"models":[{"name":"old-project-model"}]});
+        let root = tempfile::tempdir().unwrap();
+        let path = fixture(root.path(), &server.url, true);
+        let mut expected: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        expected["model"] = json!("old-project-model");
+        fs::write(&path, expected.to_string()).unwrap();
+        let shared = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        let defaults = json!({"model":"shared-model","ollama_url":"http://127.0.0.1:1"});
+        fs::write(&shared, defaults.to_string()).unwrap();
+        let original_defaults = fs::read(&shared).unwrap();
+
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"jjj\r");
+        ui.wait("Inference provider");
+        ui.send(b"\r");
+        ui.wait("Choose model for this project");
+        ui.wait("selectable only");
+        ui.wait("old-project-model");
+        assert_eq!(server.catalog_requests.load(Ordering::SeqCst), 1);
+        *server.catalog.lock().unwrap() = json!({"models":[{"name":"fake-next"}]});
+        ui.send(b"r");
+        ui.wait("fake-next");
+        assert_eq!(server.catalog_requests.load(Ordering::SeqCst), 2);
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            expected,
+            "Refreshing a catalog must not select a model or change the project"
+        );
+        ui.send(b"\r");
+        ui.wait("Resume project");
+        ui.wait("fake-next");
+        expected["model"] = json!("fake-next");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(fs::read(&shared).unwrap(), original_defaults);
+        assert!(server.requests.lock().unwrap().is_empty());
+        ui.send(b"q");
+        ui.restored();
+    }
+
+    #[test]
+    fn cancelling_provider_and_model_pages_preserves_project_and_global_settings() {
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        let path = fixture(root.path(), &server.url, true);
+        let original_project = fs::read(&path).unwrap();
+        let shared = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(
+            &shared,
+            json!({"model":"shared-model","ollama_url":server.url}).to_string(),
+        )
+        .unwrap();
+        let original_defaults = fs::read(&shared).unwrap();
+
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"jjj\r");
+        ui.wait("Inference provider");
+        ui.send(b"\x1b");
+        ui.wait("Resume project");
+        assert_eq!(server.catalog_requests.load(Ordering::SeqCst), 0);
+        ui.send(b"jjj\r");
+        ui.wait("Inference provider");
+        ui.send(b"\r");
+        ui.wait("Choose model for this project");
+        ui.wait("selectable only");
+        ui.send(b"\x1b");
+        ui.wait("Inference provider");
+        ui.send(b"\x1b");
+        ui.wait("Resume project");
+        assert!(!ui.parser.screen().contents().contains("Could not complete"));
+        assert_eq!(server.catalog_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read(&path).unwrap(), original_project);
+        assert_eq!(fs::read(&shared).unwrap(), original_defaults);
+        assert!(server.requests.lock().unwrap().is_empty());
+        ui.send(b"q");
+        ui.restored();
+    }
+
+    #[test]
+    fn project_model_picker_updates_sparse_saved_settings_using_the_shared_connection() {
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        let path = fixture(root.path(), &server.url, true);
+        let mut expected: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        expected["model"] = json!("old-project-model");
+        for field in [
+            "ollama_url",
+            "context_tokens",
+            "output_tokens",
+            "implementation_calls",
+            "retry_seconds",
+        ] {
+            expected.as_object_mut().unwrap().remove(field);
+        }
+        fs::write(&path, expected.to_string()).unwrap();
+        let shared = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(
+            &shared,
+            json!({"model":"shared-model","ollama_url":server.url}).to_string(),
+        )
+        .unwrap();
+        let original_defaults = fs::read(&shared).unwrap();
+
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"jjj\r");
+        ui.wait("Inference provider");
+        ui.send(b"\r");
+        ui.wait("Choose model for this project");
+        ui.wait("selectable only");
+        ui.send(b"\r");
+        ui.wait("Resume project");
+        ui.wait("fake");
+        expected["model"] = json!("fake");
+        expected["ollama_url"] = json!(server.url);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap(),
+            expected,
+            "Choosing a model must validate inherited settings and preserve unrelated project fields"
+        );
+        assert_eq!(fs::read(shared).unwrap(), original_defaults);
+        assert!(server.requests.lock().unwrap().is_empty());
+        ui.send(b"q");
+        ui.restored();
     }
 
     #[test]
@@ -2898,9 +3111,18 @@ mod terminal_ui {
         ui.send(b"jjjjjjjj\r");
         ui.wait("Global settings");
         ui.send(b"\r");
+        ui.wait("Inference providers · shared connections");
+        // With no selected model the provider menu starts at Groq.
+        ui.send(b"j\r");
+        ui.wait("Ollama · shared connection");
+        ui.send(b"\r");
         ui.wait("Ctrl+U clear");
         ui.send("\x15http://localhost:11434".as_bytes());
         ui.send(b"\r");
+        ui.wait("Ollama · shared connection");
+        ui.send(b"\x1b");
+        ui.wait("Inference providers · shared connections");
+        ui.send(b"\x1b");
         ui.wait("Global settings");
         ui.send(b"\x1b");
         ui.wait("Set up this project");
@@ -2915,8 +3137,56 @@ mod terminal_ui {
     }
 
     #[test]
+    fn shared_ollama_connection_editor_preserves_project_and_default_models() {
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        let path = fixture(root.path(), &server.url, true);
+        let original_project = fs::read(&path).unwrap();
+        let shared = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(
+            &shared,
+            json!({"model":"shared-model","ollama_url":"http://127.0.0.1:1"}).to_string(),
+        )
+        .unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"jjjjjjjj\r");
+        ui.wait("Global settings");
+        ui.send(b"\r");
+        ui.wait("Inference providers · shared connections");
+        ui.send(b"\r");
+        ui.wait("Ollama · shared connection");
+        ui.send(b"\r");
+        ui.wait("Ctrl+U clear");
+        ui.send(format!("\x15{}\r", server.url).as_bytes());
+        ui.wait("Ollama · shared connection");
+        ui.send(b"jj\r");
+        ui.wait("fake");
+        assert_eq!(server.catalog_requests.load(Ordering::SeqCst), 1);
+        assert!(server.requests.lock().unwrap().is_empty());
+        ui.send(b"\x1b");
+        ui.wait("Ollama · shared connection");
+        ui.send(b"\x1b");
+        ui.wait("Inference providers · shared connections");
+        ui.send(b"\x1b");
+        ui.wait("Global settings");
+        ui.send(b"\x1b");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+
+        let saved: Value = serde_json::from_slice(&fs::read(shared).unwrap()).unwrap();
+        assert_eq!(saved["ollama_url"], server.url);
+        assert_eq!(saved["model"], "shared-model");
+        assert_eq!(fs::read(path).unwrap(), original_project);
+        assert!(server.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn fresh_project_settings_persist_without_changing_defaults_or_starting_work() {
         let server = Server::new(false, false);
+        *server.catalog.lock().unwrap() = json!({"models":[{"name":"fake"},{"name":"fake-chat"}]});
         let root = tempfile::tempdir().unwrap();
         let global = root.path().join(".chuggin/global/chuggin/settings.json");
         fs::create_dir_all(global.parent().unwrap()).unwrap();
@@ -2936,19 +3206,20 @@ mod terminal_ui {
         ui.wait("Inference provider");
         ui.send(b"\r");
         ui.wait("Choose model for this project");
+        ui.wait("selectable only");
         ui.send(b"\r");
         ui.wait("Set up this project");
         ui.wait("fake");
         ui.send(b"jjjj\r");
         ui.wait("Project settings");
-        ui.send(b"j\r");
+        ui.send(b"jj\r");
         ui.wait("Context window · this project");
         ui.wait("1,000,000 tokens");
         // The inherited 65,536 preset is four rows before 1,000,000.
         ui.send(b"jjjj\r");
         ui.wait("Project settings");
         ui.wait("1,000,000");
-        ui.send(b"jj\r");
+        ui.send(b"jjj\r");
         ui.wait("Response limit · this project");
         ui.send(b"j\r");
         ui.wait("Project settings");
@@ -2957,7 +3228,7 @@ mod terminal_ui {
         ui.wait("Set up this project");
         ui.send(b"jjjjjjj\r");
         ui.wait("More project settings");
-        ui.send(b"jj\r");
+        ui.send(b"jjjjj\r");
         ui.wait("Helpers · Disabled");
         ui.send(b"\r");
         ui.wait("Helpers · Enabled");
@@ -2967,10 +3238,23 @@ mod terminal_ui {
         ui.wait("Model responses per helper · 24");
         ui.send(b"\x1b");
         ui.wait("More project settings");
+        ui.send(b"jjj\r");
+        ui.wait("Chat model · this project");
         ui.send(b"j\r");
-        ui.wait("Chat model (enter");
-        ui.send(b"\x15fake-chat\r");
+        ui.wait("Inference provider");
+        ui.send(b"\r");
+        ui.wait("Chat model · this project");
+        ui.wait("selectable only");
+        ui.send(b"j\r");
+        ui.wait("More project settings");
         ui.wait("Chat model · fake-chat");
+        ui.send(b"jj\r");
+        ui.wait("Setup thinking · this project");
+        ui.wait("Source: Ollama /api/show");
+        ui.wait("high effort");
+        ui.send(b"jjjj\r");
+        ui.wait("More project settings");
+        ui.wait("Setup thinking · high effort");
         ui.send(b"\x1b");
         ui.wait("Set up this project");
         ui.send(b"q");
@@ -2983,6 +3267,10 @@ mod terminal_ui {
         assert_eq!(saved["helpers"]["enabled"], true);
         assert_eq!(saved["helpers"]["max_calls"], 24);
         assert_eq!(saved["chat_model"], "fake-chat");
+        assert_eq!(
+            saved["setup_reasoning"],
+            json!({"mode":"effort","value":"high"})
+        );
         let saved_bytes = fs::read(&draft).unwrap();
 
         let mut ui = TerminalProcess::start(root.path());
@@ -3035,9 +3323,10 @@ mod terminal_ui {
         ui.wait("Inference provider");
         ui.send(b"\r");
         ui.wait("Choose model for this project");
+        ui.wait("selectable only");
         ui.send(b"\r");
         ui.wait("Project settings");
-        ui.send(b"j\r");
+        ui.send(b"jj\r");
         ui.wait("Context window · this project");
         ui.wait("1,048,576 tokens");
         ui.wait("Custom");
@@ -3045,7 +3334,7 @@ mod terminal_ui {
         ui.send(b"jjjjj\r");
         ui.wait("Project settings");
         ui.wait("1,000,000");
-        ui.send(b"jj\r");
+        ui.send(b"jjj\r");
         ui.wait("Response limit · this project");
         ui.send(b"j\r");
         ui.wait("Project settings");
@@ -3057,16 +3346,16 @@ mod terminal_ui {
             expected
         );
         assert_eq!(fs::read(&shared).unwrap(), original_defaults);
-        ui.send(b"jjjjjjj\r");
+        ui.send(b"jjjjjjjj\r");
         ui.wait("More project settings");
         ui.wait("Investigation helpers");
-        ui.send(b"jjjj\r");
+        ui.send(b"jjjjjjj\r");
         ui.wait("No missing capabilities have been requested");
         ui.send(b"\x1b");
         ui.wait("More project settings");
         ui.send(b"\x1b");
         ui.wait("Project settings");
-        ui.send(b"jjjjjjjj\r");
+        ui.send(b"jjjjjjjjj\r");
         ui.wait("Global settings");
         ui.send(b"jj\r");
         ui.wait("Default context window · global");
@@ -3096,6 +3385,7 @@ mod terminal_ui {
     #[test]
     fn observation_settings_apply_without_interrupting_active_requests() {
         let server = Server::new(false, true);
+        *server.catalog.lock().unwrap() = json!({"models":[{"name":"fake"},{"name":"fake-next"}]});
         let root = tempfile::tempdir().unwrap();
         fixture(root.path(), &server.url, true);
         let mut ui = TerminalProcess::start(root.path());
@@ -3104,8 +3394,14 @@ mod terminal_ui {
         ui.wait("Receiving response");
         ui.send(b"5");
         ui.wait("PROJECT SETTINGS");
-        ui.send(b"\r\x15fake-next\r");
+        ui.send(b"\r");
+        ui.wait("Inference provider");
+        ui.send(b"\r");
+        ui.wait("Choose model for this project");
+        ui.wait("selectable only");
         ui.send(b"\x1b[B\r");
+        ui.wait("PROJECT SETTINGS");
+        ui.send(b"\x1b[B\x1b[B\r");
         ui.wait("Context window · this project");
         ui.send(b"jjjjj\r");
         ui.wait("PROJECT SETTINGS");
@@ -3211,6 +3507,82 @@ mod terminal_ui {
         );
     }
     #[test]
+    fn guided_rust_rewrite_records_reference_and_finishes_without_inference() {
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        let defaults = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(defaults.parent().unwrap()).unwrap();
+        fs::write(
+            &defaults,
+            json!({"model":"loop-model","ollama_url":server.url}).to_string(),
+        )
+        .unwrap();
+        let original = b"Original reference material is preserved";
+        fs::write(
+            root.path().join(".chuggin/project-draft-settings.json"),
+            json!({"model":"loop-model"}).to_string(),
+        )
+        .unwrap();
+        fs::write(root.path().join("original.iso"), original).unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Set up this project");
+        ui.send(b"\r");
+        ui.wait("What are you working on today?");
+        ui.send(b"\r");
+        ui.wait("○ Software and version to recreate");
+        ui.send(b"\r");
+        ui.wait("Alt+Enter newline");
+        ui.send(b"An abandoned game, complete 1998 version\r");
+        ui.wait("✓ Software and version to recreate");
+        ui.send(b"\r");
+        ui.wait("Where is the reference?");
+        ui.send(b"\r");
+        ui.wait("Reference files");
+        ui.wait("original.iso");
+        ui.send(b"\r");
+        ui.wait("✓ Where is the original software?");
+        for label in [
+            "Behavior and features to preserve",
+            "Changes and constraints",
+            "Target platforms",
+            "How will you know it works?",
+        ] {
+            ui.send(b"\r");
+            ui.wait("Alt+Enter newline");
+            ui.send(b"\r");
+            ui.wait(&format!("✓ {label}"));
+        }
+        ui.send(b"\r");
+        ui.wait("Review your goal");
+        ui.wait("Accept goal");
+        ui.send(b"\r");
+        ui.wait("Validation command");
+        ui.send(b"git rev-parse HEAD\r");
+        ui.wait("First command review (seconds)");
+        ui.send(b"\r");
+        ui.wait("Create the first commit?");
+        ui.send(b"\r");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        let config: Value =
+            serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
+        let goal = config["goal"].as_str().unwrap();
+        assert!(goal.contains("An abandoned game, complete 1998 version"));
+        assert!(goal.contains("Local project reference: original.iso"));
+        assert!(goal.contains("Implement the rewrite in Rust"));
+        assert!(goal.contains("an early prototype is not the completed goal"));
+        assert_eq!(config["model"], "loop-model");
+        assert_eq!(config["reasoning"], json!({"mode":"default"}));
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert!(!root.path().join(".chuggin/state.json").exists());
+        assert_eq!(
+            fs::read(root.path().join("original.iso")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
     fn goal_setup_uses_full_screen_drafting_and_persists_the_result() {
         let server = Server::new(true, true);
         let root = tempfile::tempdir().unwrap();
@@ -3224,6 +3596,7 @@ mod terminal_ui {
         let original_defaults = fs::read(&settings).unwrap();
         let draft_path = root.path().join(".chuggin/project-draft-settings.json");
         let preferences = json!({"ollama_url":server.url,"model":"project-model",
+            "setup_model":"setup-project-model","setup_reasoning":{"mode":"default"},
             "context_tokens":1_000_000,"output_tokens":8192,"request_timeout_seconds":1200,
             "run_duration_seconds":36000,"command_review_seconds":300,"chat_model":"chat-model",
             "allow_goal_completion":true,"active_hours":{"mode":"always"},
@@ -3243,8 +3616,13 @@ mod terminal_ui {
         assert!(!email_screen.contains("user.name"), "{email_screen}");
         assert!(server.requests.lock().unwrap().is_empty());
         ui.send(b"project@example.com\r");
-        ui.wait("Describe what you want to build");
-        ui.wait("Give a short description of this project");
+        ui.wait("What are you working on today?");
+        ui.send(b"jjjj\r");
+        ui.wait("Work out a goal with AI");
+        ui.wait("Setup model: setup-project-model");
+        ui.wait("Loop model: project-model");
+        ui.send(b"\r");
+        ui.wait("Message to the setup assistant");
         let pitch_screen = ui.parser.screen().contents();
         for old in [
             "Git author",
@@ -3256,7 +3634,7 @@ mod terminal_ui {
         }
         ui.send("An éditeur in Rust".as_bytes());
         ui.send(b"\r");
-        ui.wait("Review your goal");
+        ui.wait("Review the assistant's proposal");
         ui.wait("Build a useful editor. Draft 1.");
         let review_screen = ui.parser.screen().contents();
         for old in [
@@ -3266,15 +3644,31 @@ mod terminal_ui {
         ] {
             assert!(!review_screen.contains(old), "{old}: {review_screen}");
         }
-        ui.send(b"j\r");
-        ui.wait("What should change?");
-        ui.wait("Describe what should change in this goal");
+        // Cold-start recovery must retain the unaccepted proposal and observed
+        // tool reply, with no extra inference or automatic loop start.
+        ui.send(b"\x1b");
+        ui.wait("Goal proposal and conversation saved");
+        ui.send(b"\r");
+        ui.wait("Set up this project");
+        ui.send(b"q");
+        ui.restored();
+        drop(ui);
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Set up this project");
+        ui.send(b"\r");
+        ui.wait("Continue saved setup");
+        ui.send(b"\r");
+        ui.wait("Review the assistant's proposal");
+        ui.wait("Build a useful editor. Draft 1.");
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        ui.send(b"jj\r");
+        ui.wait("What should change or be clarified?");
         ui.wait("Build a useful editor. Draft 1.");
         let revision_screen = ui.parser.screen().contents();
         assert!(!revision_screen.contains("Give a short description"));
         assert!(!revision_screen.contains("Git author"));
         ui.send(b"Include reliable document persistence.\r");
-        ui.wait("Review your goal");
+        ui.wait("Review the assistant's proposal");
         ui.wait("Build a useful editor. Draft 2.");
         let revised_screen = ui.parser.screen().contents();
         assert_eq!(
@@ -3331,7 +3725,12 @@ mod terminal_ui {
         assert!(!root.path().join(".chuggin/global/chuggin/runtime").exists());
         let calls = server.requests.lock().unwrap();
         assert_eq!(calls.len(), 2, "Accepting a goal must not start the loop");
-        assert_eq!(calls[0]["model"], "project-model");
+        assert_eq!(calls[0]["model"], "setup-project-model");
+        assert!(calls.iter().all(|call| call.get("think").is_none()));
+        assert!(calls.iter().all(|call| {
+            !call["tools"].to_string().contains("write_file")
+                && !call["tools"].to_string().contains("run_command")
+        }));
         assert_eq!(calls[0]["options"]["num_ctx"], 1_000_000);
         assert_eq!(calls[0]["options"]["num_predict"], 8192);
         assert!(
@@ -3353,7 +3752,7 @@ fn dev_tool_reply(body: &Value, mode: u8) -> (String, Value) {
     if messages.iter().any(|m| m["tool_name"] == "run_command") {
         return (
             String::new(),
-            json!([{"function":{"name":"read_command_log","arguments":{"log_id":"command-0-2.log"}}}]),
+            json!([{"function":{"name":"read_command_log","arguments":{"log_id":"command-cycle-000001-0-2.log"}}}]),
         );
     }
     let script = "cat > src/lib.rs <<'RS'\npub fn value() -> u8 { 2 }\n#[test] fn baseline() { assert!(value() > 0); }\n#[test] fn returns_two() { assert_eq!(value(), 2); }\nRS\necho COMMAND_FINISHED";
@@ -3438,8 +3837,8 @@ fn exercise_project_tools(failing: bool) {
     );
     let artifact = root.path().join("state/cycle-000001");
     for name in [
-        "command-0-2.log",
-        "diagnostics-0-1.log",
+        "command-cycle-000001-0-2.log",
+        "diagnostics-cycle-000001-0-1.log",
         "tool-1-0.json",
         "verification.json",
     ] {
@@ -3978,13 +4377,26 @@ fn asynchronous_command_repetition_survives_cycles_without_counting_status_polls
 }
 
 #[test]
-fn final_command_drain_counts_completed_executions() {
-    let server = Server::custom(false, false, None, |_, step| {
+fn commands_completed_in_later_cycles_count_once_without_counting_status_polls() {
+    let server = Server::custom(false, false, None, |body, step| {
+        if step % 2 == 1 {
+            let starts = named_tool_results(body, "run_command");
+            let id = starts.last().unwrap()["result"]["command_id"].clone();
+            return (
+                String::new(),
+                json!([
+                    {"function":{"name":"command_input","arguments":{"command_id":id,"text":"finish\n","close_stdin":true}}},
+                    {"function":{"name":"command_status","arguments":{"command_id":id,"wait_ms":1000}}},
+                    {"function":{"name":"command_status","arguments":{"command_id":id,"wait_ms":0}}},
+                    {"function":{"name":"command_status","arguments":{"command_id":id,"wait_ms":0}}}
+                ]),
+            );
+        }
         let mut calls = Vec::new();
         if step == 0 {
             calls.push(task_tool("Observe delayed command results"));
         }
-        calls.push(json!({"function":{"name":"run_command","arguments":{"argv":["sh","-c","sleep 1.2; printf stable-evidence"]}}}));
+        calls.push(json!({"function":{"name":"run_command","arguments":{"argv":["sh","-c","read instruction; printf stable-evidence"]}}}));
         (String::new(), json!(calls))
     });
     let root = tempfile::tempdir().unwrap();
@@ -3992,26 +4404,36 @@ fn final_command_drain_counts_completed_executions() {
     let mut settings: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     settings["implementation_calls"] = json!(1);
     fs::write(config, settings.to_string()).unwrap();
-    for expected in [1, 2] {
-        run_cycles(root.path(), 1);
-        let started: Value = serde_json::from_slice(
-            &fs::read(root.path().join(format!(
-                "state/cycle-{expected:06}/tool-0-{}.json",
-                if expected == 1 { 1 } else { 0 }
-            )))
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(started["result"]["running"], true);
+    for (cycle, expected) in [(1, 0), (2, 1), (3, 1), (4, 2)] {
+        run_cycles_bounded(root.path(), 1);
         let session: Value =
             serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
                 .unwrap();
-        assert_eq!(session["command_watch"]["count"], expected);
         assert_eq!(
-            session["command_watch"]["recent"][0]["status"]["passed"],
-            true
+            session["command_watch"]["count"], expected,
+            "Pending executions and repeated status polls must not increase the completion count"
         );
+        let artifact = root.path().join(format!("state/cycle-{cycle:06}"));
+        if cycle % 2 == 1 {
+            let started: Value = serde_json::from_slice(
+                &fs::read(artifact.join(format!("tool-0-{}.json", if cycle == 1 { 1 } else { 0 })))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(started["result"]["running"], true);
+        } else {
+            let final_poll: Value =
+                serde_json::from_slice(&fs::read(artifact.join("tool-0-3.json")).unwrap()).unwrap();
+            assert_eq!(final_poll["ok"], true);
+            assert_eq!(final_poll["result"]["running"], false);
+            assert_eq!(final_poll["result"]["passed"], true);
+            assert_eq!(
+                session["command_watch"]["recent"][0]["status"]["passed"],
+                true
+            );
+        }
     }
+    assert_eq!(server.requests.lock().unwrap().len(), 4);
 }
 fn is_diagnostic(body: &Value) -> bool {
     body["tools"]
@@ -4181,7 +4603,7 @@ fn legitimate_repeated_commands_keep_the_conversation_and_continue() {
             .to_string_lossy()
             .starts_with("conversation-before-refresh")
     }));
-    assert!(art.join("command-23-0.log").exists());
+    assert!(art.join("command-cycle-000001-23-0.log").exists());
 }
 
 #[test]
@@ -4613,8 +5035,327 @@ fn project_completion_setting_updates_between_calls_and_revokes_stale_calls() {
 }
 
 #[test]
+fn finite_command_survives_call_budget_and_soft_stop_until_resumed() {
+    let server = Server::custom(false, false, None, |body, n| match n {
+        0 => (
+            String::new(),
+            json!([
+                task_tool("Complete a finite command before validating"),
+                {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"UNFINISHED"}}},
+                {"function":{"name":"run_command","arguments":{"argv":["sh","-c","printf READY; read instruction; printf FINISHED"],"timeout_seconds":120}}}
+            ]),
+        ),
+        1 => {
+            let starts = named_tool_results(body, "run_command");
+            let command = &starts.last().unwrap()["result"];
+            assert_eq!(command["running"], true);
+            let id = command["command_id"].clone();
+            assert!(
+                body["messages"].to_string().contains("running_commands"),
+                "The continuation must describe the existing live process"
+            );
+            (
+                String::new(),
+                json!([
+                    {"function":{"name":"command_status","arguments":{"command_id":id,"wait_ms":0}}},
+                    {"function":{"name":"command_input","arguments":{"command_id":id,"text":"finish\n","close_stdin":true}}},
+                    {"function":{"name":"command_status","arguments":{"command_id":id,"wait_ms":1000}}},
+                    {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"FIXED"}}},
+                    {"function":{"name":"finish_task","arguments":{"task_id":1,"summary":"The same finite command finished and the repaired files were checked"}}}
+                ]),
+            )
+        }
+        _ => panic!("Unexpected provider request {n}"),
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["implementation_calls"] = json!(1);
+    fs::write(path, config.to_string()).unwrap();
+
+    run_cycles_bounded(root.path(), 1);
+    let pending = state(root.path());
+    assert_eq!(pending["last_checks_passed_ref"], Value::Null);
+    assert!(pending["completed_tasks"].as_array().unwrap().is_empty());
+    assert_eq!(
+        pending["recent"][0]["disposition"], "checkpoint/unverified",
+        "An unfinished process cannot establish passing checks"
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+    run_cycles_bounded(root.path(), 1);
+    let finished = state(root.path());
+    assert_eq!(finished["completed_tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(finished["last_checks_passed_ref"], finished["working_ref"]);
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/value.txt")).unwrap(),
+        "FIXED"
+    );
+    let art = root.path().join("state/cycle-000002");
+    let status: Value =
+        serde_json::from_slice(&fs::read(art.join("tool-0-2.json")).unwrap()).unwrap();
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["result"]["running"], false);
+    assert_eq!(status["result"]["passed"], true);
+    assert_eq!(status["result"]["stop_reason"], Value::Null);
+    assert_eq!(status["result"]["output"], "READYFINISHED");
+    assert_eq!(
+        status["result"]["command_id"], "cycle-000001-0-2",
+        "A continuation must address the original process, without relaunching it"
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn background_command_allows_edits_and_checks_until_explicit_cleanup() {
+    let reason = "The app inspection is complete; the model deliberately closed it";
+    let server = Server::custom(false, false, None, move |body, n| {
+        if n == 0 {
+            return (
+                String::new(),
+                json!([
+                    task_tool("Inspect a live application while making progress"),
+                    {"function":{"name":"run_command","arguments":{"argv":["sh","-c","printf APP_READY; read instruction"],"mode":"background","reason":"Keep the application available for inspection","timeout_seconds":120}}}
+                ]),
+            );
+        }
+        let starts = named_tool_results(body, "run_command");
+        let background = starts
+            .iter()
+            .find(|result| result["result"]["mode"] == "background")
+            .expect("The background launch must stay in the conversation");
+        let id = background["result"]["command_id"].clone();
+        match n {
+            1 => (
+                String::new(),
+                json!([
+                    {"function":{"name":"command_status","arguments":{"command_id":id,"wait_ms":0}}},
+                    {"function":{"name":"run_command","arguments":{"argv":["sh","-c","printf FINITE_CHECK"]}}},
+                    {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"Updated while the application was open"}}},
+                    {"function":{"name":"finish_task","arguments":{"task_id":1,"summary":"The visible files were updated and checked while the application remained alive"}}}
+                ]),
+            ),
+            2 => (
+                String::new(),
+                json!([
+                    {"function":{"name":"command_status","arguments":{"command_id":id,"wait_ms":0}}},
+                    {"function":{"name":"finish_project","arguments":{"summary":"Complete","evidence":"The files have been checked"}}},
+                    {"function":{"name":"stop_command","arguments":{"command_id":id,"reason":reason}}},
+                    {"function":{"name":"finish_project","arguments":{"summary":"Complete","evidence":"The files have been checked and the app was deliberately closed"}}}
+                ]),
+            ),
+            _ => panic!("Unexpected provider request {n}"),
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["implementation_calls"] = json!(1);
+    config["allow_goal_completion"] = json!(true);
+    fs::write(path, config.to_string()).unwrap();
+
+    run_cycles_bounded(root.path(), 1);
+    let first = state(root.path());
+    assert_eq!(first["last_checks_passed_ref"], first["working_ref"]);
+
+    run_cycles_bounded(root.path(), 1);
+    let finished_task = state(root.path());
+    assert_eq!(
+        finished_task["completed_tasks"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/value.txt")).unwrap(),
+        "Updated while the application was open"
+    );
+    let second = root.path().join("state/cycle-000002");
+    let status: Value =
+        serde_json::from_slice(&fs::read(second.join("tool-0-0.json")).unwrap()).unwrap();
+    assert_eq!(status["result"]["running"], true);
+    assert_eq!(status["result"]["mode"], "background");
+
+    run_cycles_bounded(root.path(), 1);
+    let third = root.path().join("state/cycle-000003");
+    let refused: Value =
+        serde_json::from_slice(&fs::read(third.join("tool-0-1.json")).unwrap()).unwrap();
+    assert_eq!(refused["ok"], false);
+    let stopped: Value =
+        serde_json::from_slice(&fs::read(third.join("tool-0-2.json")).unwrap()).unwrap();
+    assert_eq!(stopped["ok"], true);
+    assert_eq!(stopped["result"]["running"], false);
+    assert_eq!(stopped["result"]["passed"], false);
+    assert_eq!(stopped["result"]["stop_reason"], reason);
+    assert!(root.path().join("state/goal-completion.json").exists());
+    assert_eq!(server.requests.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn configured_check_yields_at_budget_and_reuses_the_same_process_after_resume() {
+    let server = Server::custom(false, false, None, |body, n| match n {
+        0 => (
+            String::new(),
+            json!([
+                task_tool("Complete the actual long-running validation"),
+                {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"FIXED"}}},
+                {"function":{"name":"finish_task","arguments":{"task_id":1,"summary":"The repaired files are ready for validation"}}}
+            ]),
+        ),
+        1 => {
+            let live = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .filter_map(|message| {
+                    serde_json::from_str::<Value>(message["content"].as_str()?).ok()
+                })
+                .find(|message| {
+                    message["running_commands"]
+                        .as_array()
+                        .is_some_and(|commands| !commands.is_empty())
+                })
+                .expect("The model must receive the pending configured-check handle");
+            assert_eq!(
+                live["running_commands"][0]["command_id"],
+                "cycle-000001-verification"
+            );
+            assert_eq!(live["running_commands"][0]["running"], true);
+            let id = live["running_commands"][0]["command_id"].clone();
+            (
+                String::new(),
+                json!([
+                    {"function":{"name":"command_input","arguments":{"command_id":id,"text":"finish\n","close_stdin":true}}},
+                    {"function":{"name":"command_status","arguments":{"command_id":id,"wait_ms":1000}}},
+                    {"function":{"name":"finish_task","arguments":{"task_id":1,"summary":"The existing configured check completed successfully"}}}
+                ]),
+            )
+        }
+        _ => panic!("Unexpected provider request {n}"),
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let marker = root.path().join("verification-launches.txt");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["implementation_calls"] = json!(1);
+    config["checks"] = json!([{"argv":["sh","-c","printf 'started\\n' >> \"$0\"; printf READY; read instruction && test \"$(cat value.txt)\" = FIXED && printf VERIFIED", marker],"timeout_seconds":120}]);
+    fs::write(path, config.to_string()).unwrap();
+
+    run_cycles_bounded(root.path(), 1);
+    let pending = state(root.path());
+    assert!(pending["completed_tasks"].as_array().unwrap().is_empty());
+    assert_eq!(pending["last_checks_passed_ref"], Value::Null);
+    assert_eq!(pending["recent"][0]["disposition"], "checkpoint/unverified");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "started\n");
+
+    run_cycles_bounded(root.path(), 1);
+    let finished = state(root.path());
+    assert_eq!(finished["completed_tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(finished["last_checks_passed_ref"], finished["working_ref"]);
+    assert_eq!(
+        fs::read_to_string(marker).unwrap(),
+        "started\n",
+        "The resumed cycle must collect the original check, not launch another one"
+    );
+    let results: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000002/verification.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(results.as_array().unwrap().len(), 1);
+    assert_eq!(results[0]["passed"], true);
+    assert!(results[0]["output"].as_str().unwrap().contains("VERIFIED"));
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+#[cfg(unix)]
+fn controller_cleanup_explains_interrupted_commands_on_cold_resume() {
+    let server = Server::custom(false, false, None, |body, n| match n {
+        0 => (
+            String::new(),
+            json!([
+                task_tool("Inspect an application across model turns"),
+                {"function":{"name":"run_command","arguments":{"argv":["sh","-c","printf APP_READY; read instruction"],"mode":"background","reason":"Keep the application open for inspection","timeout_seconds":120}}}
+            ]),
+        ),
+        1 => {
+            let messages = body["messages"].to_string();
+            assert!(messages.contains("cycle-000001-0-1"));
+            assert!(messages.contains("stop_reason"));
+            assert!(messages.contains("not an application crash or a passing check"));
+            (
+                String::new(),
+                json!([
+                    {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"Continued after intentional controller cleanup"}}},
+                    {"function":{"name":"finish_task","arguments":{"task_id":1,"summary":"Continued after reviewing the harness interruption notice"}}}
+                ]),
+            )
+        }
+        _ => panic!("Unexpected provider request {n}"),
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["implementation_calls"] = json!(1);
+    fs::write(path, config.to_string()).unwrap();
+    run_cycles_bounded(root.path(), 1);
+
+    let runtime = root.path().join(".chuggin/global/chuggin/runtime");
+    let socket = fs::read_dir(runtime)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "sock"))
+        .expect("The controller must remain alive while it owns the application");
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(b"{\"action\":\"shutdown\",\"cleanup_commands\":true}\n")
+        .unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["ok"], true, "{response}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "The explicitly closed controller must release its socket"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let journal_path = root.path().join("state/command-lifecycle.json");
+    let journal: Value = serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    let closed = &journal[0]["command_updates"][0];
+    assert_eq!(closed["command_id"], "cycle-000001-0-1");
+    assert_eq!(closed["running"], false);
+    assert_eq!(closed["passed"], false);
+    assert!(
+        closed["stop_reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+    );
+    let pid = closed["pid"].as_u64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+
+    run_cycles_bounded(root.path(), 1);
+    assert!(
+        !journal_path.exists(),
+        "The durable notice is consumed after saving the continuation"
+    );
+    let saved = state(root.path());
+    assert_eq!(saved["completed_tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/value.txt")).unwrap(),
+        "Continued after intentional controller cleanup"
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
 fn project_completion_waits_for_running_commands() {
-    let server = Server::custom(false, false, None, |_, n| {
+    let server = Server::custom(false, false, None, |body, n| {
         if n == 0 {
             (
                 String::new(),
@@ -4625,16 +5366,23 @@ fn project_completion_waits_for_running_commands() {
                 ]),
             )
         } else {
-            ("Checkpoint".into(), json!([]))
+            let starts = named_tool_results(body, "run_command");
+            (
+                String::new(),
+                json!([{"function":{"name":"command_status","arguments":{"command_id":starts.last().unwrap()["result"]["command_id"],"wait_ms":5000}}}]),
+            )
         }
     });
     let root = tempfile::tempdir().unwrap();
     let path = fixture(root.path(), &server.url, true);
     let mut c: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     c["allow_goal_completion"] = json!(true);
+    c["implementation_calls"] = json!(1);
     fs::write(&path, c.to_string()).unwrap();
-    run_cycles(root.path(), 1);
+    run_cycles_bounded(root.path(), 1);
     assert!(!root.path().join("state/goal-completion.json").exists());
+    assert_eq!(state(root.path())["last_checks_passed_ref"], Value::Null);
+    run_cycles_bounded(root.path(), 1);
     let s = state(root.path());
     assert_eq!(
         fs::read_to_string(Path::new(s["working_workspace"].as_str().unwrap()).join("result.txt"))

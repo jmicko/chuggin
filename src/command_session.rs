@@ -25,12 +25,79 @@ struct Managed {
     child: std::sync::Weak<std::sync::Mutex<Child>>,
     exited: std::sync::Arc<std::sync::Mutex<Option<std::process::ExitStatus>>>,
     stopped: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    descendant_cleanup: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    mode: std::sync::Arc<std::sync::Mutex<String>>,
+    purpose: std::sync::Arc<std::sync::Mutex<String>>,
+    persist_guard: std::sync::Arc<std::sync::Mutex<()>>,
+    pid: i32,
     started: Instant,
 }
 static MANAGED: std::sync::LazyLock<std::sync::Mutex<Vec<Managed>>> =
     std::sync::LazyLock::new(Default::default);
 pub fn managed_commands() -> Vec<Value> {
-    MANAGED.lock().unwrap().iter().rev().take(100).map(|m| json!({"command_id":m.handle,"actor":m.actor,"job_id":m.id,"argv":m.argv,"running":m.exited.lock().unwrap().is_none() && m.child.strong_count()>0,"log":m.log,"elapsed_seconds":m.started.elapsed().as_secs()})).collect()
+    MANAGED.lock().unwrap().iter().rev().take(100).map(|m| json!({"command_id":m.handle,"actor":m.actor,"job_id":m.id,"pid":m.pid,"argv":m.argv,"mode":*m.mode.lock().unwrap(),"purpose":*m.purpose.lock().unwrap(),"running":m.exited.lock().unwrap().is_none() && m.stopped.lock().unwrap().is_none() && m.child.strong_count()>0,"stop_reason":*m.stopped.lock().unwrap(),"descendant_cleanup_reason":*m.descendant_cleanup.lock().unwrap(),"log":m.log,"elapsed_seconds":m.started.elapsed().as_secs()})).collect()
+}
+/// Background apps remain observable while finite workspace work retains its barrier.
+pub fn workspace_checks() -> Vec<i32> {
+    let background: Vec<i32> = MANAGED
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|managed| {
+            managed.exited.lock().unwrap().is_none()
+                && managed.child.strong_count() > 0
+                && *managed.mode.lock().unwrap() == "background"
+        })
+        .map(|managed| managed.pid)
+        .collect();
+    crate::project::active_checks()
+        .into_iter()
+        .filter(|pid| !background.contains(pid))
+        .collect()
+}
+
+/// Save a reason before a force stop even while the worker owns its job registry.
+pub fn stop_actor(actor: &str, reason: &str) -> Result<Vec<Value>> {
+    let handles: Vec<String> = MANAGED
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|managed| {
+            managed.actor == actor
+                && managed.exited.lock().unwrap().is_none()
+                && managed.child.strong_count() > 0
+        })
+        .map(|managed| managed.handle.clone())
+        .collect();
+    handles
+        .iter()
+        .map(|handle| manage(handle, "stop_command", &json!({"reason":reason})))
+        .collect()
+}
+
+fn persist_managed_state(managed: &Managed) -> Result<()> {
+    let _guard = managed.persist_guard.lock().unwrap();
+    let path = managed.log.with_extension("session.json");
+    let mut value: Value = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| json!({"command_id":managed.id,"argv":managed.argv,"pid":managed.pid}));
+    let exit = *managed.exited.lock().unwrap();
+    let stopped = managed.stopped.lock().unwrap().clone();
+    value["running"] =
+        json!(exit.is_none() && stopped.is_none() && managed.child.strong_count() > 0);
+    value["exit_code"] = json!(exit.and_then(|status| status.code()));
+    value["passed"] = json!(if stopped.is_some() {
+        Some(false)
+    } else {
+        exit.map(|status| status.success())
+    });
+    value["stop_reason"] = json!(stopped);
+    value["descendant_cleanup_reason"] = json!(*managed.descendant_cleanup.lock().unwrap());
+    value["mode"] = json!(*managed.mode.lock().unwrap());
+    value["purpose"] = json!(*managed.purpose.lock().unwrap());
+    fs::write(path, serde_json::to_vec_pretty(&value)?)?;
+    Ok(())
 }
 pub fn manage(id: &str, action: &str, args: &Value) -> Result<Value> {
     anyhow::ensure!(
@@ -47,6 +114,10 @@ pub fn manage(id: &str, action: &str, args: &Value) -> Result<Value> {
         .context("Unknown command; use list_commands")?;
     let mut written = None;
     if action == "stop_command" {
+        let reason = args["reason"]
+            .as_str()
+            .filter(|reason| !reason.trim().is_empty())
+            .context("Supply a reason for stopping this command")?;
         if let Some(child) = m.child.upgrade() {
             let mut child = child.lock().unwrap();
             if m.exited.lock().unwrap().is_none() {
@@ -54,12 +125,7 @@ pub fn manage(id: &str, action: &str, args: &Value) -> Result<Value> {
                     // A successful completed process wins a stale stop request.
                     *m.exited.lock().unwrap() = Some(status);
                 } else {
-                    *m.stopped.lock().unwrap() = Some(
-                        args["reason"]
-                            .as_str()
-                            .unwrap_or("Stopped by operator")
-                            .into(),
-                    );
+                    *m.stopped.lock().unwrap() = Some(reason.into());
                     #[cfg(unix)]
                     unsafe {
                         libc::kill(-(child.id() as i32), libc::SIGKILL);
@@ -78,6 +144,7 @@ pub fn manage(id: &str, action: &str, args: &Value) -> Result<Value> {
                 crate::project::unregister_check(child.id() as i32);
             }
         }
+        persist_managed_state(&m)?;
     } else if action == "command_input" {
         let child = m.child.upgrade().context("Command has ended")?;
         let mut child = child.lock().unwrap();
@@ -146,7 +213,14 @@ pub fn manage(id: &str, action: &str, args: &Value) -> Result<Value> {
     let exit = *m.exited.lock().unwrap();
     let stopped = m.stopped.lock().unwrap().clone();
     let running = exit.is_none() && stopped.is_none() && m.child.strong_count() > 0;
-    let mut value = json!({"command_id":m.handle,"actor":m.actor,"argv":m.argv,"running":exit.is_none() && stopped.is_none() && m.child.strong_count()>0,"exit_code":exit.and_then(|e|e.code()),"passed":if stopped.is_some(){Some(false)}else{exit.map(|e|e.success())},"stop_reason":stopped,"output_tail":String::from_utf8_lossy(&tail),"log":m.log,"log_id":log_id,"log_bytes":bytes,"written_bytes":written,"next_output_offset":bytes});
+    let mut value = json!({"command_id":m.handle,"job_id":m.id,"actor":m.actor,"pid":m.pid,"argv":m.argv,"mode":*m.mode.lock().unwrap(),"purpose":*m.purpose.lock().unwrap(),"running":exit.is_none() && stopped.is_none() && m.child.strong_count()>0,"exit_code":exit.and_then(|e|e.code()),"passed":if stopped.is_some(){Some(false)}else{exit.map(|e|e.success())},"stop_reason":stopped,"descendant_cleanup_reason":*m.descendant_cleanup.lock().unwrap(),"output_tail":String::from_utf8_lossy(&tail),"log":m.log,"log_id":log_id,"log_bytes":bytes,"written_bytes":written,"next_output_offset":bytes});
+    value["lifecycle_instruction"] = json!(if stopped.is_some() {
+        "Chuggin intentionally stopped this process for the recorded stop_reason. Interrupted commands are not passing validation; do not treat this as an unexplained application crash."
+    } else if m.descendant_cleanup.lock().unwrap().is_some() {
+        "The parent command exited and Chuggin cleaned up its descendants. Launch applications or servers directly with mode=background instead of shell backgrounding with &."
+    } else {
+        "This command stays owned by its controller. Use the existing command_id for status, input or targeted stop. A running process is not passing validation."
+    });
     if action == "command_status" {
         value.as_object_mut().unwrap().remove("output_tail");
         value.as_object_mut().unwrap().extend(
@@ -210,6 +284,10 @@ pub struct Session {
     pub result: Option<CheckResult>,
     pub stop_reason: Option<String>,
     external_stop: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    descendant_cleanup: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    mode: std::sync::Arc<std::sync::Mutex<String>>,
+    purpose: std::sync::Arc<std::sync::Mutex<String>>,
+    persist_guard: std::sync::Arc<std::sync::Mutex<()>>,
 }
 impl Session {
     pub fn start(root: &Path, c: &Check, log: &Path, id: &str) -> Result<Self> {
@@ -252,13 +330,17 @@ impl Session {
         let child = std::sync::Arc::new(std::sync::Mutex::new(child));
         let exited = std::sync::Arc::new(std::sync::Mutex::new(None));
         let external_stop = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let descendant_cleanup = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mode = std::sync::Arc::new(std::sync::Mutex::new("finite".to_owned()));
+        let purpose = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let persist_guard = std::sync::Arc::new(std::sync::Mutex::new(()));
         let mut registry = MANAGED.lock().unwrap();
         if registry.len() >= 1024
             && let Some(index) = registry.iter().position(|m| m.child.strong_count() == 0)
         {
             registry.remove(index);
         }
-        registry.push(Managed {
+        let managed = Managed {
             handle: crate::operator::id(),
             actor: events::actor(),
             id: id.into(),
@@ -267,8 +349,14 @@ impl Session {
             child: std::sync::Arc::downgrade(&child),
             exited: exited.clone(),
             stopped: external_stop.clone(),
+            descendant_cleanup: descendant_cleanup.clone(),
+            mode: mode.clone(),
+            purpose: purpose.clone(),
+            persist_guard: persist_guard.clone(),
+            pid: pid as i32,
             started: Instant::now(),
-        });
+        };
+        registry.push(managed.clone());
         drop(registry);
         let monitored = child.clone();
         let observed = exited.clone();
@@ -279,10 +367,14 @@ impl Session {
                 if let Ok(Some(status)) = status {
                     #[cfg(unix)]
                     unsafe {
+                        if libc::kill(-(pid as i32), 0) == 0 {
+                            *managed.descendant_cleanup.lock().unwrap() = Some("Parent command exited; Chuggin cleaned up its remaining process-group descendants. Launch apps or servers directly with mode=background instead of shell backgrounding with &.".into());
+                        }
                         libc::kill(-(pid as i32), libc::SIGKILL);
                     }
                     crate::project::unregister_check(pid as i32);
                     *observed.lock().unwrap() = Some(status);
+                    let _ = persist_managed_state(&managed);
                     break;
                 }
                 if status.is_err() {
@@ -305,9 +397,29 @@ impl Session {
             result: None,
             stop_reason: None,
             external_stop,
+            descendant_cleanup,
+            mode,
+            purpose,
+            persist_guard,
         };
         session.persist()?;
         Ok(session)
+    }
+    pub fn pid(&self) -> i32 {
+        self.pid as i32
+    }
+    pub fn set_mode(&mut self, mode: &str, purpose: &str) -> Result<()> {
+        anyhow::ensure!(
+            matches!(mode, "finite" | "background"),
+            "Unknown command mode"
+        );
+        anyhow::ensure!(
+            mode == "finite" || !purpose.trim().is_empty(),
+            "Explain the purpose of a background command"
+        );
+        *self.mode.lock().unwrap() = mode.into();
+        *self.purpose.lock().unwrap() = purpose.trim().into();
+        self.persist()
     }
     pub fn running(&self) -> bool {
         self.result.is_none()
@@ -376,7 +488,10 @@ impl Session {
             }
             let exit_status = *self.exited.lock().unwrap();
             if let Some(status) = exit_status {
-                self.finish(status.code(), status.success())?;
+                self.finish(
+                    status.code(),
+                    status.success() && self.stop_reason.is_none(),
+                )?;
                 break;
             }
             if stop.load(Ordering::SeqCst) {
@@ -414,11 +529,26 @@ impl Session {
         if !self.running() {
             return Ok(());
         }
-        let exit_status = *self.exited.lock().unwrap();
+        if let Some(stopped) = self.external_stop.lock().unwrap().clone() {
+            self.stop_reason = Some(stopped);
+        }
+        let mut exit_status = *self.exited.lock().unwrap();
+        if exit_status.is_none() {
+            // Check the child directly as well as the async monitor: a process
+            // can finish between the last observation and a stop request.
+            exit_status = self.child.lock().unwrap().try_wait()?;
+            if let Some(status) = exit_status {
+                *self.exited.lock().unwrap() = Some(status);
+            }
+        }
         if let Some(status) = exit_status {
-            return self.finish(status.code(), status.success());
+            return self.finish(
+                status.code(),
+                status.success() && self.stop_reason.is_none(),
+            );
         }
         self.stop_reason = Some(reason.into());
+        *self.external_stop.lock().unwrap() = Some(reason.into());
         self.finish(None, false)
     }
     pub fn input(&mut self, text: &str, close: bool) -> Result<usize> {
@@ -438,11 +568,32 @@ impl Session {
     }
     pub fn snapshot(&self) -> Result<Value> {
         let log_id = evidence_log_id(&self.log);
+        let stopped = self
+            .stop_reason
+            .clone()
+            .or_else(|| self.external_stop.lock().unwrap().clone());
+        let descendant_cleanup = self.descendant_cleanup.lock().unwrap().clone();
+        let observed_exit = *self.exited.lock().unwrap();
+        let running = self.running() && observed_exit.is_none() && stopped.is_none();
+        let exit_code = self
+            .result
+            .as_ref()
+            .and_then(|result| result.exit_code)
+            .or_else(|| observed_exit.and_then(|status| status.code()));
+        let passed = if stopped.is_some() {
+            Some(false)
+        } else {
+            self.result
+                .as_ref()
+                .map(|result| result.passed)
+                .or_else(|| observed_exit.map(|status| status.success()))
+        };
         Ok(
-            json!({"pid":self.pid,"command_id":self.id,"argv":self.argv,"running":self.running(),"elapsed_seconds":self.started.elapsed().as_secs(),"next_review_seconds":self.next_review.saturating_duration_since(Instant::now()).as_secs(),"watchdog_reviews":self.reviews,"log_bytes":fs::metadata(&self.log)?.len(),"next_output_offset":fs::metadata(&self.log)?.len(),"seconds_since_output":fs::metadata(&self.log)?.modified().ok().and_then(|t|t.elapsed().ok()).map(|d|d.as_secs()),"processes":process_observations(self.pid),"exit_code":self.result.as_ref().and_then(|r|r.exit_code),"passed":self.result.as_ref().map(|r|r.passed),"timed_out":false,"stop_reason":self.stop_reason,"output_tail":self.tail()?,"log_id":log_id,"instruction":"If running, read evidence or use command_status with wait_ms up to 60000, output_offset=next_output_offset and output_log_id=log_id to wait for new output or completion. Use read_command_log with log_id for older/full output. Do not launch duplicates or edit files being checked. Planning and read-only inspection may continue. A running command is not a passing check."}),
+            json!({"pid":self.pid,"command_id":self.id,"argv":self.argv,"mode":*self.mode.lock().unwrap(),"purpose":*self.purpose.lock().unwrap(),"running":running,"elapsed_seconds":self.started.elapsed().as_secs(),"next_review_seconds":self.next_review.saturating_duration_since(Instant::now()).as_secs(),"watchdog_reviews":self.reviews,"log_bytes":fs::metadata(&self.log)?.len(),"next_output_offset":fs::metadata(&self.log)?.len(),"seconds_since_output":fs::metadata(&self.log)?.modified().ok().and_then(|t|t.elapsed().ok()).map(|d|d.as_secs()),"processes":process_observations(self.pid),"exit_code":exit_code,"passed":passed,"timed_out":false,"stop_reason":stopped,"descendant_cleanup_reason":descendant_cleanup,"output_tail":self.tail()?,"log_id":log_id,"instruction":"Commands stay owned by the controller across turns, cycles and soft stops. Use command_status with wait_ms up to 60000 and the existing command_id for fresh output or completion. Use read_command_log with log_id for older/full output. Finite work must finish before editing its workspace; deliberate background apps can remain open. A running command is not a passing check. If stop_reason or descendant_cleanup_reason is present, Chuggin performed the recorded cleanup; do not mistake it for an unexplained application crash. Launch apps/servers directly with mode=background, without shell &."}),
         )
     }
     fn persist(&self) -> Result<()> {
+        let _guard = self.persist_guard.lock().unwrap();
         fs::write(
             self.log.with_extension("session.json"),
             serde_json::to_vec_pretty(&self.snapshot()?)?,
@@ -563,6 +714,17 @@ mod tests {
         }
         thread::sleep(Duration::from_millis(1100));
         assert!(!d.path().join("escaped").exists());
+        let record: Value =
+            serde_json::from_slice(&fs::read(d.path().join("command-drop.session.json")).unwrap())
+                .unwrap();
+        assert_eq!(record["running"], false);
+        assert_eq!(record["passed"], false);
+        assert!(
+            record["stop_reason"]
+                .as_str()
+                .unwrap()
+                .contains("Session owner ended")
+        );
     }
     #[test]
     fn waiting_yields_on_new_output_and_cursors_preserve_unicode() {
@@ -689,6 +851,84 @@ mod tests {
         assert_eq!(final_status["passed"], false);
         assert_eq!(final_status["output"], "");
         assert_eq!(final_status["stop_reason"], "Operator ended the probe");
+        let record: Value =
+            serde_json::from_slice(&fs::read(session.log.with_extension("session.json")).unwrap())
+                .unwrap();
+        assert_eq!(record["stop_reason"], "Operator ended the probe");
+        assert_eq!(record["passed"], false);
+    }
+    #[test]
+    fn background_intent_is_visible_to_operators_and_releases_only_its_workspace_barrier() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut app = Session::start(
+            fixture.path(),
+            &command("sleep 10"),
+            &fixture.path().join("command-app.log"),
+            "app",
+        )
+        .unwrap();
+        let finite = Session::start(
+            fixture.path(),
+            &command("sleep 10"),
+            &fixture.path().join("command-build.log"),
+            "build",
+        )
+        .unwrap();
+        assert!(workspace_checks().contains(&app.pid()));
+        app.set_mode("background", "Inspect the running application")
+            .unwrap();
+        assert!(!workspace_checks().contains(&app.pid()));
+        assert!(workspace_checks().contains(&finite.pid()));
+        let managed = managed_commands()
+            .into_iter()
+            .find(|record| record["log"] == json!(app.log))
+            .unwrap();
+        let status = manage(
+            managed["command_id"].as_str().unwrap(),
+            "command_status",
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(status["mode"], "background");
+        assert_eq!(status["purpose"], "Inspect the running application");
+        assert_eq!(status["passed"], Value::Null);
+        app.terminate("Inspection completed").unwrap();
+        let status = manage(
+            managed["command_id"].as_str().unwrap(),
+            "command_status",
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(status["stop_reason"], "Inspection completed");
+        assert_eq!(status["passed"], false);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_exit_records_descendant_cleanup_without_inventing_a_parent_failure() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut session = Session::start(
+            fixture.path(),
+            &command("sleep 10 & exit 0"),
+            &fixture.path().join("command-shell.log"),
+            "shell",
+        )
+        .unwrap();
+        let status = session.poll(1000, &AtomicBool::new(false)).unwrap();
+        assert_eq!(status["passed"], true);
+        assert_eq!(status["stop_reason"], Value::Null);
+        assert!(
+            status["descendant_cleanup_reason"]
+                .as_str()
+                .unwrap()
+                .contains("Parent command exited")
+        );
+        let saved: Value =
+            serde_json::from_slice(&fs::read(session.log.with_extension("session.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            saved["descendant_cleanup_reason"],
+            status["descendant_cleanup_reason"]
+        );
     }
     #[test]
     fn operator_observation_can_wait_past_a_second_for_completion() {
