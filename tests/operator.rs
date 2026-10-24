@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -69,7 +69,7 @@ impl Fixture {
         )
         .unwrap();
         let log = fs::File::create(dir.path().join("engine.log")).unwrap();
-        let child = Command::new(BIN)
+        let mut child = Command::new(BIN)
             .arg("engine")
             .arg("--config")
             .arg(dir.path().join("chuggin.json"))
@@ -81,6 +81,7 @@ impl Fixture {
             .unwrap();
         let runtime = dir.path().join("config/chuggin/runtime");
         let until = Instant::now() + Duration::from_secs(8);
+        let mut readiness_error = String::from("Controller socket has not appeared");
         let socket = loop {
             if let Ok(files) = fs::read_dir(&runtime)
                 && let Some(path) = files
@@ -88,13 +89,34 @@ impl Fixture {
                     .map(|e| e.path())
                     .find(|p| p.extension().is_some_and(|e| e == "sock"))
             {
-                break path;
+                // A Unix socket pathname exists after bind, before listen and
+                // request handling are necessarily ready. A real status reply
+                // establishes readiness; ordinary test RPCs remain strict.
+                match Self::readiness_probe(&path) {
+                    Ok(reply) => {
+                        assert_eq!(
+                            reply["ok"], true,
+                            "Controller rejected startup readiness: {reply}"
+                        );
+                        break path;
+                    }
+                    Err(error) => readiness_error = error.to_string(),
+                }
             }
-            assert!(
-                Instant::now() < until,
-                "{}",
-                fs::read_to_string(dir.path().join("engine.log")).unwrap()
-            );
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!(
+                    "Controller exited during startup ({status}): {}",
+                    fs::read_to_string(dir.path().join("engine.log")).unwrap()
+                );
+            }
+            if Instant::now() >= until {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "Controller did not become ready: {readiness_error}\n{}",
+                    fs::read_to_string(dir.path().join("engine.log")).unwrap()
+                );
+            }
             thread::sleep(Duration::from_millis(25));
         };
         Self {
@@ -103,6 +125,16 @@ impl Fixture {
             socket,
             serial: AtomicU64::new(0),
         }
+    }
+    fn readiness_probe(socket: &Path) -> std::io::Result<Value> {
+        let mut stream = UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+        writeln!(stream, "{}", json!({"action":"status"}))?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        serde_json::from_str(&line)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
     fn rpc(&self, v: Value) -> Value {
         let mut s = UnixStream::connect(&self.socket).unwrap();

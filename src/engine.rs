@@ -386,14 +386,21 @@ impl Engine {
             "human_settings" => self.controller.update_human_settings(&v),
             "force_stop" => {
                 let _admission = self.controller.lifecycle.lock().unwrap();
+                ensure!(
+                    !self.controller.closing.load(Ordering::SeqCst),
+                    "Controller is already closing; reconnect before continuing"
+                );
                 self.controller.force_stop_loop_commands()?;
                 crate::project::kill_active_check();
                 self.controller.closing.store(true, Ordering::SeqCst);
-                self.quit.store(true, Ordering::SeqCst);
                 Ok(json!({"stopped":true}))
             }
             "shutdown" => {
                 let _admission = self.controller.lifecycle.lock().unwrap();
+                ensure!(
+                    !self.controller.closing.load(Ordering::SeqCst),
+                    "Controller is already closing; reconnect before continuing"
+                );
                 ensure!(
                     !self.controller.running.load(Ordering::SeqCst)
                         && !self.chats.any_running()
@@ -412,7 +419,6 @@ impl Engine {
                     );
                 }
                 self.controller.closing.store(true, Ordering::SeqCst);
-                self.quit.store(true, Ordering::SeqCst);
                 Ok(json!({"closing":true}))
             }
             "open_session" => {
@@ -471,6 +477,30 @@ impl Engine {
         }
     }
 }
+
+/// A successful close request retires admission immediately, but its worker must
+/// finish the acknowledgement before the main thread can end the process. Even
+/// a disconnected client gets a completed write/flush attempt before quitting.
+#[cfg(unix)]
+fn write_response(
+    writer: &mut impl Write,
+    result: Result<Value>,
+    close_after_reply: bool,
+    quit: &AtomicBool,
+) -> std::io::Result<()> {
+    let close_after_reply = close_after_reply && result.is_ok();
+    let value = match result {
+        Ok(value) => json!({"ok":true,"result":value}),
+        Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
+    };
+    let written = writeln!(writer, "{value}");
+    let flushed = writer.flush();
+    if close_after_reply {
+        quit.store(true, Ordering::SeqCst);
+    }
+    written.and(flushed)
+}
+
 pub fn serve(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -497,20 +527,28 @@ pub fn serve(path: &Path) -> Result<()> {
                     Ok(stream) => {
                         let worker = engine.clone();
                         std::thread::spawn(move || {
+                            let mut close_after_reply = false;
                             let result = (|| -> Result<Value> {
                                 stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                                stream.set_write_timeout(Some(Duration::from_secs(10)))?;
                                 let mut line = String::new();
                                 BufReader::new(stream.try_clone()?)
                                     .take(2_000_000)
                                     .read_line(&mut line)?;
-                                worker.request(serde_json::from_str(&line)?)
+                                let request: Value = serde_json::from_str(&line)?;
+                                close_after_reply = matches!(
+                                    request["action"].as_str(),
+                                    Some("shutdown" | "force_stop")
+                                );
+                                worker.request(request)
                             })();
-                            let value = match result {
-                                Ok(v) => json!({"ok":true,"result":v}),
-                                Err(e) => json!({"ok":false,"error":format!("{e:#}")}),
-                            };
                             let mut stream = stream;
-                            let _ = writeln!(stream, "{value}");
+                            let _ = write_response(
+                                &mut stream,
+                                result,
+                                close_after_reply,
+                                &worker.quit,
+                            );
                         });
                     }
                     Err(_) => break,
@@ -542,6 +580,7 @@ pub fn serve(path: &Path) -> Result<()> {
             }
             std::thread::sleep(Duration::from_millis(20));
             if !engine.controller.running.load(Ordering::SeqCst)
+                && !engine.controller.closing.load(Ordering::SeqCst)
                 && !engine.chats.any_running()
                 && !engine.controller.has_editor()
                 && crate::project::active_checks().is_empty()
@@ -681,6 +720,88 @@ pub fn close_idle_interactive(path: &Path) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    struct AcknowledgementWriter<'a> {
+        quit: &'a AtomicBool,
+        bytes: Vec<u8>,
+        flushed: bool,
+        broken: bool,
+    }
+    impl Write for AcknowledgementWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            assert!(
+                !self.quit.load(Ordering::SeqCst),
+                "Controller quit before its response was written"
+            );
+            if self.broken {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            // Simulate partial writes: quit must stay false throughout the JSON,
+            // including its final newline, rather than after the first chunk.
+            let count = bytes.len().min(2);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            assert!(
+                !self.quit.load(Ordering::SeqCst),
+                "Controller quit before its response was flushed"
+            );
+            self.flushed = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn shutdown_waits_for_the_complete_acknowledgement_and_flush() {
+        let quit = AtomicBool::new(false);
+        let mut writer = AcknowledgementWriter {
+            quit: &quit,
+            bytes: vec![],
+            flushed: false,
+            broken: false,
+        };
+        write_response(&mut writer, Ok(json!({"closing":true})), true, &quit).unwrap();
+        assert!(writer.flushed);
+        assert!(quit.load(Ordering::SeqCst));
+        assert!(writer.bytes.ends_with(b"\n"));
+        let response: Value = serde_json::from_slice(&writer.bytes).unwrap();
+        assert_eq!(response, json!({"ok":true,"result":{"closing":true}}));
+    }
+
+    #[test]
+    fn rejected_shutdown_does_not_quit_and_a_lost_acknowledgement_still_flushes() {
+        let quit = AtomicBool::new(false);
+        let mut writer = AcknowledgementWriter {
+            quit: &quit,
+            bytes: vec![],
+            flushed: false,
+            broken: false,
+        };
+        write_response(
+            &mut writer,
+            Err(anyhow::anyhow!("Loop is still running")),
+            true,
+            &quit,
+        )
+        .unwrap();
+        assert!(writer.flushed);
+        assert!(!quit.load(Ordering::SeqCst));
+        let response: Value = serde_json::from_slice(&writer.bytes).unwrap();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"], "Loop is still running");
+        let mut disconnected = AcknowledgementWriter {
+            quit: &quit,
+            bytes: vec![],
+            flushed: false,
+            broken: true,
+        };
+        assert!(
+            write_response(&mut disconnected, Ok(json!({"stopped":true})), true, &quit).is_err()
+        );
+        assert!(disconnected.flushed);
+        assert!(quit.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn startup_error_omits_logs_from_previous_runs() {
