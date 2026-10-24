@@ -23,6 +23,7 @@ pub(crate) fn progress_text(progress: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(progress) else {
         return progress.into();
     };
+    let file_observations = v["activity_mode"] == "type2" || v["activity_mode"] == "chaos";
     let branch = v["working_branch"]
         .as_str()
         .or_else(|| v["accepted_branch"].as_str())
@@ -49,6 +50,12 @@ pub(crate) fn progress_text(progress: &str) -> String {
         v["branch_head"].as_str().unwrap_or("legacy"),
         v["working_ref"].as_str().unwrap_or("—")
     ));
+    if file_observations {
+        text = format!(
+            "Cycle {}\nWorkspace: {workspace}\n\nConversation, tool history, and activity records are saved. Files remain in the workspace. File hashes support change detection; they are not recoverable backups. There are no automatic commits or branch restrictions.\n\nRecent cycles\n",
+            v["cycle"]
+        );
+    }
     if let Some(reason) = v["commit_pending"].as_str() {
         text.push_str(&format!("Commit deferred: {reason}\n"));
     }

@@ -181,7 +181,11 @@ Tasks are optional records of activities the model chooses. Finishing one never
 ends the session. With no configured checks, completion is recorded as a model
 report and validation reads **No checks configured**, never a passing result.
 If checks are explicitly configured, their existing completion gates apply.
-All work remains visible and is preserved in recovery snapshots. Mode is fixed
+This mode does not initialize Git, request a commit identity, create recovery
+snapshots or commits, or restrict branches. Existing repositories and their history
+are left intact. Conversation, tool results, and activity state persist normally;
+file hashes detect changes independently of Git. Hash records are not file backups.
+The model can use Git through shell commands if it chooses. Mode is fixed
 for a saved session to avoid silently mixing its history with goal-driven
 instructions; start in a new directory to choose another mode.
 

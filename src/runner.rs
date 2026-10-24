@@ -76,6 +76,69 @@ impl Config {
     pub fn allows_goal_completion(&self) -> bool {
         !self.activity_mode.is_chaos() && self.allow_goal_completion
     }
+    pub(crate) fn tree(&self, root: &Path) -> Result<String> {
+        if self.activity_mode.is_chaos() {
+            crate::file_state::tree(root, &self.state_dir)
+        } else {
+            crate::workspace::tree(root, Some(&self.state_dir))
+        }
+    }
+    pub(crate) fn changed_paths(
+        &self,
+        root: &Path,
+        before: &str,
+        after: &str,
+    ) -> Result<Vec<String>> {
+        if self.activity_mode.is_chaos() {
+            crate::file_state::changed_paths(&self.state_dir, before, after)
+        } else {
+            crate::workspace::changed_paths(root, &self.state_dir, before, after)
+        }
+    }
+    pub(crate) fn check_workspace(&self, root: &Path, branch: &str) -> Result<()> {
+        if self.activity_mode.is_chaos() {
+            anyhow::ensure!(
+                fs::canonicalize(root)? == fs::canonicalize(&self.repo)?,
+                "Workspace directory changed"
+            );
+            Ok(())
+        } else {
+            crate::workspace::check(root, branch)
+        }
+    }
+    pub(crate) fn workspace_branch(&self, root: &Path) -> Result<String> {
+        if self.activity_mode.is_chaos() {
+            Ok(String::new())
+        } else {
+            crate::workspace::branch(root)
+        }
+    }
+    pub(crate) fn workspace_head(&self, root: &Path) -> String {
+        if self.activity_mode.is_chaos() {
+            String::new()
+        } else {
+            crate::workspace::head(root)
+        }
+    }
+    pub(crate) fn observe_or_save(
+        &self,
+        root: &Path,
+        id: &str,
+        message: &str,
+    ) -> Result<(String, bool)> {
+        if self.activity_mode.is_chaos() {
+            Ok((self.tree(root)?, false))
+        } else {
+            crate::workspace::autosave(root, &self.state_dir, id, message)
+        }
+    }
+    pub(crate) fn controller_identity(&self) -> Result<PathBuf> {
+        if !self.activity_mode.is_chaos() {
+            return fs::canonicalize(crate::workspace::git_dir(&self.repo)?).map_err(Into::into);
+        }
+        let root = fs::canonicalize(&self.repo)?;
+        Ok(root)
+    }
 }
 pub fn default_command_review() -> u64 {
     120
@@ -758,47 +821,58 @@ fn release_project_lock(file: &fs::File) -> Result<()> {
 }
 
 pub(crate) fn lock_project(c: &Config) -> Result<Vec<fs::File>> {
+    use sha2::{Digest, Sha256};
     fs::create_dir_all(&c.state_dir)?;
-    // Resolve Git before taking ownership: subprocesses should not inherit
-    // temporary state ownership while the second lock is still being acquired.
-    let checkout_path = crate::workspace::git_dir(&c.repo)?.join("chuggin-run.lock");
-    let run_path = c.state_dir.join("run.lock");
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&run_path)?;
-    #[cfg(unix)]
-    acquire_project_lock(
-        &file,
-        &run_path,
-        "Another Chuggin process is already running this project",
-    )?;
-    let checkout = (|| -> Result<fs::File> {
-        let checkout_lock = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&checkout_path)?;
-        #[cfg(unix)]
-        acquire_project_lock(
-            &checkout_lock,
-            &checkout_path,
-            "Another Chuggin process owns this checkout",
-        )?;
-        Ok(checkout_lock)
-    })();
-    let checkout_lock = match checkout {
-        Ok(checkout) => checkout,
-        Err(error) => {
-            // A concurrent fork can keep a dropped File's open description
-            // alive until exec. Explicitly undo only this partial ownership.
+    let root = fs::canonicalize(&c.repo)?;
+    let directory = crate::setup::settings_path()?
+        .parent()
+        .unwrap()
+        .join("runtime");
+    fs::create_dir_all(&directory)?;
+    let shared_path = directory.join(format!(
+        "workspace-{:x}.lock",
+        Sha256::digest(root.as_os_str().as_encoded_bytes())
+    ));
+    // A directory lock coordinates every mode and configuration of this folder.
+    // Normal projects also retain their original Git lock for older controllers.
+    let mut paths = vec![c.state_dir.join("run.lock"), shared_path];
+    if !c.activity_mode.is_chaos() {
+        paths.push(crate::workspace::git_dir(&c.repo)?.join("chuggin-run.lock"));
+    }
+    let mut locks = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        let acquired = (|| -> Result<fs::File> {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)?;
             #[cfg(unix)]
-            release_project_lock(&file)?;
-            return Err(error);
+            acquire_project_lock(
+                &file,
+                path,
+                if index == 0 {
+                    "Another Chuggin process is already running this project"
+                } else {
+                    "Another Chuggin process owns this workspace"
+                },
+            )?;
+            Ok(file)
+        })();
+        match acquired {
+            Ok(file) => locks.push(file),
+            Err(error) => {
+                // Undo partial ownership even if a concurrent fork inherited an
+                // open description. Never unlock another process's lock.
+                #[cfg(unix)]
+                for file in locks.iter().rev() {
+                    release_project_lock(file)?;
+                }
+                return Err(error);
+            }
         }
-    };
-    Ok(vec![file, checkout_lock])
+    }
+    Ok(locks)
 }
 
 /// Socket removal precedes process exit, so it does not establish lock release.
@@ -923,6 +997,38 @@ mod project_lock_tests {
         assert!(error.downcast_ref::<ProjectLocked>().is_none());
         assert!(error.downcast_ref::<std::io::Error>().is_some());
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn modes_and_separate_state_directories_share_workspace_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let normal = config(dir.path());
+        let mut independent = normal.clone();
+        independent.activity_mode = crate::activity::Mode::Chaos;
+        independent.state_dir = dir.path().join("separate-state");
+        let normal_owner = lock_project(&normal).unwrap();
+        assert!(
+            lock_project(&independent)
+                .unwrap_err()
+                .downcast_ref::<ProjectLocked>()
+                .is_some()
+        );
+        for file in normal_owner.iter().rev() {
+            release_project_lock(file).unwrap();
+        }
+        drop(normal_owner);
+        let independent_owner = lock_project(&independent).unwrap();
+        assert!(
+            lock_project(&normal)
+                .unwrap_err()
+                .downcast_ref::<ProjectLocked>()
+                .is_some()
+        );
+        for file in independent_owner.iter().rev() {
+            release_project_lock(file).unwrap();
+        }
+        drop(independent_owner);
+        assert!(lock_project(&normal).is_ok());
     }
 
     #[test]
@@ -1247,10 +1353,12 @@ fn prepare_legacy_state(c: &Config) -> Result<State> {
 
 const PROJECT_PATHS: &[&str] = &[".", ":(exclude).chuggin", ":(exclude)chuggin.json"];
 fn checkpoint(c: &Config, s: &mut State, message: &str) -> Result<bool> {
-    let (reference, changed) =
-        crate::workspace::autosave(&s.working_workspace, &c.state_dir, &s.run_id, message)?;
+    let (reference, mut changed) = c.observe_or_save(&s.working_workspace, &s.run_id, message)?;
+    if c.activity_mode.is_chaos() {
+        changed = reference != s.working_ref;
+    }
     s.working_ref = reference;
-    s.branch_head = crate::workspace::head(&s.working_workspace);
+    s.branch_head = c.workspace_head(&s.working_workspace);
     save(&c.state_dir.join("state.json"), s)?;
     workspace_event(s);
     Ok(changed)
@@ -1263,9 +1371,6 @@ fn workspace_event(s: &State) {
         recovery: s.working_ref.clone(),
         pending: s.commit_pending.clone(),
     });
-}
-fn working_tree(workspace: &Path, state: &Path) -> Result<String> {
-    crate::workspace::tree(workspace, Some(state))
 }
 fn ensure_activity_mode(c: &Config, s: &State) -> Result<()> {
     anyhow::ensure!(
@@ -1316,13 +1421,29 @@ fn prepare_state(c: &Config) -> Result<State> {
             goal: c.goal.clone(),
             repo: fs::canonicalize(&c.repo)?,
             working_workspace: fs::canonicalize(&c.repo)?,
-            working_branch: crate::workspace::branch(&c.repo)?,
-            branch_head: crate::workspace::head(&c.repo),
+            working_branch: c.workspace_branch(&c.repo)?,
+            branch_head: c.workspace_head(&c.repo),
             ..State::default()
         }
     };
-    crate::workspace::check(&c.repo, &s.working_branch)?;
-    s.branch_head = crate::workspace::head(&c.repo);
+    if c.activity_mode.is_chaos() {
+        if !s.working_branch.is_empty()
+            || !s.branch_head.is_empty()
+            || (!s.working_ref.is_empty() && !s.working_ref.starts_with("files-"))
+        {
+            let backup = c.state_dir.join("state-before-file-observations.json");
+            if !backup.exists() {
+                crate::setup::save(&backup, &s)?;
+            }
+            s.last_checks_passed_ref = None;
+            s.last_validated_tree = None;
+        }
+        s.working_branch.clear();
+        s.branch_head.clear();
+        s.commit_pending = None;
+    }
+    c.check_workspace(&c.repo, &s.working_branch)?;
+    s.branch_head = c.workspace_head(&c.repo);
     checkpoint(c, &mut s, "chuggin: recovery before starting")?;
     Ok(s)
 }
@@ -1338,7 +1459,7 @@ fn activity_context(c: &Config, s: &State) -> Value {
 }
 fn resumed_context(c: &Config, state: &State) -> Value {
     if c.activity_mode.is_chaos() {
-        json!({"role":"user","content":json!({"workspace":state.working_workspace,"branch":state.working_branch,"head":state.branch_head,"instruction":"This is the same self-directed conversation without an assigned project goal. Existing files, observations, and any activity records are retained. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work. Recording tasks is optional; completed tasks may create normal commits. Decide what, if anything, to pursue next."}).to_string()})
+        json!({"role":"user","content":json!({"workspace":state.working_workspace,"instruction":"This is the same self-directed conversation without an assigned project goal. Existing files, observations, and any activity records are retained. Inspect current files before editing. Conversation and tool history are saved automatically. File observation identifiers describe file state; they are not recoverable file backups. There is no automatic version control or commit on task completion. Recording tasks is optional. Decide what, if anything, to pursue next."}).to_string()})
     } else {
         json!({"role":"user","content":format!("Current overall goal: {}. Current visible project folder: {}. Branch: {}. HEAD: {}. Work directly here. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work; completed tasks may create normal commits.",c.goal,state.working_workspace.display(),state.working_branch,state.branch_head)})
     }
@@ -1429,7 +1550,7 @@ fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
     repair_pending_tools(&mut session.messages);
     // Upgrade existing transcripts before making the first provider request.
     // A human's file changes invalidate the old repetition evidence.
-    let tree = working_tree(&s.working_workspace, &c.state_dir).ok();
+    let tree = c.tree(&s.working_workspace).ok();
     if tree
         .as_ref()
         .is_some_and(|tree| !session.observed_tree.is_empty() && tree != &session.observed_tree)
@@ -1562,7 +1683,7 @@ fn refresh_conversation(
         session.feedback_narration_archived = true;
         session.note.model_note_archived = true;
     }
-    let tree = working_tree(&s.working_workspace, &c.state_dir).ok();
+    let tree = c.tree(&s.working_workspace).ok();
     let mut feedback = serde_json::from_str::<Value>(&s.feedback)
         .unwrap_or_else(|_| json!({"history_available":!s.feedback.is_empty()}));
     let mut evidence = session.note.context_at(
@@ -1663,7 +1784,7 @@ fn recover_commands(
     if !session.command_watch.pending_diagnosis {
         return Ok(());
     }
-    let current = working_tree(&s.working_workspace, &c.state_dir).ok();
+    let current = c.tree(&s.working_workspace).ok();
     let observed = session
         .command_watch
         .recent
@@ -1677,6 +1798,9 @@ fn recover_commands(
     let id = session.command_watch.diagnoses;
     let mut input = json!({"goal":c.goal,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"checkpoint":s.working_ref,"observed_project_tree":current,"repetitions":session.command_watch.count,"command":session.command_watch.command,"recent_commands":session.command_watch.recent,"recent_activity_including_inspections":session.command_watch.activity,"latest_check_feedback":project::excerpt(&s.feedback,4000),"progress_note_metadata":{"note_task_id":session.note.task_id,"bytes":session.note.model_note.len(),"instruction":"Use read_progress_note only if needed. It may describe an earlier task; historical fixes are not evidence of progress during these repeated commands."},"instruction":"Determine whether this repeated work is justified. The project snapshot excludes ignored build outputs and cannot establish external side effects. Inspect evidence, then propose a concrete next action. The full main conversation has deliberately not been copied."});
     if c.activity_mode.is_chaos() {
+        input["instruction"] = json!(
+            "Assess whether repeated work is justified using concrete evidence. File hashes exclude runtime and version-control metadata; file changes alone do not prove useful progress or external effects. Inspect evidence, then propose a concrete next action. The main conversation has not been copied."
+        );
         input["goal"] = Value::Null;
         input["activity_context"] = json!(
             "This conversation has no assigned goal and no requirement to create a task, product, or file change. Assess repeated actions and their evidence, not compliance with an imagined project objective. Repeated sampling, external observations, or unchanged files can be legitimate. The existing repetition recovery remains active; suggest a different approach when a confirmed loop yields no new information."
@@ -1889,7 +2013,7 @@ impl Commands {
         art: &Path,
         stop: &AtomicBool,
     ) -> Result<Option<Verified>> {
-        let tree = working_tree(&state.working_workspace, &c.state_dir)?;
+        let tree = c.tree(&state.working_workspace)?;
         if c.checks.is_empty() && !self.jobs.finite_running() {
             return Ok(Some(Verified {
                 results: Vec::new(),
@@ -2034,7 +2158,7 @@ fn observe_command_validation(
     if !session.command_watch.has_pending(&command_key) && !tickets.contains_key(id) {
         return Ok(());
     }
-    let current = working_tree(&s.working_workspace, &c.state_dir)?;
+    let current = c.tree(&s.working_workspace)?;
     if session
         .command_watch
         .completed(&command_key, update, Some(&current), s.task_serial)
@@ -2155,10 +2279,10 @@ fn work(
             .into());
         }
         anyhow::ensure!(!stop.load(Ordering::SeqCst), "Stopped by operator");
-        crate::workspace::check(&s.working_workspace, &s.working_branch)?;
+        c.check_workspace(&s.working_workspace, &s.working_branch)?;
         let command_updates = jobs.monitor(c, s.current_task.as_ref(), m, stop)?;
         if !command_updates.is_empty() {
-            let tree = working_tree(&s.working_workspace, &c.state_dir)?;
+            let tree = c.tree(&s.working_workspace)?;
             if tree != session.observed_tree {
                 session.prose_watch.progress();
                 session.thinking_watch.progress();
@@ -2252,7 +2376,7 @@ fn work(
         }
         crate::events::send(crate::events::Event::Phase("Work".into()));
         let proposal_has_commands = jobs.finite_running();
-        let proposal_tree = working_tree(&s.working_workspace, &c.state_dir)?;
+        let proposal_tree = c.tree(&s.working_workspace)?;
         if !session.observed_tree.is_empty()
             && session.observed_tree != proposal_tree
             && !proposal_has_commands
@@ -2261,13 +2385,8 @@ fn work(
             session.thinking_watch.progress();
             session.action_watch.progress();
             session.reread.extend(
-                crate::workspace::changed_paths(
-                    &s.working_workspace,
-                    &c.state_dir,
-                    &session.observed_tree,
-                    &proposal_tree,
-                )
-                .unwrap_or_default(),
+                c.changed_paths(&s.working_workspace, &session.observed_tree, &proposal_tree)
+                    .unwrap_or_default(),
             );
             session.messages.push(json!({"role":"user","content":"The visible project changed outside your last recorded actions. Inspect the current files before editing; human work and commits must be preserved."}));
         }
@@ -2348,12 +2467,11 @@ fn work(
             break;
         }
         let mut completed_commands = Vec::new();
-        let mut observed_tree = working_tree(&s.working_workspace, &c.state_dir)?;
+        let mut observed_tree = c.tree(&s.working_workspace)?;
         let mut stale_response = proposal_tree != observed_tree && !proposal_has_commands;
         if stale_response {
-            session.reread.extend(crate::workspace::changed_paths(
+            session.reread.extend(c.changed_paths(
                 &s.working_workspace,
-                &c.state_dir,
                 &proposal_tree,
                 &observed_tree,
             )?);
@@ -2366,14 +2484,13 @@ fn work(
                 )
                 .into());
             }
-            crate::workspace::check(&s.working_workspace, &s.working_branch)?;
+            c.check_workspace(&s.working_workspace, &s.working_branch)?;
             let had_running_commands = jobs.finite_running();
             completed_commands.extend(jobs.refresh_finished(stop)?);
-            let now_tree = working_tree(&s.working_workspace, &c.state_dir)?;
+            let now_tree = c.tree(&s.working_workspace)?;
             if now_tree != observed_tree && !had_running_commands {
-                session.reread.extend(crate::workspace::changed_paths(
+                session.reread.extend(c.changed_paths(
                     &s.working_workspace,
-                    &c.state_dir,
                     &observed_tree,
                     &now_tree,
                 )?);
@@ -2388,7 +2505,7 @@ fn work(
             let root = s.working_workspace.clone();
             let command = matches!(name, "run_command" | "run_checks" | "compiler_diagnostics");
             let before_command = if command && !jobs.finite_running() {
-                working_tree(&root, &c.state_dir).ok()
+                c.tree(&root).ok()
             } else {
                 None
             };
@@ -2599,7 +2716,7 @@ fn work(
                         Ok(session.note.page(offset)?.to_string())
                     }
                     "read_task_evidence" => {
-                        let tree = working_tree(&root, &c.state_dir)?;
+                        let tree = c.tree(&root)?;
                         Ok(json!({"task_id":s.current_task.as_ref().map(|_|s.task_serial),"task":s.current_task,"evidence":session.note.context_at(s.current_task.as_ref().map(|_|s.task_serial),Some(&tree))}).to_string())
                     }
                     "search_history" => Ok(crate::history::search(&c.state_dir, args)?.to_string()),
@@ -2633,7 +2750,7 @@ fn work(
                         };
                         session.helper_links.insert(key, id.clone());
                         save_conversation(c, session)?;
-                        let tree = working_tree(&root, &c.state_dir)?;
+                        let tree = c.tree(&root)?;
                         let input = json!({"question":args["question"],"selected_evidence":args["evidence"],"goal":if c.activity_mode.is_chaos() { Value::Null } else { json!(s.goal) },"task":s.current_task,"task_id":s.current_task.as_ref().map(|_|s.task_serial),"inspected_tree":tree,"active_nudge":crate::nudge::read(&c.state_dir)?.active,"task_evidence":session.note.context_at(s.current_task.as_ref().map(|_|s.task_serial),Some(&tree)),"running_commands":jobs.running_snapshots()?,"workspace":root,"config_path":config_path});
                         crate::events::log(format!(
                             "Investigation {id}: {}",
@@ -2870,7 +2987,7 @@ fn work(
                 )?;
             }
             if command && value["ok"] == false {
-                let after_command = working_tree(&root, &c.state_dir).ok();
+                let after_command = c.tree(&root).ok();
                 let observed_args = if name == "run_checks" {
                     json!({"checks":c.checks})
                 } else {
@@ -2905,7 +3022,7 @@ fn work(
             {
                 session.reread.remove(args["path"].as_str().unwrap_or(""));
             }
-            observed_tree = working_tree(&s.working_workspace, &c.state_dir)?;
+            observed_tree = c.tree(&s.working_workspace)?;
             session.observed_tree = observed_tree.clone();
             session.command_watch.record_activity(name, args, &value);
             let detail = args["path"]
@@ -2985,7 +3102,7 @@ fn work(
     if jobs.running() {
         session.messages.push(json!({"role":"user","content":json!({"running_commands":jobs.running_snapshots()?,"instruction":"This response batch ended, but these commands remain owned and running. Continue managing them on the next cycle; there is no wait-for-all barrier and no automatic closure at this boundary. Validation stays pending while finite commands run."}).to_string()}));
     }
-    let tree = working_tree(&s.working_workspace, &c.state_dir)?;
+    let tree = c.tree(&s.working_workspace)?;
     if tree != session.observed_tree {
         session.prose_watch.progress();
         session.thinking_watch.progress();
@@ -3013,15 +3130,21 @@ pub fn run_controlled_with_commands(
     controls.bind_stop(stop.clone());
     controls.configure(path);
     let c = load(path)?;
-    crate::setup::ensure_git_identity(&c.repo)?;
+    if !c.activity_mode.is_chaos() {
+        crate::setup::ensure_git_identity(&c.repo)?;
+    }
     let _lock = if controls.owns_project.load(Ordering::SeqCst) {
         Vec::new()
     } else {
         lock_project(&c)?
     };
-    crate::workspace::recover_promotion(&c.repo)?;
+    if !c.activity_mode.is_chaos() {
+        crate::workspace::recover_promotion(&c.repo)?;
+    }
     let mut state = prepare_state(&c)?;
-    crate::workspace::ignore_runtime(&c.repo, &c.state_dir)?;
+    if !c.activity_mode.is_chaos() {
+        crate::workspace::ignore_runtime(&c.repo, &c.state_dir)?;
+    }
     if c.allows_goal_completion() && c.state_dir.join("goal-completion.json").exists() {
         crate::events::log(
             "Model reports project complete. Explicitly resume to reopen work.".into(),
@@ -3090,11 +3213,15 @@ pub fn run_controlled_with_commands(
     if !notices.is_empty() && lifecycle_path.is_file() {
         fs::remove_file(lifecycle_path)?;
     }
-    crate::events::log(format!(
-        "Working directly in {} on {}",
-        state.working_workspace.display(),
-        state.working_branch
-    ));
+    crate::events::log(if c.activity_mode.is_chaos() {
+        format!("Working directly in {}", state.working_workspace.display())
+    } else {
+        format!(
+            "Working directly in {} on {}",
+            state.working_workspace.display(),
+            state.working_branch
+        )
+    });
     let started = Instant::now();
     let time_up = || {
         let limit = fs::read(path)
@@ -3123,7 +3250,7 @@ pub fn run_controlled_with_commands(
         if stop.load(Ordering::SeqCst) || time_up() {
             break;
         }
-        crate::workspace::check(&state.working_workspace, &state.working_branch)?;
+        c.check_workspace(&state.working_workspace, &state.working_branch)?;
         controls.cycle_active(true);
         state.cycle += 1;
         while c
@@ -3188,7 +3315,7 @@ pub fn run_controlled_with_commands(
             break;
         }
         crate::events::send(crate::events::Event::Phase("Check".into()));
-        crate::workspace::check(&state.working_workspace, &state.working_branch)?;
+        c.check_workspace(&state.working_workspace, &state.working_branch)?;
         sync_operator(&c, &mut state, &mut session)?;
         if controls.changed.load(Ordering::SeqCst) != work_generation
             && let Ok(result) = &mut result
@@ -3197,7 +3324,7 @@ pub fn run_controlled_with_commands(
             result.project_completion = None;
         }
         let check_generation = controls.changed.load(Ordering::SeqCst);
-        let before_check = working_tree(&state.working_workspace, &c.state_dir)?;
+        let before_check = c.tree(&state.working_workspace)?;
         for update in commands.jobs.refresh_finished(&stage_stop)? {
             observe_command_validation(
                 &c,
@@ -3212,7 +3339,7 @@ pub fn run_controlled_with_commands(
             );
         }
         let validation = commands.verify(&c, &state, &model, &art, &stage_stop);
-        let after_check = working_tree(&state.working_workspace, &c.state_dir)?;
+        let after_check = c.tree(&state.working_workspace)?;
         let checks_pending = validation.as_ref().is_ok_and(Option::is_none);
         let check_error = if checks_pending {
             Some("Validation is pending while a finite command runs. Manage the existing command_id next cycle; no check has been assumed to pass.".into())
@@ -3244,7 +3371,7 @@ pub fn run_controlled_with_commands(
                 result.project_completion = None;
             }
         }
-        let saved_candidate = working_tree(&state.working_workspace, &c.state_dir)?;
+        let saved_candidate = c.tree(&state.working_workspace)?;
         let mut checked_same_files = !checks_pending
             && same_generation
             && checked_tree == before_check
@@ -3280,7 +3407,7 @@ pub fn run_controlled_with_commands(
             state.cycle,
             project::excerpt(&task_title, 100)
         );
-        crate::workspace::check(&state.working_workspace, &state.working_branch)?;
+        c.check_workspace(&state.working_workspace, &state.working_branch)?;
         let mut changed = checkpoint(&c, &mut state, &message)?;
         if passed {
             state.last_checks_passed_ref = Some(state.working_ref.clone());
@@ -3301,7 +3428,7 @@ pub fn run_controlled_with_commands(
                 checked_same_files,
                 commands.jobs.finite_running(),
             );
-        if finished {
+        if finished && !c.activity_mode.is_chaos() {
             match crate::workspace::promote(
                 &state.working_workspace,
                 &c.state_dir,
@@ -3325,8 +3452,8 @@ pub fn run_controlled_with_commands(
                 }
             }
         }
-        state.branch_head = crate::workspace::head(&state.working_workspace);
-        let saved_tree = working_tree(&state.working_workspace, &c.state_dir)?;
+        state.branch_head = c.workspace_head(&state.working_workspace);
+        let saved_tree = c.tree(&state.working_workspace)?;
         if saved_tree != after_check {
             passed = false;
             checked_same_files = false;
@@ -3342,7 +3469,7 @@ pub fn run_controlled_with_commands(
             feedback["post_commit_changes"] = json!(if c.activity_mode.is_chaos()
                 && c.checks.is_empty()
             {
-                "Files changed during commit hooks; inspect the changes before reporting a recorded task complete. No checks are configured."
+                "Files changed after the last observation; inspect current files before reporting a recorded activity complete. No checks are configured."
             } else {
                 "Files changed during commit hooks; inspect and run checks again before completing the task."
             });
@@ -3407,6 +3534,9 @@ pub fn run_controlled_with_commands(
         }
         emit(&art, "repair-note", &session.note)?;
         if finished {
+            if c.activity_mode.is_chaos() {
+                crate::events::log(format!("Activity recorded: {task_title}"));
+            }
             session.prose_watch.progress();
             session.thinking_watch.progress();
             session.action_watch.progress();
@@ -3532,12 +3662,20 @@ pub fn run_controlled_with_commands(
         );
     }
     save(&c.state_dir.join("state.json"), &state)?;
-    crate::events::log(format!(
-        "Working branch: {}\nWorking files: {}\nArtifacts: {}",
-        state.working_branch,
-        state.working_workspace.display(),
-        c.state_dir.display()
-    ));
+    crate::events::log(if c.activity_mode.is_chaos() {
+        format!(
+            "Working files: {}\nConversation history: {}",
+            state.working_workspace.display(),
+            c.state_dir.display()
+        )
+    } else {
+        format!(
+            "Working branch: {}\nWorking files: {}\nArtifacts: {}",
+            state.working_branch,
+            state.working_workspace.display(),
+            c.state_dir.display()
+        )
+    });
     Ok(())
 }
 
@@ -4236,6 +4374,9 @@ mod stall_replay_tests {
 
 pub fn needs_migration(path: &Path) -> Result<bool> {
     let c = load(path)?;
+    if c.activity_mode.is_chaos() {
+        return Ok(false);
+    }
     if !c.state_dir.join("state.json").exists() {
         return Ok(c.state_dir.join("working").exists());
     }
@@ -4247,6 +4388,10 @@ pub fn needs_migration(path: &Path) -> Result<bool> {
 }
 pub fn migration_preview(path: &Path) -> Result<String> {
     let c = load(path)?;
+    anyhow::ensure!(
+        !c.activity_mode.is_chaos(),
+        "Git workspace migration is not used for this conversation"
+    );
     let _lock = lock_project(&c)?;
     crate::setup::ensure_git_identity(&c.repo)?;
     anyhow::ensure!(
@@ -4267,6 +4412,10 @@ pub fn migration_preview(path: &Path) -> Result<String> {
 }
 pub fn migration_apply(path: &Path, clear_staging: bool) -> Result<()> {
     let c = load(path)?;
+    anyhow::ensure!(
+        !c.activity_mode.is_chaos(),
+        "Git workspace migration is not used for this conversation"
+    );
     crate::engine::close_idle_interactive(path)?;
     let _lock = lock_project(&c)?;
     let mut s: State = serde_json::from_slice(&fs::read(c.state_dir.join("state.json"))?)?;
@@ -4530,6 +4679,14 @@ Your project files and development history stay unchanged. This only restarts th
 }
 pub fn recovery_ui(path: &Path) -> Result<()> {
     let c = load(path)?;
+    if c.activity_mode.is_chaos() {
+        let text = fs::read_to_string(c.state_dir.join("state.json"))
+            .unwrap_or_else(|_| "No run started".into());
+        return crate::ui::show(
+            "Saved conversation progress",
+            &crate::menu::progress_text(&text),
+        );
+    }
     let choice = crate::menu::select(
         "Project history",
         &[
@@ -4563,7 +4720,7 @@ pub fn recovery_ui(path: &Path) -> Result<()> {
                     .split_whitespace()
                     .next()
                     .context("Missing revision")?;
-                let before = working_tree(&c.repo, &c.state_dir)?;
+                let before = c.tree(&c.repo)?;
                 let diff = project::git(
                     &c.repo,
                     &[
@@ -4590,7 +4747,7 @@ pub fn recovery_ui(path: &Path) -> Result<()> {
                     0,
                 )? == Some(1)
                 {
-                    crate::workspace::check(&c.repo, &s.working_branch)?;
+                    c.check_workspace(&c.repo, &s.working_branch)?;
                     checkpoint(&c, &mut s, "chuggin: recovery before user restore")?;
                     crate::migration::restore_files(&c.repo, &c.state_dir, target)?;
                     checkpoint(&c, &mut s, "chuggin: user restored project files")?;
@@ -4600,7 +4757,7 @@ pub fn recovery_ui(path: &Path) -> Result<()> {
             }
         }
         Some(2) => {
-            crate::workspace::check(&c.repo, &s.working_branch)?;
+            c.check_workspace(&c.repo, &s.working_branch)?;
             if crate::menu::select(
                 "Commit all current project files, including staged and unstaged changes?",
                 &["Back".into(), "Commit current files".into()],
@@ -4611,7 +4768,7 @@ pub fn recovery_ui(path: &Path) -> Result<()> {
             }
             let message = crate::setup::ask("Commit description", "Save project progress")?;
             checkpoint(&c, &mut s, "chuggin: recovery before user commit")?;
-            let tree = working_tree(&c.repo, &c.state_dir)?;
+            let tree = c.tree(&c.repo)?;
             s.branch_head = crate::workspace::commit_current(
                 &c.repo,
                 &c.state_dir,

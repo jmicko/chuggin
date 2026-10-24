@@ -926,6 +926,7 @@ struct HelperActivity {
     speed: f64,
 }
 struct Dashboard {
+    versioned: bool,
     validation_unconfigured: bool,
     workspace: String,
     workspace_branch: String,
@@ -986,6 +987,7 @@ struct Dashboard {
 impl Dashboard {
     fn new(config: &runner::Config) -> Self {
         let mut d = Self {
+            versioned: !config.activity_mode.is_chaos(),
             validation_unconfigured: config.activity_mode.is_chaos() && config.checks.is_empty(),
             workspace: config.repo.display().to_string(),
             workspace_branch: String::new(),
@@ -1550,6 +1552,12 @@ impl Dashboard {
                     .unwrap_or_default(),
                 goal
             );
+            if !self.versioned {
+                detail = format!(
+                    "WORKING FOLDER\n{}\n\nConversation and tool history are saved. Files remain in the workspace; no automatic version control or recoverable file snapshots.\n\nCONVERSATION\n{}",
+                    self.workspace, goal
+                );
+            }
             if let Some(n) = &self.nudges.active {
                 detail.push_str(&format!("\n\nACTIVE NUDGE #{}\n{}", n.id, n.request));
             }
@@ -1924,7 +1932,11 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             } else {
                 "Current task"
             },
-            d.workspace_branch
+            if d.workspace_branch.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", d.workspace_branch)
+            }
         ))),
         r[2],
     );
@@ -2170,7 +2182,15 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             Line::from("CYCLES & SESSION").fg(CYAN).bold(),
             Line::from(format!("Overall cycle: #{}", d.cycle)),
             Line::from(format!("This session: {} finished", d.completed_cycles)),
-            Line::from(format!("Recovery saves: {}", d.checkpoints)),
+            Line::from(format!(
+                "{}: {}",
+                if c.activity_mode.is_chaos() {
+                    "File observations"
+                } else {
+                    "Recovery saves"
+                },
+                d.checkpoints
+            )),
             Line::from(format!(
                 "Elapsed {}",
                 duration(d.active_elapsed().as_secs())
@@ -2330,7 +2350,9 @@ fn dashboard_session(
 ) -> Result<bool> {
     let mut config = runner::load(path)?;
     // Identity setup can prompt, so complete it on the thread that owns the terminal.
-    crate::setup::ensure_git_identity(&config.repo)?;
+    if !config.activity_mode.is_chaos() {
+        crate::setup::ensure_git_identity(&config.repo)?;
+    }
     let mut d = Dashboard::new(&config);
     let client = crate::engine::Client::connect_interactive(path)?;
     if start {

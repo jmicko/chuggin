@@ -458,9 +458,13 @@ fn run_cycles(root: &Path, cycles: u64) {
     );
 }
 fn run_cycles_bounded(root: &Path, cycles: u64) {
+    run_cycles_with_environment(root, cycles, &[]);
+}
+fn run_cycles_with_environment(root: &Path, cycles: u64, environment: &[(&str, &str)]) {
     let log_path = root.join("bounded-run.log");
     let log = fs::File::create(&log_path).unwrap();
     let mut child = command(root)
+        .envs(environment.iter().copied())
         .args(["run", "--cycles", &cycles.to_string()])
         .stdout(log.try_clone().unwrap())
         .stderr(log)
@@ -540,14 +544,21 @@ fn fixture(root: &Path, url: &str, pass: bool) -> std::path::PathBuf {
     config
 }
 fn chaos_fixture(root: &Path, url: &str) -> std::path::PathBuf {
-    let path = fixture(root, url, true);
-    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    config["activity_mode"] = json!("chaos");
-    config.as_object_mut().unwrap().remove("goal");
-    config.as_object_mut().unwrap().remove("checks");
-    fs::write(&path, config.to_string()).unwrap();
+    let repo = root.join("repo");
+    fs::create_dir(&repo).unwrap();
+    fs::write(repo.join("value.txt"), "USER_EDIT").unwrap();
+    let path = root.join("chuggin.json");
+    fs::write(
+        &path,
+        json!({"repo":repo,"state_dir":root.join("state"),"activity_mode":"chaos",
+        "model":"fake","ollama_url":url,"context_tokens":32768,"output_tokens":4096,
+        "implementation_calls":16,"retry_seconds":1})
+        .to_string(),
+    )
+    .unwrap();
     path
 }
+
 fn command(root: &Path) -> Command {
     fs::create_dir_all(root.join(".chuggin")).unwrap();
     let identity = root.join(".chuggin/test-gitconfig");
@@ -562,6 +573,136 @@ fn command(root: &Path) -> Command {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("XDG_CONFIG_HOME", root.join(".chuggin/global"));
     c
+}
+
+#[test]
+#[cfg(unix)]
+fn chaos_runs_tools_and_resumes_without_a_git_executable_or_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::custom(false, false, None, |_, n| match n {
+        0 => (
+            String::new(),
+            json!([
+                task_tool("Record an observation"),
+                {"function":{"name":"write_file","arguments":{"path":"observation.md","content":"Retained observation"}}},
+                {"function":{"name":"write_file","arguments":{"path":".gitignore","content":"cache/\n"}}},
+                {"function":{"name":"finish_task","arguments":{"task_id":1,"summary":"Recorded an observation"}}}
+            ]),
+        ),
+        _ => (
+            "I can continue from the retained observation.".into(),
+            json!([]),
+        ),
+    });
+    let root = tempfile::tempdir().unwrap();
+    chaos_fixture(root.path(), &server.url);
+    let bin = root.path().join("blocked-bin");
+    fs::create_dir(&bin).unwrap();
+    let sentinel = bin.join("git");
+    fs::write(
+        &sentinel,
+        "#!/bin/sh\nprintf called >> \"$GIT_SPY\"\nexit 99\n",
+    )
+    .unwrap();
+    fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o755)).unwrap();
+    let spy = root.path().join("git-called");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let empty_identity = root.path().join("no-identity");
+    fs::write(&empty_identity, "").unwrap();
+    let environment = [
+        ("PATH", path.as_str()),
+        ("GIT_SPY", spy.to_str().unwrap()),
+        ("GIT_CONFIG_GLOBAL", empty_identity.to_str().unwrap()),
+    ];
+    run_cycles_with_environment(root.path(), 1, &environment);
+    run_cycles_with_environment(root.path(), 1, &environment);
+    let migration = command(root.path())
+        .envs(environment)
+        .arg("migrate")
+        .output()
+        .unwrap();
+    assert!(!migration.status.success());
+    assert!(String::from_utf8_lossy(&migration.stderr).contains("migration is not used"));
+    assert!(
+        !spy.exists(),
+        "The harness must never invoke Git in this mode"
+    );
+    assert!(!root.path().join("repo/.git").exists());
+    let saved = state(root.path());
+    assert_eq!(saved["cycle"], 2);
+    assert_eq!(saved["working_branch"], "");
+    assert_eq!(saved["branch_head"], "");
+    assert!(saved["working_ref"].as_str().unwrap().starts_with("files-"));
+    assert_eq!(saved["completed_tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/observation.md")).unwrap(),
+        "Retained observation"
+    );
+    let requests = server.requests.lock().unwrap();
+    assert!(
+        requests.last().unwrap()["messages"]
+            .to_string()
+            .contains("Retained observation")
+    );
+}
+
+#[test]
+fn chaos_upgrades_existing_git_backed_history_without_changing_repository_metadata() {
+    let server = Server::custom(false, false, None, |_, _| {
+        (
+            "An earlier observation is still available.".into(),
+            json!([]),
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["activity_mode"] = json!("chaos");
+    config["goal"] = json!("");
+    config["checks"] = json!([]);
+    fs::write(&path, config.to_string()).unwrap();
+    let repo = root.path().join("repo");
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let index = fs::read(repo.join(".git/index")).unwrap();
+    let exclude = fs::read(repo.join(".git/info/exclude")).unwrap();
+    run_cycles_bounded(root.path(), 1);
+    let conversation = root.path().join("state/conversation.json");
+    let old: Value = serde_json::from_slice(&fs::read(&conversation).unwrap()).unwrap();
+    let mut saved = state(root.path());
+    saved["working_branch"] = json!(git(&repo, &["branch", "--show-current"]));
+    saved["branch_head"] = json!(head);
+    saved["working_ref"] = json!(head);
+    fs::write(root.path().join("state/state.json"), saved.to_string()).unwrap();
+    // A branch change is permitted; the harness no longer owns Git workflow.
+    git(&repo, &["switch", "-c", "independent-work"]);
+    run_cycles_bounded(root.path(), 1);
+    assert_eq!(state(root.path())["cycle"], 2);
+    assert!(
+        root.path()
+            .join("state/state-before-file-observations.json")
+            .exists()
+    );
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git(&repo, &["branch", "--show-current"]),
+        "independent-work"
+    );
+    assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+    assert_eq!(fs::read(repo.join(".git/info/exclude")).unwrap(), exclude);
+    assert!(git(&repo, &["for-each-ref", "refs/chuggin"]).is_empty());
+    let after: Value = serde_json::from_slice(&fs::read(conversation).unwrap()).unwrap();
+    for message in old["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+    {
+        assert!(after["messages"].as_array().unwrap().contains(message));
+    }
 }
 
 #[test]
@@ -3964,15 +4105,15 @@ mod terminal_ui {
         ui.wait("Work toward a goal");
         ui.wait("No goals, only chaos");
         ui.send(b"j\r");
-        ui.wait("Create the first commit?");
+        ui.wait("Resume project");
         let screen = ui.parser.screen().contents();
+        assert!(!screen.contains("Create the first commit?"));
         assert!(!screen.contains("Validation command"));
         assert!(!screen.contains("What are you working on today?"));
         assert!(!screen.contains("First command review (seconds)"));
-        ui.send(b"\r");
-        ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
+        assert!(!root.path().join(".git").exists());
 
         let config: Value =
             serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();

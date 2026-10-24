@@ -13,6 +13,7 @@ mod context_usage;
 mod dev_tools;
 mod engine;
 mod events;
+mod file_state;
 mod goal_setup;
 mod groq;
 mod history;

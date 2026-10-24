@@ -155,7 +155,11 @@ fn turn(
                 crate::setup::save(path, &history)?;
             }
             let context = context_messages(&history);
-            let response = model.chat(&context, Some(crate::operator::schemas()), false)?;
+            let response = model.chat(
+                &context,
+                Some(crate::operator::schemas_for(&controller.config()?)),
+                false,
+            )?;
             if let Some(sent) = model.take_completed_messages()
                 && let Some(stored) = history["messages"].as_array_mut()
             {

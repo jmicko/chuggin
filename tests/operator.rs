@@ -25,44 +25,56 @@ impl Fixture {
         Self::with_context(url, 8192)
     }
     fn with_context(url: &str, context_tokens: u32) -> Self {
+        Self::with_mode(url, context_tokens, false)
+    }
+    fn with_mode(url: &str, context_tokens: u32, unversioned: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        for args in [
-            vec!["init", "-q", "-b", "main"],
-            vec!["config", "user.name", "Test"],
-            vec!["config", "user.email", "test@example.invalid"],
-        ] {
+        if !unversioned {
+            for args in [
+                vec!["init", "-q", "-b", "main"],
+                vec!["config", "user.name", "Test"],
+                vec!["config", "user.email", "test@example.invalid"],
+            ] {
+                assert!(
+                    Command::new("git")
+                        .args(args)
+                        .current_dir(dir.path())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+        }
+        fs::write(dir.path().join("file.txt"), "before\n").unwrap();
+        if !unversioned {
+            fs::write(
+                dir.path().join(".git/info/exclude"),
+                "config/\nengine.log\n.chuggin/\nchuggin.json\n",
+            )
+            .unwrap();
             assert!(
                 Command::new("git")
-                    .args(args)
+                    .args(["add", "file.txt"])
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("git")
+                    .args(["commit", "-qm", "baseline"])
                     .current_dir(dir.path())
                     .status()
                     .unwrap()
                     .success()
             );
         }
-        fs::write(dir.path().join("file.txt"), "before\n").unwrap();
-        fs::write(
-            dir.path().join(".git/info/exclude"),
-            "config/\nengine.log\n.chuggin/\nchuggin.json\n",
-        )
-        .unwrap();
-        assert!(
-            Command::new("git")
-                .args(["add", "file.txt"])
-                .current_dir(dir.path())
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .args(["commit", "-qm", "baseline"])
-                .current_dir(dir.path())
-                .status()
-                .unwrap()
-                .success()
-        );
-        let config = json!({"repo":dir.path(),"state_dir":dir.path().join(".chuggin"),"goal":"Improve the fixture","ollama_url":url,"model":"test-model","context_tokens":context_tokens,"output_tokens":512,"implementation_calls":6,"checks":[{"argv":["git","rev-parse","HEAD"],"timeout_seconds":10}],"retry_seconds":1});
+        let mut config = json!({"repo":dir.path(),"state_dir":dir.path().join(".chuggin"),"goal":"Improve the fixture","ollama_url":url,"model":"test-model","context_tokens":context_tokens,"output_tokens":512,"implementation_calls":6,"checks":[{"argv":["git","rev-parse","HEAD"],"timeout_seconds":10}],"retry_seconds":1});
+        if unversioned {
+            config["activity_mode"] = json!("type2");
+            config["goal"] = json!("");
+            config["checks"] = json!([]);
+        }
         fs::write(
             dir.path().join("chuggin.json"),
             serde_json::to_vec(&config).unwrap(),
@@ -361,6 +373,77 @@ fn upgrading_waits_for_old_controller_locks_after_its_socket_disappears() {
     assert!(model.requests.lock().unwrap().is_empty());
     let log = fs::read_to_string(fixture.socket.with_extension("log")).unwrap();
     assert!(!log.contains("Another Chuggin process"), "{log}");
+    close_startup_fixture_controller(&fixture);
+}
+
+#[test]
+fn unversioned_upgrade_retires_the_legacy_socket_then_reconnects_by_directory() {
+    use std::os::unix::net::UnixListener;
+    let model = Model::new(|_, _| answer());
+    let mut fixture = Fixture::new(&model.url);
+    close_startup_fixture_controller(&fixture);
+    fixture.child.wait().unwrap();
+    let config = fs::canonicalize(fixture.dir.path().join("chuggin.json")).unwrap();
+    let mut value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    value["activity_mode"] = json!("type2");
+    value["goal"] = json!("");
+    value["checks"] = json!([]);
+    fs::write(&config, value.to_string()).unwrap();
+    let held = hold_startup_fixture_locks(&fixture);
+    let listener = UnixListener::bind(&fixture.socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let legacy_socket = fixture.socket.clone();
+    let old_address = legacy_socket.clone();
+    let owner = thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            if request["action"] == "shutdown" {
+                assert_eq!(request["cleanup_commands"], true);
+                writeln!(stream, "{}", json!({"ok":true,"result":{"closing":true}})).unwrap();
+                fs::remove_file(&legacy_socket).unwrap();
+                thread::sleep(Duration::from_millis(100));
+                drop(held);
+                return;
+            }
+            assert_eq!(request["action"], "status");
+            writeln!(
+                stream,
+                "{}",
+                json!({"ok":true,"result":{"version":"0.18.1","config":config,"running":false}})
+            )
+            .unwrap();
+        }
+        panic!("The old controller was not retired");
+    });
+    let mut mcp = StartupMcp::start(&fixture, "unversioned-upgrade");
+    mcp.initialized();
+    owner.join().unwrap();
+    assert_eq!(mcp.status()["running"], false);
+    let runtime = fixture.dir.path().join("config/chuggin/runtime");
+    fixture.socket = fs::read_dir(runtime)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "sock"))
+        .unwrap();
+    assert_ne!(fixture.socket, old_address);
+    assert!(model.requests.lock().unwrap().is_empty());
     close_startup_fixture_controller(&fixture);
 }
 
@@ -1070,6 +1153,71 @@ fn thinking_and_setup_settings_are_independent_and_invalid_updates_are_atomic() 
         assert_ne!(reply["status"], "complete", "{reply}");
         assert_eq!(fs::read(&path).unwrap(), saved);
     }
+}
+
+#[test]
+fn unversioned_controller_coordinates_edits_and_hides_git_tools_without_a_repository() {
+    let f = Fixture::with_mode("http://127.0.0.1:1", 8192, true);
+    let session = f.session();
+    let schemas = f.rpc(json!({"action":"tools"}));
+    let names: Vec<_> = schemas
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    for name in [
+        "save_checkpoint",
+        "commit_changes",
+        "restore_checkpoint",
+        "preview_restore",
+    ] {
+        assert!(!names.contains(&name));
+    }
+    assert_eq!(
+        f.call(&session, "begin_edit", json!({}))["result"]["granted"],
+        true
+    );
+    assert_eq!(
+        f.call(
+            &session,
+            "write_file",
+            json!({"path":"note.md","content":"Operator observation"})
+        )["status"],
+        "complete"
+    );
+    assert_eq!(
+        f.call(
+            &session,
+            "end_edit",
+            json!({"summary":"Recorded an observation"})
+        )["status"],
+        "complete"
+    );
+    assert_eq!(
+        fs::read_to_string(f.dir.path().join("note.md")).unwrap(),
+        "Operator observation"
+    );
+    let changes = f.call(&session, "project_diff", json!({}));
+    assert_eq!(changes["status"], "complete");
+    assert!(
+        changes["result"]["changed_paths"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("note.md"))
+    );
+    assert_eq!(
+        f.call(
+            &session,
+            "commit_changes",
+            json!({"summary":"Must not commit"})
+        )["status"],
+        "failed"
+    );
+    assert!(!f.dir.path().join(".git").exists());
+    let status = f.rpc(json!({"action":"status"}));
+    assert_eq!(status["running"], false);
+    assert!(status["editing"].is_null());
 }
 
 #[test]

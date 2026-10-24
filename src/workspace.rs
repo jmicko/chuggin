@@ -97,33 +97,39 @@ impl Index {
 }
 pub fn tree(root: &Path, state: Option<&Path>) -> Result<String> {
     let index = Index::new(root, &head(root))?;
-    // Enumerate first: some Git versions reject ignored *exclusion* pathspecs
-    // passed to `add`. Literal, NUL-separated names also preserve unusual paths.
-    let files = index
-        .command(root)
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-        ])
-        .args(paths(root, state)?)
-        .output()?;
-    anyhow::ensure!(
-        files.status.success(),
-        "{}",
-        String::from_utf8_lossy(&files.stderr)
-    );
-    if !files.stdout.is_empty() {
-        let mut list = tempfile::NamedTempFile::new()?;
-        std::io::Write::write_all(&mut list, &files.stdout)?;
-        let mut cmd = index.command(root);
-        cmd.env("GIT_LITERAL_PATHSPECS", "1")
-            .args(["add", "-A", "--pathspec-file-nul"])
-            .arg(format!("--pathspec-from-file={}", list.path().display()));
-        checked(cmd.output()?)?;
+    // Update tracked files separately: Git still tracks files after an ignore
+    // rule is added, but `add -A` with their explicit names can reject them.
+    // Never force-add a directory: that could import ignored build artifacts.
+    for tracked in [true, false] {
+        let files = index
+            .command(root)
+            .args([
+                "ls-files",
+                "-z",
+                if tracked { "--cached" } else { "--others" },
+                "--exclude-standard",
+                "--",
+            ])
+            .args(paths(root, state)?)
+            .output()?;
+        anyhow::ensure!(
+            files.status.success(),
+            "{}",
+            String::from_utf8_lossy(&files.stderr)
+        );
+        if !files.stdout.is_empty() {
+            let mut list = tempfile::NamedTempFile::new()?;
+            std::io::Write::write_all(&mut list, &files.stdout)?;
+            let mut cmd = index.command(root);
+            cmd.env("GIT_LITERAL_PATHSPECS", "1")
+                .args([
+                    "add",
+                    if tracked { "-u" } else { "-A" },
+                    "--pathspec-file-nul",
+                ])
+                .arg(format!("--pathspec-from-file={}", list.path().display()));
+            checked(cmd.output()?)?;
+        }
     }
     index.git(root, &["write-tree"])
 }
@@ -482,6 +488,45 @@ mod tests {
         project::git(d.path(), &["add", "."]).unwrap();
         project::git(d.path(), &["commit", "-m", "initial"]).unwrap();
         d
+    }
+    #[test]
+    fn snapshots_update_newly_ignored_tracked_files_without_importing_ignored_artifacts() {
+        let d = repo();
+        let p = d.path();
+        fs::create_dir(p.join("cache")).unwrap();
+        fs::write(p.join("cache/tracked"), "before").unwrap();
+        fs::write(p.join("replaced"), "old file").unwrap();
+        project::git(p, &["add", "."]).unwrap();
+        project::git(p, &["commit", "-m", "Track initial material"]).unwrap();
+        let original = head(p);
+        fs::write(p.join("file"), "human staging").unwrap();
+        project::git(p, &["add", "file"]).unwrap();
+        let index = fs::read(git_dir(p).unwrap().join("index")).unwrap();
+        fs::write(p.join(".gitignore"), "cache/\nreplaced/ignored\n").unwrap();
+        fs::write(p.join("cache/tracked"), "after").unwrap();
+        fs::write(p.join("cache/ignored"), "do not import").unwrap();
+        fs::remove_file(p.join("replaced")).unwrap();
+        fs::create_dir(p.join("replaced")).unwrap();
+        fs::write(p.join("replaced/ignored"), "do not force-add directory").unwrap();
+        fs::write(p.join("replaced/visible"), "new content").unwrap();
+        let state = p.join(".chuggin");
+        let (saved, _) = autosave(p, &state, "ignore-rules", "recovery").unwrap();
+        assert_eq!(
+            project::git(p, &["show", &format!("{saved}:cache/tracked")]).unwrap(),
+            "after"
+        );
+        assert_eq!(
+            project::git(p, &["show", &format!("{saved}:replaced/visible")]).unwrap(),
+            "new content"
+        );
+        assert!(project::git(p, &["show", &format!("{saved}:cache/ignored")]).is_err());
+        assert!(project::git(p, &["show", &format!("{saved}:replaced/ignored")]).is_err());
+        assert_eq!(fs::read(git_dir(p).unwrap().join("index")).unwrap(), index);
+        assert_eq!(head(p), original);
+        fs::remove_file(p.join("cache/tracked")).unwrap();
+        let (removed, _) = autosave(p, &state, "ignore-rules", "delete tracked cache").unwrap();
+        assert!(project::git(p, &["show", &format!("{removed}:cache/tracked")]).is_err());
+        assert_eq!(fs::read(git_dir(p).unwrap().join("index")).unwrap(), index);
     }
     #[test]
     fn autosaves_preserve_partial_staging_and_branch() {

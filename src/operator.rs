@@ -340,11 +340,10 @@ impl Controller {
             && crate::command_session::workspace_checks().is_empty()
         {
             let c = self.config()?;
-            l.baseline = crate::workspace::tree(&c.repo, Some(&c.state_dir))?;
-            l.branch = crate::workspace::branch(&c.repo)?;
-            crate::workspace::autosave(
+            l.baseline = c.tree(&c.repo)?;
+            l.branch = c.workspace_branch(&c.repo)?;
+            c.observe_or_save(
                 &c.repo,
-                &c.state_dir,
                 &format!("operator-{}", id()),
                 "Before operator editing",
             )?;
@@ -381,15 +380,13 @@ impl Controller {
         );
         let c = self.config()?;
         if l.granted {
-            crate::workspace::check(&c.repo, &l.branch)?;
-            let current = crate::workspace::tree(&c.repo, Some(&c.state_dir))?;
+            c.check_workspace(&c.repo, &l.branch)?;
+            let current = c.tree(&c.repo)?;
             if current != l.baseline || l.generation != self.controls.changed.load(Ordering::SeqCst)
             {
-                let paths =
-                    crate::workspace::changed_paths(&c.repo, &c.state_dir, &l.baseline, &current)?;
-                crate::workspace::autosave(
+                let paths = c.changed_paths(&c.repo, &l.baseline, &current)?;
+                c.observe_or_save(
                     &c.repo,
-                    &c.state_dir,
                     &format!("operator-{}", id()),
                     "After operator editing; unfinished work retained",
                 )?;
@@ -662,9 +659,8 @@ impl Controller {
                 if let Some(old) = record["session"].as_str() {
                     self.sessions.lock().unwrap().remove(old);
                 }
-                crate::workspace::autosave(
+                c.observe_or_save(
                     &c.repo,
-                    &c.state_dir,
                     &format!("operator-recovery-{}", id()),
                     "Recovered interrupted editing; preserve current files",
                 )?;
@@ -781,18 +777,34 @@ impl Controller {
             }
             "preview_restore" => {
                 let target = restore_target(&c, text(args, "target")?)?;
-                let before = crate::workspace::tree(&c.repo, Some(&c.state_dir))?;
+                let before = c.tree(&c.repo)?;
                 let diff = project::git(&c.repo, &["diff", "--stat", &before, &target, "--"])?;
                 Ok(
                     json!({"target":target,"expected_tree":before,"changes":diff,"instruction":"Show these changes to the user. Restore only when requested; current files will first be backed up. Human staging must be empty."}),
                 )
             }
             "reopen_nudge" => Ok(serde_json::to_value(crate::nudge::reopen(&c.state_dir)?)?),
+            "project_diff" if c.activity_mode.is_chaos() => {
+                let after = c.tree(&c.repo)?;
+                let before = read_json(&c.state_dir.join("state.json"))
+                    .ok()
+                    .and_then(|v| v["working_ref"].as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                Ok(
+                    json!({"file_observation":after,"changed_paths":c.changed_paths(&c.repo,&before,&after)?,"instruction":"File hashes describe changes since the latest saved conversation state. They contain no recoverable file copies."}),
+                )
+            }
             "project_diff" => Ok(
                 json!({"diff":project::excerpt(&project::git(&c.repo,&["diff","HEAD","--"] )?,20000),"status":project::git(&c.repo,&["status","--short"])?}),
             ),
             "edit_file" | "write_file" | "run_command" | "run_checks" | "save_checkpoint"
             | "commit_changes" | "restore_checkpoint" => {
+                ensure!(
+                    !c.activity_mode.is_chaos()
+                        || !["save_checkpoint", "commit_changes", "restore_checkpoint"]
+                            .contains(&name),
+                    "Automatic version control and file recovery are unavailable here. Use ordinary file edits or commands when requested."
+                );
                 let _workspace = self.workspace.lock().unwrap();
                 let lease = self.begin_edit(session)?;
                 ensure!(
@@ -809,14 +821,13 @@ impl Controller {
                         "Finish commands before restoring"
                     );
                     let target = restore_target(&c, text(args, "target")?)?;
-                    let before = crate::workspace::tree(&c.repo, Some(&c.state_dir))?;
+                    let before = c.tree(&c.repo)?;
                     ensure!(
                         args["expected_tree"].as_str() == Some(before.as_str()),
                         "Files changed; refresh the restoration preview"
                     );
-                    let (backup, _) = crate::workspace::autosave(
+                    let (backup, _) = c.observe_or_save(
                         &c.repo,
-                        &c.state_dir,
                         &format!("operator-{}", id()),
                         "Before operator restore",
                     )?;
@@ -829,7 +840,7 @@ impl Controller {
                         crate::command_session::workspace_checks().is_empty(),
                         "Finish running commands before committing"
                     );
-                    let tree = crate::workspace::tree(&c.repo, Some(&c.state_dir))?;
+                    let tree = c.tree(&c.repo)?;
                     let head = crate::workspace::head(&c.repo);
                     let commit = crate::workspace::promote(
                         &c.repo,
@@ -843,9 +854,8 @@ impl Controller {
                     );
                 }
                 if name == "save_checkpoint" {
-                    let (reference, changed) = crate::workspace::autosave(
+                    let (reference, changed) = c.observe_or_save(
                         &c.repo,
-                        &c.state_dir,
                         &format!("operator-{}", id()),
                         args["summary"].as_str().unwrap_or("Operator recovery save"),
                     )?;
@@ -1141,10 +1151,45 @@ pub fn schemas() -> Value {
     json!(all)
 }
 
+pub fn schemas_for(c: &runner::Config) -> Value {
+    let mut tools = schemas();
+    if c.activity_mode.is_chaos() {
+        tools.as_array_mut().unwrap().retain(|t| {
+            ![
+                "save_checkpoint",
+                "commit_changes",
+                "restore_checkpoint",
+                "preview_restore",
+            ]
+            .contains(&t["function"]["name"].as_str().unwrap_or(""))
+        });
+        for tool in tools.as_array_mut().unwrap() {
+            match tool["function"]["name"].as_str().unwrap_or("") {
+                "project_diff" => {
+                    tool["function"]["description"] = json!(
+                        "Read file-hash changes since the latest saved conversation state, without version control or recoverable file copies."
+                    )
+                }
+                "recover_edit_session" => {
+                    tool["function"]["description"] = json!(
+                        "Recover interrupted editing only after the user confirms external writers stopped. Retains current files, revokes the old session, and records a handoff. Inspect project_status first."
+                    )
+                }
+                _ => {}
+            }
+        }
+    }
+    tools
+}
+
 fn compact_state(v: &Value) -> Value {
     json!({"cycle":v["cycle"],"current_task":v["current_task"],"working_branch":v["working_branch"],"working_ref":v["working_ref"],"feedback":v["feedback"],"recent":v["recent"].as_array().map(|a|a.iter().rev().take(3).collect::<Vec<_>>()),"history":"state.json"})
 }
 fn restore_target(c: &runner::Config, target: &str) -> Result<String> {
+    ensure!(
+        !c.activity_mode.is_chaos(),
+        "File restoration through version control is unavailable here"
+    );
     ensure!(
         !target.starts_with('-') && target.len() < 256,
         "Invalid recovery reference"

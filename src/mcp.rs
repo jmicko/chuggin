@@ -14,6 +14,7 @@ use std::{
 #[derive(Clone)]
 struct Server {
     client: crate::engine::Client,
+    tools: Vec<Tool>,
     sessions: Arc<Mutex<BTreeSet<String>>>,
 }
 fn observation_content(value: &Value) -> Result<Vec<ContentBlock>> {
@@ -27,10 +28,10 @@ fn observation_content(value: &Value) -> Result<Vec<ContentBlock>> {
     }
     Ok(content)
 }
-fn tools() -> Vec<Tool> {
+fn tools(schemas: &Value) -> Vec<Tool> {
     let mut entries = Vec::new();
     entries.push(serde_json::from_value(json!({"name":"open_operator_session","description":"Open or resume a project operator session. Does not start the loop. Use the returned session_id on tools; retain editing control around any external native edits or commands.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}}}})).unwrap());
-    for value in crate::operator::schemas().as_array().unwrap() {
+    for value in schemas.as_array().unwrap() {
         let f = &value["function"];
         let mut schema = f["parameters"].clone();
         if !schema["required"].is_array() {
@@ -97,7 +98,7 @@ impl ServerHandler for Server {
         .into())
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tools().into_iter().find(|t| t.name == name)
+        self.tools.iter().find(|t| t.name == name).cloned()
     }
     async fn list_tools(
         &self,
@@ -105,7 +106,7 @@ impl ServerHandler for Server {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult {
-            tools: tools(),
+            tools: self.tools.clone(),
             ..Default::default()
         })
     }
@@ -159,9 +160,14 @@ pub fn serve(path: &Path) -> Result<()> {
         }
     });
     let result = tokio::runtime::Runtime::new()?.block_on(async move {
-        let server = Server { client, sessions }
-            .serve(rmcp::transport::stdio())
-            .await?;
+        let schemas = client.request(json!({"action":"tools"}))?;
+        let server = Server {
+            tools: tools(&schemas),
+            client,
+            sessions,
+        }
+        .serve(rmcp::transport::stdio())
+        .await?;
         server.waiting().await?;
         Ok(())
     });
@@ -195,7 +201,7 @@ mod tests {
             .unwrap();
         assert_eq!(image::load_from_memory(&pixels).unwrap().width(), 12);
         assert!(!contents[0].as_text().unwrap().text.contains(&image.data));
-        let names: Vec<_> = tools()
+        let names: Vec<_> = tools(&crate::operator::schemas())
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();

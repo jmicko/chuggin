@@ -504,7 +504,9 @@ pub fn wizard() -> Result<PathBuf> {
     if io::stdin().is_terminal() && draft_settings(&root)?.get("activity_mode").is_none() {
         choose_activity_mode(None)?;
     }
-    ensure_git_identity(&root)?;
+    if !draft_config(&root)?.activity_mode.is_chaos() {
+        ensure_git_identity(&root)?;
+    }
     if draft_config(&root)?.model.trim().is_empty() {
         if io::stdin().is_terminal() {
             choose_project_model(None)?;
@@ -633,96 +635,98 @@ pub fn wizard() -> Result<PathBuf> {
         )?;
         (check, timeout)
     };
-    // Do not accidentally initialize or commit an ancestor repository.
-    let top = project::git(&root, &["rev-parse", "--show-toplevel"]).ok();
-    if let Some(top) = top {
-        anyhow::ensure!(
-            fs::canonicalize(top)? == root,
-            "This directory is inside another Git repository. Run setup at its root or in a separate directory."
-        );
-    } else {
-        project::git(&root, &["init"])?;
-    }
-    // Exclude runtime state before offering to commit project files.
-    let exclude = root.join(project::git(
-        &root,
-        &["rev-parse", "--git-path", "info/exclude"],
-    )?);
-    let mut ignored = fs::read_to_string(&exclude).unwrap_or_default();
-    for entry in ["/.chuggin/", "/chuggin.json"] {
-        if !ignored.lines().any(|line| line == entry) {
-            ignored.push_str(&format!("\n{entry}\n"));
-        }
-    }
-    if let Some(parent) = exclude.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(exclude, ignored)?;
-    if project::git(&root, &["rev-parse", "HEAD"]).is_err() {
-        let scope = [".", ":(exclude).chuggin", ":(exclude)chuggin.json"];
-        let mut list = vec![
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-        ];
-        list.extend(scope);
-        let files = project::git(&root, &list)?;
-        let has_files = !files.is_empty();
-        let paths: Vec<String> = files
-            .split('\0')
-            .filter(|p| !p.is_empty())
-            .map(|p| format!(":(literal){p}"))
-            .collect();
-        if has_files {
-            crate::ui::clear_notes();
-            crate::ui::notice("\nThis project has no commits yet. Chuggin can commit all project files as its starting point. Git-ignored files and Chuggin's local state are excluded.\n".to_string());
-            for file in files.split('\0').filter(|s| !s.is_empty()).take(40) {
-                crate::ui::notice(format!("  {file}"));
-            }
-            let accepted = if io::stdin().is_terminal() {
-                crate::menu::select(
-                    "Create the first commit?",
-                    &[
-                        "Commit project files and continue".into(),
-                        "Back to menu".into(),
-                    ],
-                    0,
-                )? == Some(0)
-            } else {
-                matches!(
-                    ask("Commit project files and continue? (yes/no)", "yes")?
-                        .to_lowercase()
-                        .as_str(),
-                    "yes" | "y"
-                )
-            };
-            anyhow::ensure!(accepted, "No commit created. Your goal draft is saved.");
-            let mut add = vec!["add", "-A", "--"];
-            add.extend(paths.iter().map(String::as_str));
-            project::git(&root, &add)?;
-        }
-        let mut commit = vec![
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "Initialize Chuggin project",
-        ];
-        if has_files {
-            commit.extend(["--only", "--"]);
-            commit.extend(paths.iter().map(String::as_str));
+    if !chaos {
+        // Do not accidentally initialize or commit an ancestor repository.
+        let top = project::git(&root, &["rev-parse", "--show-toplevel"]).ok();
+        if let Some(top) = top {
+            anyhow::ensure!(
+                fs::canonicalize(top)? == root,
+                "This directory is inside another Git repository. Run setup at its root or in a separate directory."
+            );
         } else {
-            // --only with no paths makes an empty commit without importing staged runtime files.
-            commit.push("--only");
+            project::git(&root, &["init"])?;
         }
-        project::git(&root, &commit)?;
-        crate::ui::notice("Created the first commit.".to_string());
+        // Exclude runtime state before offering to commit project files.
+        let exclude = root.join(project::git(
+            &root,
+            &["rev-parse", "--git-path", "info/exclude"],
+        )?);
+        let mut ignored = fs::read_to_string(&exclude).unwrap_or_default();
+        for entry in ["/.chuggin/", "/chuggin.json"] {
+            if !ignored.lines().any(|line| line == entry) {
+                ignored.push_str(&format!("\n{entry}\n"));
+            }
+        }
+        if let Some(parent) = exclude.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(exclude, ignored)?;
+        if project::git(&root, &["rev-parse", "HEAD"]).is_err() {
+            let scope = [".", ":(exclude).chuggin", ":(exclude)chuggin.json"];
+            let mut list = vec![
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+            ];
+            list.extend(scope);
+            let files = project::git(&root, &list)?;
+            let has_files = !files.is_empty();
+            let paths: Vec<String> = files
+                .split('\0')
+                .filter(|p| !p.is_empty())
+                .map(|p| format!(":(literal){p}"))
+                .collect();
+            if has_files {
+                crate::ui::clear_notes();
+                crate::ui::notice("\nThis project has no commits yet. Chuggin can commit all project files as its starting point. Git-ignored files and Chuggin's local state are excluded.\n".to_string());
+                for file in files.split('\0').filter(|s| !s.is_empty()).take(40) {
+                    crate::ui::notice(format!("  {file}"));
+                }
+                let accepted = if io::stdin().is_terminal() {
+                    crate::menu::select(
+                        "Create the first commit?",
+                        &[
+                            "Commit project files and continue".into(),
+                            "Back to menu".into(),
+                        ],
+                        0,
+                    )? == Some(0)
+                } else {
+                    matches!(
+                        ask("Commit project files and continue? (yes/no)", "yes")?
+                            .to_lowercase()
+                            .as_str(),
+                        "yes" | "y"
+                    )
+                };
+                anyhow::ensure!(accepted, "No commit created. Your goal draft is saved.");
+                let mut add = vec!["add", "-A", "--"];
+                add.extend(paths.iter().map(String::as_str));
+                project::git(&root, &add)?;
+            }
+            let mut commit = vec![
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initialize Chuggin project",
+            ];
+            if has_files {
+                commit.extend(["--only", "--"]);
+                commit.extend(paths.iter().map(String::as_str));
+            } else {
+                // --only with no paths makes an empty commit without importing staged runtime files.
+                commit.push("--only");
+            }
+            project::git(&root, &commit)?;
+            crate::ui::notice("Created the first commit.".to_string());
+        }
     }
     let preferences = draft_config(&root)?;
     let mut accepted = json!({"repo":".","goal":goal,"state_dir":".chuggin","helpers":preferences.helpers,"active_hours":{"mode":"shared"},

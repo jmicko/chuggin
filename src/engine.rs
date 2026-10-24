@@ -47,9 +47,12 @@ impl std::error::Error for Disconnected {
     }
 }
 fn socket_path(path: &Path) -> Result<PathBuf> {
-    use std::hash::{Hash, Hasher};
     let c = crate::runner::load(path)?;
-    let root = fs::canonicalize(crate::workspace::git_dir(&c.repo)?)?;
+    let root = c.controller_identity()?;
+    socket_for_identity(&root)
+}
+fn socket_for_identity(root: &Path) -> Result<PathBuf> {
+    use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     root.hash(&mut h);
     let base = crate::setup::settings_path()?
@@ -142,6 +145,45 @@ impl Client {
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         let _startup = startup_lock(&client.socket, deadline)?;
+        let config = crate::runner::load(&path)?;
+        if config.activity_mode.is_chaos() {
+            // Earlier versions addressed this mode by Git metadata. Retire an
+            // idle old owner once, then use the directory identity permanently.
+            // Never run Git or modify its metadata during this transition.
+            let marker = config.repo.join(".git");
+            let legacy_identity = if marker.is_dir() {
+                fs::canonicalize(marker).ok()
+            } else {
+                fs::read_to_string(marker)
+                    .ok()
+                    .and_then(|text| text.trim().strip_prefix("gitdir: ").map(str::to_owned))
+                    .and_then(|relative| fs::canonicalize(config.repo.join(relative)).ok())
+            };
+            if let Some(identity) = legacy_identity {
+                let legacy = Self {
+                    socket: socket_for_identity(&identity)?,
+                };
+                if legacy.socket != client.socket
+                    && let Ok(status) = legacy.request(json!({"action":"status"}))
+                    && status["config"].as_str() == path.to_str()
+                {
+                    ensure!(
+                        status["running"] == false,
+                        "Stop the previous Chuggin loop in its original window before opening this version. Saved conversation and files remain available."
+                    );
+                    if status["closing"] != true {
+                        legacy.request(json!({"action":"shutdown","cleanup_commands":true,"reason":"Controller upgrade; inspect saved command notices before continuing."}))?;
+                    }
+                    while legacy.socket.exists() {
+                        ensure!(
+                            Instant::now() < deadline,
+                            "Previous controller is still closing; return home and retry shortly"
+                        );
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        }
         if let Ok(status) = client.request(json!({"action":"status"})) {
             ensure!(
                 status["config"].as_str() == path.to_str(),
@@ -428,7 +470,7 @@ impl Engine {
                 self.controller.touch(text(&v, "session_id")?)?;
                 Ok(json!({"ok":true}))
             }
-            "tools" => Ok(crate::operator::schemas()),
+            "tools" => Ok(crate::operator::schemas_for(&self.controller.config()?)),
             "call" => {
                 let session = text(&v, "session_id")?;
                 let name = text(&v, "name")?;
