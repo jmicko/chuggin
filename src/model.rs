@@ -73,6 +73,7 @@ pub struct Model {
     output: u32,
     output_cap: Cell<Option<u32>>,
     watchdog_call: Cell<bool>,
+    observer_call: Cell<bool>,
     stop: Arc<AtomicBool>,
     trace: RefCell<Option<PathBuf>>,
     sequence: Cell<u32>,
@@ -88,9 +89,12 @@ pub struct Model {
     pinned_target: Option<(String, String, PathBuf)>,
     vision_capabilities: RefCell<HashMap<(String, String), bool>>,
     reasoning: crate::reasoning::Setting,
+    sampling: crate::sampling::Settings,
     reasoning_role: ReasoningRole,
     reasoning_capabilities:
         RefCell<HashMap<(String, String), (Instant, crate::reasoning::Capabilities)>>,
+    sampling_capabilities:
+        RefCell<HashMap<(String, String), (Instant, crate::sampling::Capabilities)>>,
     request_timeout_seconds: u64,
     #[cfg(test)]
     responses_test_token: Option<String>,
@@ -119,6 +123,7 @@ impl Model {
             output,
             output_cap: Cell::new(None),
             watchdog_call: Cell::new(false),
+            observer_call: Cell::new(false),
             stop,
             trace: RefCell::new(None),
             sequence: Cell::new(0),
@@ -134,8 +139,10 @@ impl Model {
             pinned_target: None,
             vision_capabilities: RefCell::new(HashMap::new()),
             reasoning: crate::reasoning::Setting::default(),
+            sampling: crate::sampling::Settings::default(),
             reasoning_role: ReasoningRole::Loop,
             reasoning_capabilities: RefCell::new(HashMap::new()),
+            sampling_capabilities: RefCell::new(HashMap::new()),
             request_timeout_seconds: 1800,
             #[cfg(test)]
             responses_test_token: None,
@@ -143,6 +150,9 @@ impl Model {
     }
     pub fn set_reasoning(&mut self, setting: crate::reasoning::Setting) {
         self.reasoning = setting;
+    }
+    pub fn set_sampling(&mut self, setting: crate::sampling::Settings) {
+        self.sampling = setting;
     }
     pub fn set_request_timeout(&mut self, seconds: u64) {
         self.request_timeout_seconds = seconds;
@@ -278,6 +288,24 @@ impl Model {
             ReasoningRole::Loop => &c.reasoning,
             ReasoningRole::Chat => &c.chat_reasoning,
             ReasoningRole::Helper => &c.helpers.reasoning,
+        }
+    }
+    fn selected_sampling<'a>(
+        &'a self,
+        c: Option<&'a crate::runner::Config>,
+    ) -> &'a crate::sampling::Settings {
+        // Creative project profiles must not alter the observers which diagnose
+        // repetition or decide whether a command should continue running.
+        if self.observer_call.get() {
+            return &crate::sampling::Settings::Legacy;
+        }
+        let Some(c) = c else {
+            return &self.sampling;
+        };
+        match self.reasoning_role {
+            ReasoningRole::Loop => &c.sampling,
+            ReasoningRole::Chat => &c.chat_sampling,
+            ReasoningRole::Helper => &c.helpers.sampling,
         }
     }
     pub fn use_run_controls(&mut self, stop: Arc<AtomicBool>, started: Instant) {
@@ -422,19 +450,23 @@ impl Model {
     }
     pub fn diagnostic_chat(&self, messages: &[Value], tools: Value) -> Result<Value> {
         let previous = self.output_cap.replace(Some(2048));
+        let observer = self.observer_call.replace(true);
         let result = self.chat(messages, Some(tools), false);
         self.output_cap.set(previous);
+        self.observer_call.set(observer);
         result
     }
     pub fn watchdog_chat(&self, messages: &[Value], tools: Value) -> Result<Value> {
         let previous = self.output_cap.replace(Some(2048));
         let mode = self.watchdog_call.replace(true);
+        let observer = self.observer_call.replace(true);
         *self.completed_messages.borrow_mut() = None;
         self.completed_reasoning.borrow_mut().clear();
         // Observers must not disappear into an indefinite provider quota retry.
         let result = self.chat_format_once(messages, Some(tools), None);
         self.output_cap.set(previous);
         self.watchdog_call.set(mode);
+        self.observer_call.set(observer);
         self.completed_reasoning.borrow_mut().clear();
         if result.is_err() {
             crate::events::send(crate::events::Event::RequestFinished);
@@ -721,6 +753,30 @@ impl Model {
             .as_ref()
             .map(|c| self.selected_reasoning(c))
             .unwrap_or(&self.reasoning);
+        let sampling = self.selected_sampling(live.as_ref());
+        let sampling_capabilities = if sampling.has_override() {
+            let cache_key = (url.clone(), name.to_owned());
+            let cached = self
+                .sampling_capabilities
+                .borrow()
+                .get(&cache_key)
+                .filter(|(at, _)| at.elapsed() < Duration::from_secs(300))
+                .map(|(_, capabilities)| capabilities.clone());
+            let capabilities = match cached {
+                Some(capabilities) => capabilities,
+                None => {
+                    let capabilities = crate::sampling::discover(&url, name)?;
+                    self.sampling_capabilities
+                        .borrow_mut()
+                        .insert(cache_key, (Instant::now(), capabilities.clone()));
+                    capabilities
+                }
+            };
+            capabilities.validate_selection(sampling)?;
+            Some(capabilities)
+        } else {
+            None
+        };
         let thinking_capabilities = if reasoning.is_default() {
             None
         } else {
@@ -807,13 +863,12 @@ impl Model {
         } else {
             messages.to_vec()
         };
-        let mut body = json!({"model":name,"messages":wire_messages,"stream":true,"options":{"num_ctx":context,"num_predict":output,"temperature":0.4}});
+        let mut body = json!({"model":name,"messages":wire_messages,"stream":true,"options":{"num_ctx":context,"num_predict":output}});
         if let Some(t) = tools {
             body["tools"] = t;
         }
         if let Some(schema) = format {
             body["format"] = schema;
-            body["options"]["temperature"] = json!(0);
         }
         if chatgpt.is_some() {
             body =
@@ -825,12 +880,7 @@ impl Model {
             } else {
                 crate::openai::messages(messages)?
             };
-            let mut wire = json!({"model":id,"messages":wire_messages,"stream":true,"stream_options":{"include_usage":true},"temperature":if formatted{0.0}else{0.4}});
-            if cloud.is_some() {
-                // Reasoning models can reject sampling overrides. Keep their
-                // provider defaults; Groq retains its existing request policy.
-                wire.as_object_mut().unwrap().remove("temperature");
-            }
+            let mut wire = json!({"model":id,"messages":wire_messages,"stream":true,"stream_options":{"include_usage":true}});
             wire[if groq.is_some() {
                 "max_completion_tokens"
             } else {
@@ -851,13 +901,15 @@ impl Model {
             body = wire;
         }
         crate::reasoning::apply(&mut body, name, reasoning, thinking_capabilities.as_ref())?;
+        let resolved_sampling =
+            crate::sampling::apply(&mut body, name, sampling, sampling_capabilities.as_ref())?;
         let sequence = self.sequence.get();
         self.sequence.set(sequence + 1);
         let mut trace = if let Some(path) = self.trace.borrow().as_ref() {
             std::fs::write(
                 path.join(format!("connection-{sequence:03}.json")),
                 serde_json::to_vec_pretty(
-                    &json!({"model":name,"request_timeout_seconds":timeout,"reasoning":reasoning}),
+                    &json!({"model":name,"request_timeout_seconds":timeout,"reasoning":reasoning,"sampling":sampling,"sampling_resolved":resolved_sampling}),
                 )?,
             )?;
             std::fs::write(
@@ -1514,6 +1566,303 @@ mod formatting_tests {
         .unwrap();
         assert_eq!(bare.decision, "rollback");
         assert_eq!(bare.reason, "accept is only text here");
+    }
+}
+
+#[cfg(test)]
+mod sampling_transport_tests {
+    use super::*;
+    fn config(directory: &Path, url: &str) -> crate::runner::Config {
+        serde_json::from_value(json!({
+            "repo":directory,"goal":"A useful project","ollama_url":url,
+            "model":"sampling-fixture","context_tokens":4096,"output_tokens":256,
+            "implementation_calls":4,"checks":[{"argv":["true"],"timeout_seconds":10}],"state_dir":directory.join(".chuggin"),"retry_seconds":1
+        })).unwrap()
+    }
+    #[test]
+    fn live_sampling_applies_after_format_conversion_and_preserves_in_flight_selection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("chuggin.json");
+        let trace = directory.path().join("trace");
+        std::fs::create_dir(&trace).unwrap();
+        let server_config = config_path.clone();
+        let server = std::thread::spawn(move || {
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                assert!(
+                    request.contains("/api/chat"),
+                    "Sampling must not trigger inference/metadata probes"
+                );
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut raw = vec![0; length];
+                reader.read_exact(&mut raw).unwrap();
+                let body: Value = serde_json::from_slice(&raw).unwrap();
+                match index {
+                    0 => assert_eq!(body["options"]["temperature"], 0.4),
+                    1 => {
+                        assert_eq!(body["format"], "json");
+                        assert_eq!(body["options"]["temperature"], 0.9);
+                        // Settings change while this response is in flight. It
+                        // remains valid and the next call sees the new setting.
+                        let mut config: Value =
+                            serde_json::from_slice(&std::fs::read(&server_config).unwrap())
+                                .unwrap();
+                        config["sampling"] = json!({"mode":"provider_default"});
+                        crate::setup::save(&server_config, &config).unwrap();
+                    }
+                    2 => {
+                        assert_eq!(body["format"], "json");
+                        assert!(body["options"].get("temperature").is_none());
+                    }
+                    3 => {
+                        assert_eq!(body["options"]["temperature"], 1.2);
+                        assert_eq!(body["options"]["top_k"], 0);
+                        assert_eq!(body["options"]["min_p"], 0.05);
+                        assert_eq!(body["options"]["presence_penalty"], 0.3);
+                        assert_eq!(body["options"]["frequency_penalty"], 0.2);
+                        assert_eq!(body["options"]["seed"], 7);
+                    }
+                    _ => unreachable!(),
+                }
+                let reply = json!({"message":{"role":"assistant","content":"{\"ok\":true}"},"done":true,"done_reason":"stop"}).to_string()+"\n";
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+        });
+        let mut config = config(directory.path(), &url);
+        crate::setup::save(&config_path, &config).unwrap();
+        let mut model = Model::new(
+            &url,
+            &config.model,
+            4096,
+            256,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        model.use_project_settings(&config_path);
+        model.trace_to(&trace);
+        let messages = [json!({"role":"user","content":"Return JSON"})];
+        model.chat(&messages, None, false).unwrap();
+        config.sampling = crate::sampling::Settings::Exploratory;
+        crate::setup::save(&config_path, &config).unwrap();
+        model.chat(&messages, None, true).unwrap();
+        model.chat(&messages, None, true).unwrap();
+        config.sampling = crate::sampling::Settings::Custom(crate::sampling::Values {
+            temperature: Some(1.2),
+            top_p: Some(0.75),
+            top_k: Some(0),
+            min_p: Some(0.05),
+            repeat_penalty: Some(1.1),
+            presence_penalty: Some(0.3),
+            frequency_penalty: Some(0.2),
+            seed: Some(7),
+        });
+        crate::setup::save(&config_path, &config).unwrap();
+        model.chat(&messages, None, false).unwrap();
+        server.join().unwrap();
+        let first: Value =
+            serde_json::from_slice(&std::fs::read(trace.join("connection-001.json")).unwrap())
+                .unwrap();
+        assert_eq!(first["sampling_resolved"]["overrides"]["temperature"], 0.9);
+        let next: Value =
+            serde_json::from_slice(&std::fs::read(trace.join("connection-002.json")).unwrap())
+                .unwrap();
+        assert_eq!(next["sampling_resolved"]["overrides"], json!({}));
+    }
+    #[test]
+    fn role_sampling_is_independent_and_fresh_diagnostics_remain_legacy() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config(directory.path(), "http://unused");
+        config.sampling = crate::sampling::Settings::Focused;
+        config.setup_sampling = crate::sampling::Settings::Exploratory;
+        config.chat_sampling = crate::sampling::Settings::ProviderDefault;
+        config.helpers.sampling = crate::sampling::Settings::Wildcard;
+        let mut main = Model::new(
+            "http://unused",
+            "main",
+            4096,
+            256,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(main.selected_sampling(Some(&config)), &config.sampling);
+        main.use_chat_settings(&directory.path().join("chuggin.json"), directory.path());
+        assert_eq!(main.selected_sampling(Some(&config)), &config.chat_sampling);
+        let mut helper = Model::new(
+            "http://unused",
+            "helper",
+            4096,
+            256,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        main.configure_helper(
+            &mut helper,
+            &directory.path().join("chuggin.json"),
+            directory.path(),
+            "helper",
+            "http://unused",
+        );
+        assert_eq!(
+            helper.selected_sampling(Some(&config)),
+            &config.helpers.sampling
+        );
+        let mut setup = Model::new(
+            "http://unused",
+            "setup",
+            4096,
+            256,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        setup.set_sampling(config.setup_sampling.clone());
+        assert_eq!(setup.sampling, config.setup_sampling);
+        let diagnostic = Model::new(
+            "http://unused",
+            "diagnostic",
+            4096,
+            256,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(diagnostic.sampling, crate::sampling::Settings::Legacy);
+    }
+    #[test]
+    fn chaos_sampling_does_not_leak_into_diagnostics_or_watchdogs() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (index, temperature) in [0.9, 0.4, 0.4, 0.9, 0.4, 0.9].into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                assert!(request.contains("/api/chat"));
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut raw = vec![0; length];
+                reader.read_exact(&mut raw).unwrap();
+                let body: Value = serde_json::from_slice(&raw).unwrap();
+                assert_eq!(
+                    body["options"]["temperature"], temperature,
+                    "request {index}"
+                );
+                let (status, reply) = if index == 4 {
+                    (
+                        "400 Bad Request",
+                        json!({"error":"fixture observer failure"}).to_string(),
+                    )
+                } else {
+                    ("200 OK", json!({"message":{"role":"assistant","content":"Done"},"done":true,"done_reason":"stop"}).to_string()+"\n")
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chuggin.json");
+        let trace = directory.path().join("trace");
+        std::fs::create_dir(&trace).unwrap();
+        let mut config = config(directory.path(), &url);
+        config.activity_mode = crate::activity::Mode::Chaos;
+        config.goal.clear();
+        config.checks.clear();
+        config.sampling = crate::sampling::Settings::Exploratory;
+        config.chat_sampling = crate::sampling::Settings::Wildcard;
+        config.helpers.sampling = crate::sampling::Settings::Wildcard;
+        crate::setup::save(&path, &config).unwrap();
+        let mut model = Model::new(
+            &url,
+            &config.model,
+            4096,
+            256,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        model.use_project_settings(&path);
+        model.trace_to(&trace);
+        let messages = [json!({"role":"user","content":"Observe the fixture"})];
+        model.chat(&messages, None, false).unwrap();
+        model.diagnostic_chat(&messages, json!([])).unwrap();
+        model.watchdog_chat(&messages, json!([])).unwrap();
+        model.chat(&messages, None, false).unwrap();
+        assert!(model.diagnostic_chat(&messages, json!([])).is_err());
+        model.chat(&messages, None, false).unwrap();
+        server.join().unwrap();
+        for (index, temperature) in [0.9, 0.4, 0.4, 0.9, 0.4, 0.9].into_iter().enumerate() {
+            let connection: Value = serde_json::from_slice(
+                &std::fs::read(trace.join(format!("connection-{index:03}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                connection["sampling_resolved"]["overrides"]["temperature"],
+                temperature
+            );
+            assert_eq!(
+                connection["sampling"]["mode"],
+                if index == 1 || index == 2 || index == 4 {
+                    "legacy"
+                } else {
+                    "exploratory"
+                }
+            );
+        }
+        // The same observer guard applies when a fresh model was explicitly
+        // configured, rather than inheriting its sampler from project settings.
+        model.settings_path = None;
+        model.set_sampling(crate::sampling::Settings::Wildcard);
+        model.observer_call.set(true);
+        assert_eq!(
+            model.selected_sampling(None),
+            &crate::sampling::Settings::Legacy
+        );
+        model.observer_call.set(false);
+        assert_eq!(
+            model.selected_sampling(None),
+            &crate::sampling::Settings::Wildcard
+        );
     }
 }
 

@@ -238,6 +238,17 @@ fn separate_thinking_repetition_recovers_without_adding_thinking_to_prompts() {
 }
 
 fn exercise_cross_response_recovery(thinking: bool) {
+    exercise_cross_response_recovery_in_mode(thinking, false);
+}
+
+#[test]
+fn chaos_retains_prose_and_thinking_repetition_recovery() {
+    for thinking in [false, true] {
+        exercise_cross_response_recovery_in_mode(thinking, true);
+    }
+}
+
+fn exercise_cross_response_recovery_in_mode(thinking: bool, chaos: bool) {
     let server = Server::custom(false, false, None, move |body, n| {
         if n == 5 {
             assert!(
@@ -250,7 +261,13 @@ fn exercise_cross_response_recovery(thinking: bool) {
             let messages = body["messages"].to_string();
             assert!(messages.contains("repetitive history was archived"));
             assert!(messages.contains("Temporary user priority"));
-            assert!(messages.contains("Improve value incrementally"));
+            if chaos {
+                assert!(!messages.contains("Improve value incrementally"));
+                assert!(!messages.contains("toward the main goal"));
+                assert!(!messages.contains("use set_task to select useful work"));
+            } else {
+                assert!(messages.contains("Improve value incrementally"));
+            }
             assert!(!messages.contains("I've now read through the entire editor"));
             assert!(body["messages"].as_array().unwrap().len() < 10);
         }
@@ -274,7 +291,11 @@ fn exercise_cross_response_recovery(thinking: bool) {
         }
     });
     let root = tempfile::tempdir().unwrap();
-    fixture(root.path(), &server.url, true);
+    if chaos {
+        chaos_fixture(root.path(), &server.url);
+    } else {
+        fixture(root.path(), &server.url, true);
+    }
     fs::write(
         root.path().join("repo/paper.txt"),
         (0..800)
@@ -518,6 +539,15 @@ fn fixture(root: &Path, url: &str, pass: bool) -> std::path::PathBuf {
         "checks":[{"argv":argv,"timeout_seconds":5}],"state_dir":root.join("state"),"retry_seconds":1}).to_string()).unwrap();
     config
 }
+fn chaos_fixture(root: &Path, url: &str) -> std::path::PathBuf {
+    let path = fixture(root, url, true);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["activity_mode"] = json!("chaos");
+    config.as_object_mut().unwrap().remove("goal");
+    config.as_object_mut().unwrap().remove("checks");
+    fs::write(&path, config.to_string()).unwrap();
+    path
+}
 fn command(root: &Path) -> Command {
     fs::create_dir_all(root.join(".chuggin")).unwrap();
     let identity = root.join(".chuggin/test-gitconfig");
@@ -532,6 +562,297 @@ fn command(root: &Path) -> Command {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("XDG_CONFIG_HOME", root.join(".chuggin/global"));
     c
+}
+
+#[test]
+fn chaos_continues_without_tasks_or_idle_delays_and_retains_conversation_on_restart() {
+    let server = Server::custom(false, false, None, |_, n| {
+        (
+            format!("CHAOS_OBSERVATION_{n}: I am done and have no next task."),
+            json!([]),
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = chaos_fixture(root.path(), &server.url);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["implementation_calls"] = json!(2);
+    config["retry_seconds"] = json!(60);
+    fs::write(&path, config.to_string()).unwrap();
+
+    // A Goal run would wait a minute between these intervals. Chaos must keep
+    // requesting responses even when the model has not selected an activity.
+    run_cycles_bounded(root.path(), 3);
+    let first = state(root.path());
+    assert_eq!(first["activity_mode"], "chaos");
+    assert_eq!(first["cycle"], 3);
+    assert!(first["current_task"].is_null());
+    assert!(first["completed_tasks"].as_array().unwrap().is_empty());
+    assert!(first["last_checks_passed_ref"].is_null());
+    assert!(first["last_validated_tree"].is_null());
+    assert_eq!(server.requests.lock().unwrap().len(), 3);
+
+    let checkpoint: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000003/checkpoint.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(checkpoint["checks_passed"], false);
+    assert_eq!(checkpoint["validation_status"], "not_configured");
+    let feedback: Value = serde_json::from_str(first["feedback"].as_str().unwrap()).unwrap();
+    assert_eq!(feedback["checks_passed"], false);
+    assert_eq!(feedback["validation_status"], "not_configured");
+
+    run_cycles_bounded(root.path(), 1);
+    let saved = state(root.path());
+    assert_eq!(saved["cycle"], 4);
+    assert!(saved["current_task"].is_null());
+    assert!(saved["completed_tasks"].as_array().unwrap().is_empty());
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("CHAOS_OBSERVATION_0")
+    );
+    for request in requests.iter() {
+        let messages = request["messages"].to_string();
+        assert!(!messages.contains("Improve value incrementally"));
+        assert!(!messages.contains("toward the main goal"));
+        assert!(!messages.contains("use set_task to select useful work"));
+        assert!(!messages.contains("You are working toward an overall project goal"));
+    }
+}
+
+#[test]
+fn chaos_accepts_silent_responses_across_intervals_and_cold_resume() {
+    let server = Server::custom(false, false, None, |_, _| (String::new(), json!([])));
+    let root = tempfile::tempdir().unwrap();
+    let path = chaos_fixture(root.path(), &server.url);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["retry_seconds"] = json!(60);
+    fs::write(&path, config.to_string()).unwrap();
+
+    let silent_responses = |session: &Value| {
+        session["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["role"] == "assistant"
+                    && message["content"].as_str().is_none_or(str::is_empty)
+                    && message["tool_calls"].as_array().is_none_or(Vec::is_empty)
+            })
+            .count()
+    };
+    run_cycles_bounded(root.path(), 2);
+    assert_eq!(state(root.path())["cycle"], 2);
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    let session_path = root.path().join("state/conversation.json");
+    let before: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
+    assert_eq!(silent_responses(&before), 2);
+    assert_eq!(before["response_errors"], 0);
+
+    run_cycles_bounded(root.path(), 1);
+    let saved = state(root.path());
+    assert_eq!(saved["cycle"], 3);
+    assert!(saved["current_task"].is_null());
+    assert!(saved["completed_tasks"].as_array().unwrap().is_empty());
+    let resumed: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
+    assert_eq!(silent_responses(&resumed), 3);
+    assert_eq!(resumed["response_errors"], 0);
+    for guard in ["action_watch", "prose_watch", "thinking_watch"] {
+        assert_eq!(resumed[guard]["interventions"], 0);
+    }
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(silent_responses(&requests[2]), 2);
+    for request in requests.iter() {
+        let messages = request["messages"].to_string();
+        for instruction in [
+            "Reasoning-loop recovery",
+            "Action-loop recovery",
+            "toward the main goal",
+            "use set_task to select useful work",
+            "use set_task for the next useful task",
+            "Model returned empty",
+        ] {
+            assert!(
+                !messages.contains(instruction),
+                "Unexpected instruction: {instruction}"
+            );
+        }
+    }
+    for cycle in 1..=3 {
+        let artifacts = root.path().join(format!("state/cycle-{cycle:06}"));
+        assert!(!fs::read_dir(artifacts).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("request-failure-")
+        }));
+    }
+}
+
+#[test]
+fn chaos_can_close_a_self_selected_task_without_claiming_validation() {
+    let server = Server::custom(false, false, None, |_, n| match n {
+        0 => (
+            String::new(),
+            json!([
+                task_tool("A self-selected activity"),
+                {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"Observed change"}}},
+                {"function":{"name":"finish_task","arguments":{"task_id":1,"summary":"Activity recorded; no checks were configured"}}}
+            ]),
+        ),
+        _ => ("The earlier activity is recorded.".into(), json!([])),
+    });
+    let root = tempfile::tempdir().unwrap();
+    chaos_fixture(root.path(), &server.url);
+    run_cycles_bounded(root.path(), 1);
+
+    let saved = state(root.path());
+    assert!(saved["current_task"].is_null());
+    assert_eq!(saved["completed_tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        saved["completed_tasks"][0]["title"],
+        "A self-selected activity"
+    );
+    assert!(saved["last_checks_passed_ref"].is_null());
+    assert!(saved["last_validated_tree"].is_null());
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/value.txt")).unwrap(),
+        "Observed change"
+    );
+    let checkpoint: Value = serde_json::from_slice(
+        &fs::read(root.path().join("state/cycle-000001/checkpoint.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(checkpoint["task_complete"], true);
+    assert_eq!(checkpoint["checks_passed"], false);
+    assert_eq!(checkpoint["validation_status"], "not_configured");
+    assert_eq!(
+        checkpoint["completion_basis"],
+        "model_report_without_configured_checks"
+    );
+
+    run_cycles_bounded(root.path(), 1);
+    let resumed = state(root.path());
+    assert_eq!(resumed["cycle"], 2);
+    assert!(resumed["current_task"].is_null());
+    assert_eq!(resumed["completed_tasks"].as_array().unwrap().len(), 1);
+    assert!(resumed["last_checks_passed_ref"].is_null());
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn chaos_still_requires_configured_checks_before_closing_a_self_selected_task() {
+    let server = Server::custom(false, false, None, |_, _| {
+        (
+            String::new(),
+            json!([
+                task_tool("An activity with a configured check"),
+                {"function":{"name":"finish_task","arguments":{"task_id":1,"summary":"The model reports completion"}}}
+            ]),
+        )
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = chaos_fixture(root.path(), &server.url);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["checks"] =
+        json!([{"argv":["git","rev-parse","--verify","nonexistent-ref"],"timeout_seconds":5}]);
+    fs::write(&path, config.to_string()).unwrap();
+
+    run_cycles_bounded(root.path(), 1);
+    let saved = state(root.path());
+    assert_eq!(
+        saved["current_task"]["title"],
+        "An activity with a configured check"
+    );
+    assert!(saved["completed_tasks"].as_array().unwrap().is_empty());
+    assert!(saved["last_checks_passed_ref"].is_null());
+    let feedback: Value = serde_json::from_str(saved["feedback"].as_str().unwrap()).unwrap();
+    assert_eq!(feedback["checks_passed"], false);
+    assert_eq!(feedback["validation_status"], "failing");
+}
+
+#[test]
+fn a_saved_goal_session_cannot_be_reinterpreted_as_chaos() {
+    let server = Server::new(false, false);
+    let root = tempfile::tempdir().unwrap();
+    let path = fixture(root.path(), &server.url, true);
+    run_cycles_bounded(root.path(), 1);
+    let requests_before = server.requests.lock().unwrap().len();
+    let saved = fs::read(root.path().join("state/conversation.json")).unwrap();
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["activity_mode"] = json!("chaos");
+    fs::write(&path, config.to_string()).unwrap();
+
+    let out = command(root.path())
+        .args(["run", "--cycles", "1"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(server.requests.lock().unwrap().len(), requests_before);
+    assert_eq!(
+        fs::read(root.path().join("state/conversation.json")).unwrap(),
+        saved
+    );
+}
+
+#[test]
+fn chaos_never_exposes_or_accepts_project_completion_even_when_enabled() {
+    let server = Server::custom(false, false, None, |_, n| match n {
+        0 => (
+            String::new(),
+            json!([
+                {"function":{"name":"finish_project","arguments":{"summary":"Stop permanently","evidence":"The model asks to stop"}}},
+                {"function":{"name":"write_file","arguments":{"path":"after.txt","content":"The interval continues"}}}
+            ]),
+        ),
+        _ => ("I have nothing further to do.".into(), json!([])),
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = chaos_fixture(root.path(), &server.url);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["allow_goal_completion"] = json!(true);
+    fs::write(&path, config.to_string()).unwrap();
+    fs::create_dir_all(root.path().join("state")).unwrap();
+    let old_completion = json!({"summary":"A historical completion marker"}).to_string();
+    let completion_path = root.path().join("state/goal-completion.json");
+    fs::write(&completion_path, &old_completion).unwrap();
+
+    run_cycles_bounded(root.path(), 3);
+    assert_eq!(state(root.path())["cycle"], 3);
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/after.txt")).unwrap(),
+        "The interval continues"
+    );
+    assert_eq!(
+        fs::read_to_string(&completion_path).unwrap(),
+        old_completion
+    );
+    let requests = server.requests.lock().unwrap();
+    assert!(requests.len() >= 3);
+    assert!(requests.iter().all(|request| {
+        !request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "finish_project")
+    }));
+    assert!(
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["role"] == "tool"
+                    && message["tool_name"] == "finish_project"
+                    && message["content"]
+                        .as_str()
+                        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                        .is_some_and(|result| result["ok"] == false)
+            })
+    );
 }
 
 #[test]
@@ -3346,7 +3667,7 @@ mod terminal_ui {
             expected
         );
         assert_eq!(fs::read(&shared).unwrap(), original_defaults);
-        ui.send(b"jjjjjjjj\r");
+        ui.send(b"jjjjjjjjjj\r");
         ui.wait("More project settings");
         ui.wait("Investigation helpers");
         ui.send(b"jjjjjjj\r");
@@ -3355,7 +3676,7 @@ mod terminal_ui {
         ui.wait("More project settings");
         ui.send(b"\x1b");
         ui.wait("Project settings");
-        ui.send(b"jjjjjjjjj\r");
+        ui.send(b"jjjjjjjjjjj\r");
         ui.wait("Global settings");
         ui.send(b"jj\r");
         ui.wait("Default context window · global");
@@ -3382,6 +3703,112 @@ mod terminal_ui {
             "Settings never start generation"
         );
     }
+    #[test]
+    fn loop_sampling_presets_custom_defaults_and_provider_defaults_persist_only_in_project() {
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        let path = fixture(root.path(), &server.url, true);
+        let mut expected: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        expected["sampling"] = json!({"mode":"legacy"});
+        expected["setup_sampling"] = json!({"mode":"wildcard"});
+        expected["chat_sampling"] = json!({"mode":"focused"});
+        fs::write(&path, expected.to_string()).unwrap();
+        let shared = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(
+            &shared,
+            json!({"model":"shared-model","ollama_url":"http://127.0.0.1:1",
+                "sampling":{"mode":"wildcard"},"setup_sampling":{"mode":"focused"},
+                "chat_sampling":{"mode":"provider_default"}})
+            .to_string(),
+        )
+        .unwrap();
+        let original_defaults = fs::read(&shared).unwrap();
+
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"jjjj\r");
+        ui.wait("Project settings");
+        ui.send(b"jjjjjjjj\r");
+        ui.wait("Loop sampling · this project");
+        ui.wait("Only temperature changes");
+        // Legacy starts at row 5; Exploratory is row 2.
+        ui.send(b"kkk\r");
+        ui.wait("Project settings");
+        expected["sampling"] = json!({"mode":"exploratory"});
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            expected
+        );
+
+        ui.send(b"jjjjjjjj\r");
+        ui.wait("Loop sampling · this project");
+        ui.send(b"jj\r");
+        ui.wait("Custom sampling");
+        ui.send(b"\r");
+        ui.wait("Temperature · 0–2");
+        ui.wait("Ctrl+U clear");
+        ui.send(b"\x15default\r");
+        ui.wait("Custom sampling");
+        ui.send(b"j\r");
+        ui.wait("Top-p · 0–1");
+        ui.send(b"\x150.8\r");
+        ui.wait("Custom sampling");
+        ui.send(b"jjjjjjjjj\r");
+        ui.wait("Project settings");
+        expected["sampling"] = json!({"mode":"custom","value":{"top_p":0.8}});
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            expected
+        );
+
+        // Reset removes the saved override; saving Custom does not manufacture
+        // explicit defaults for any of the eight individual controls.
+        ui.send(b"jjjjjjjj\r");
+        ui.wait("Loop sampling · this project");
+        ui.send(b"\r");
+        ui.wait("Custom sampling");
+        ui.send(b"jjjjjjjj\r");
+        ui.wait("Custom sampling");
+        ui.send(b"jjjjjjjjj\r");
+        ui.wait("Project settings");
+        expected["sampling"] = json!({"mode":"custom","value":{}});
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            expected
+        );
+
+        ui.send(b"jjjjjjjj\r");
+        ui.wait("Loop sampling · this project");
+        ui.send(b"kkkk\r");
+        ui.wait("Project settings");
+        expected["sampling"] = json!({"mode":"provider_default"});
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            expected
+        );
+        ui.send(b"\x1b");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        let saved_bytes = fs::read(&path).unwrap();
+
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"jjjj\r");
+        ui.wait("Project settings");
+        ui.wait("Loop sampling: Provider default");
+        ui.send(b"\x1b");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        assert_eq!(fs::read(&path).unwrap(), saved_bytes);
+        assert_eq!(fs::read(&shared).unwrap(), original_defaults);
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert_eq!(server.catalog_requests.load(Ordering::SeqCst), 0);
+        assert!(!root.path().join("state/state.json").exists());
+    }
+
     #[test]
     fn observation_settings_apply_without_interrupting_active_requests() {
         let server = Server::new(false, true);
@@ -3507,6 +3934,63 @@ mod terminal_ui {
         );
     }
     #[test]
+    fn chaos_setup_skips_goal_and_validation_and_returns_home_without_inference() {
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        let defaults = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(defaults.parent().unwrap()).unwrap();
+        fs::write(
+            &defaults,
+            json!({"model":"fake","ollama_url":server.url}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".chuggin/project-draft-settings.json"),
+            json!({"model":"fake"}).to_string(),
+        )
+        .unwrap();
+        fs::write(root.path().join("observation.txt"), "Existing material").unwrap();
+        let original_defaults = fs::read(&defaults).unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Set up this project");
+        ui.send(b"\r");
+        ui.wait("Choose a mode");
+        ui.wait("Work toward a goal");
+        ui.wait("No goals, only chaos");
+        ui.send(b"j\r");
+        ui.wait("Create the first commit?");
+        let screen = ui.parser.screen().contents();
+        assert!(!screen.contains("Validation command"));
+        assert!(!screen.contains("What are you working on today?"));
+        assert!(!screen.contains("First command review (seconds)"));
+        ui.send(b"\r");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+
+        let config: Value =
+            serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
+        assert_eq!(config["activity_mode"], "chaos");
+        assert!(config["goal"].as_str().is_none_or(str::is_empty));
+        assert!(config["checks"].as_array().unwrap().is_empty());
+        assert_eq!(config["model"], "fake");
+        assert_eq!(config["sampling"]["mode"], "exploratory");
+        assert_eq!(fs::read(&defaults).unwrap(), original_defaults);
+        assert_eq!(
+            fs::read_to_string(root.path().join("observation.txt")).unwrap(),
+            "Existing material"
+        );
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert!(!root.path().join(".chuggin/state.json").exists());
+        assert!(
+            !root
+                .path()
+                .join(".chuggin/project-draft-settings.json")
+                .exists()
+        );
+    }
+
+    #[test]
     fn guided_rust_rewrite_records_reference_and_finishes_without_inference() {
         let server = Server::new(false, false);
         let root = tempfile::tempdir().unwrap();
@@ -3526,6 +4010,8 @@ mod terminal_ui {
         fs::write(root.path().join("original.iso"), original).unwrap();
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Set up this project");
+        ui.send(b"\r");
+        ui.wait("Choose a mode");
         ui.send(b"\r");
         ui.wait("What are you working on today?");
         ui.send(b"\r");
@@ -3607,6 +4093,8 @@ mod terminal_ui {
         // Reproduce a new directory without a configured commit identity. Git
         // setup is a separate step and must not become context for the pitch.
         fs::write(root.path().join(".chuggin/test-gitconfig"), "").unwrap();
+        ui.send(b"\r");
+        ui.wait("Choose a mode");
         ui.send(b"\r");
         ui.wait("Git author name");
         ui.send(b"Project Operator\r");

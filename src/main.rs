@@ -1,4 +1,5 @@
 mod action_watch;
+mod activity;
 mod agents;
 mod chat;
 mod chatgpt;
@@ -34,6 +35,7 @@ mod repetition;
 mod responses;
 mod run_control;
 mod runner;
+mod sampling;
 mod schedule;
 mod search;
 mod setup;

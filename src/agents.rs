@@ -30,6 +30,7 @@ pub struct Settings {
     /// Empty means the main model. An explicit provider prefix opts in to that route.
     pub model: String,
     pub reasoning: crate::reasoning::Setting,
+    pub sampling: crate::sampling::Settings,
     pub max_calls: u32,
 }
 impl Default for Settings {
@@ -38,6 +39,7 @@ impl Default for Settings {
             enabled: false,
             model: String::new(),
             reasoning: crate::reasoning::Setting::default(),
+            sampling: crate::sampling::Settings::default(),
             max_calls: 12,
         }
     }
@@ -53,6 +55,7 @@ impl Settings {
             "Investigation model name is too long"
         );
         self.reasoning.validate()?;
+        self.sampling.validate()?;
         Ok(())
     }
 }
@@ -882,6 +885,7 @@ mod tests {
             enabled: true,
             model: "helper-local".into(),
             reasoning: crate::reasoning::Setting::default(),
+            sampling: crate::sampling::Settings::default(),
             max_calls: 4,
         };
         let input = json!({"question":"What failed?","task_id":17,"inspected_tree":"tree-17","config_path":config_path});
@@ -933,6 +937,7 @@ mod tests {
             enabled: false,
             model: "groq/never-opted-in".into(),
             reasoning: crate::reasoning::Setting::default(),
+            sampling: crate::sampling::Settings::default(),
             max_calls: 1,
         };
         let cached = investigate(&c, &disabled, &parent, input, &art, "route-test", |_, _| {
@@ -1014,6 +1019,7 @@ mod tests {
             enabled: true,
             model: String::new(),
             reasoning: crate::reasoning::Setting::default(),
+            sampling: crate::sampling::Settings::default(),
             max_calls: 4,
         };
         let start = std::time::Instant::now();

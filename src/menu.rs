@@ -84,7 +84,16 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                 "Set up this project"
             }
             .into(),
-            "Project goal".into(),
+            if project
+                .as_ref()
+                .and_then(|p| runner::load(p).ok())
+                .or_else(|| preview.clone())
+                .is_some_and(|c| c.activity_mode.is_chaos())
+            {
+                "Session mode".into()
+            } else {
+                "Project goal".into()
+            },
             "Progress".into(),
             "Project model".into(),
             "Settings".into(),
@@ -121,9 +130,18 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                         v["cycle"]
                     )
                 })
-                .unwrap_or("Goal saved. Ready for the first cycle.".into())
+                .unwrap_or(if c.activity_mode.is_chaos() {
+                    "Session saved. Ready for continuous inference.".into()
+                } else {
+                    "Goal saved. Ready for the first cycle.".into()
+                })
         } else {
-            "A fresh project. Start with a goal; Chuggin will help shape it.".into()
+            "A fresh project. Setup offers goal-driven work or No goals, only chaos.".into()
+        };
+        let status = if let Some(c) = effective.as_ref().or(preview.as_ref()) {
+            format!("{}\n\n{status}", c.activity_mode.label())
+        } else {
+            status
         };
         let Some(choice) = crate::ui::home_select(&items, &root, model, &status)? else {
             return Ok(());
@@ -146,7 +164,12 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                 }
                 1 => {
                     if let Some(path) = project.as_ref() {
-                        crate::ui::show("Project goal", &runner::load(path)?.goal)?;
+                        let c = runner::load(path)?;
+                        if c.activity_mode.is_chaos() {
+                            setup::choose_activity_mode(Some(path))?;
+                        } else {
+                            crate::ui::show("Project goal", &c.goal)?;
+                        }
                     } else {
                         crate::ui::show(
                             "Project goal",

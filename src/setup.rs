@@ -21,6 +21,9 @@ pub struct Settings {
     pub reasoning: crate::reasoning::Setting,
     pub setup_reasoning: crate::reasoning::Setting,
     pub chat_reasoning: crate::reasoning::Setting,
+    pub sampling: crate::sampling::Settings,
+    pub setup_sampling: crate::sampling::Settings,
+    pub chat_sampling: crate::sampling::Settings,
     pub context_tokens: u32,
     pub output_tokens: u32,
     pub implementation_calls: u32,
@@ -38,6 +41,9 @@ impl Default for Settings {
             reasoning: crate::reasoning::Setting::default(),
             setup_reasoning: crate::reasoning::Setting::default(),
             chat_reasoning: crate::reasoning::Setting::default(),
+            sampling: crate::sampling::Settings::default(),
+            setup_sampling: crate::sampling::Settings::default(),
+            chat_sampling: crate::sampling::Settings::default(),
             context_tokens: 32768,
             output_tokens: 4096,
             implementation_calls: 48,
@@ -63,6 +69,10 @@ pub fn settings() -> Result<Settings> {
     }
 }
 const DRAFT_SETTING_FIELDS: &[&str] = &[
+    "activity_mode",
+    "sampling",
+    "setup_sampling",
+    "chat_sampling",
     "model",
     "setup_model",
     "reasoning",
@@ -154,6 +164,9 @@ fn draft_config_with(root: &Path, defaults: &Settings, draft: &Value) -> Result<
     config.reasoning.validate()?;
     config.setup_reasoning.validate()?;
     config.chat_reasoning.validate()?;
+    config.sampling.validate()?;
+    config.setup_sampling.validate()?;
+    config.chat_sampling.validate()?;
     if let crate::schedule::Schedule::Custom { window } = &config.active_hours {
         window.validate()?;
     }
@@ -432,14 +445,66 @@ pub fn ensure_git_identity(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn chaos_sampling_default(c: &runner::Config) -> crate::sampling::Settings {
+    let requested = crate::sampling::Settings::Exploratory;
+    if crate::sampling::discover(&c.ollama_url, &c.model).is_ok_and(|cap| cap.supports(&requested))
+    {
+        requested
+    } else {
+        crate::sampling::Settings::ProviderDefault
+    }
+}
+
+pub fn choose_activity_mode(project: Option<&Path>) -> Result<()> {
+    if let Some(path) = project {
+        let c = runner::load(path)?;
+        return crate::ui::show(
+            "Session mode",
+            &format!(
+                "{}\n\nThe mode is fixed for this saved session so its conversation cannot accidentally inherit a different mode's instructions. Start in a new directory to choose another mode.",
+                c.activity_mode.label()
+            ),
+        );
+    }
+    let root = std::env::current_dir()?;
+    let c = draft_config(&root)?;
+    crate::ui::clear_notes();
+    crate::ui::notice("Choose how this session runs. Work toward a goal uses the existing project workflow. No goals, only chaos starts continuous inference with tools and saved history, without an assigned objective or required validation. The mode name is shown to you, not used as a personality prompt. You retain pause, stop, schedule and timer controls.".into());
+    let Some(choice) = crate::menu::select(
+        "Choose a mode",
+        &["Work toward a goal".into(), "No goals, only chaos".into()],
+        usize::from(c.activity_mode.is_chaos()),
+    )?
+    else {
+        anyhow::bail!("Setup cancelled; settings are saved");
+    };
+    let mode = if choice == 1 {
+        crate::activity::Mode::Chaos
+    } else {
+        crate::activity::Mode::Goal
+    };
+    let mut patch = json!({"activity_mode":mode});
+    if mode.is_chaos()
+        && draft_settings(&root)?.get("sampling").is_none()
+        && matches!(c.sampling, crate::sampling::Settings::Legacy)
+        && !c.model.is_empty()
+    {
+        patch["sampling"] = json!(chaos_sampling_default(&c));
+    }
+    save_draft_patch(&root, patch)
+}
+
 pub fn wizard() -> Result<PathBuf> {
     let root = std::env::current_dir()?;
-    ensure_git_identity(&root)?;
     let config = root.join("chuggin.json");
     anyhow::ensure!(
         !config.exists(),
         "Project already configured; run chuggin to resume."
     );
+    if io::stdin().is_terminal() && draft_settings(&root)?.get("activity_mode").is_none() {
+        choose_activity_mode(None)?;
+    }
+    ensure_git_identity(&root)?;
     if draft_config(&root)?.model.trim().is_empty() {
         if io::stdin().is_terminal() {
             choose_project_model(None)?;
@@ -447,8 +512,18 @@ pub fn wizard() -> Result<PathBuf> {
             configure(false)?;
         }
     }
-    let s = draft_config(&root)?;
-    let goal = if io::stdin().is_terminal() {
+    let mut s = draft_config(&root)?;
+    let chaos = s.activity_mode.is_chaos();
+    if chaos
+        && draft_settings(&root)?.get("sampling").is_none()
+        && matches!(s.sampling, crate::sampling::Settings::Legacy)
+    {
+        save_draft_patch(&root, json!({"sampling":chaos_sampling_default(&s)}))?;
+        s = draft_config(&root)?;
+    }
+    let goal = if chaos {
+        String::new()
+    } else if io::stdin().is_terminal() {
         crate::goal_setup::choose_goal(&root, &s)?
     } else {
         let setup_model = if s.setup_model.is_empty() {
@@ -493,6 +568,7 @@ pub fn wizard() -> Result<PathBuf> {
                     Arc::new(AtomicBool::new(false)),
                 )?;
                 model.set_reasoning(current.setup_reasoning.clone());
+                model.set_sampling(current.setup_sampling.clone());
                 model.set_request_timeout(current.request_timeout_seconds);
                 let input = json!({"pitch":draft.pitch,"current_draft":draft.goal,"requested_changes":draft.feedback});
                 let result = crate::ui::busy("Drafting your project goal", move || {
@@ -530,28 +606,33 @@ pub fn wizard() -> Result<PathBuf> {
         }
         draft.goal
     };
-    crate::ui::clear_notes();
-    crate::ui::notice("Choose a check Chuggin can use to guide refinement. All work is saved even when checks fail.\nChoose validation appropriate to this project: tests, a document linter, a data checker, or your own validation script.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
-    let check = loop {
-        let default_check = if root.join("Cargo.toml").is_file() {
-            "cargo test"
-        } else {
-            ""
+    let (check, timeout) = if chaos {
+        (Vec::new(), s.command_review_seconds as u32)
+    } else {
+        crate::ui::clear_notes();
+        crate::ui::notice("Choose a check Chuggin can use to guide refinement. All work is saved even when checks fail.\nChoose validation appropriate to this project: tests, a document linter, a data checker, or your own validation script.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
+        let check = loop {
+            let default_check = if root.join("Cargo.toml").is_file() {
+                "cargo test"
+            } else {
+                ""
+            };
+            let text = ask("Validation command", default_check)?;
+            match shell_words::split(&text) {
+                Ok(argv) if !argv.is_empty() => break argv,
+                _ => crate::ui::notice("Enter a valid command with balanced quotes.".to_string()),
+            }
         };
-        let text = ask("Validation command", default_check)?;
-        match shell_words::split(&text) {
-            Ok(argv) if !argv.is_empty() => break argv,
-            _ => crate::ui::notice("Enter a valid command with balanced quotes.".to_string()),
-        }
+        crate::ui::clear_notes();
+        crate::ui::notice("Choose when Chuggin first checks a running command, in seconds. This sets the first review point for commands and validation checks; the watchdog can inspect work that takes longer.".into());
+        let timeout = number(
+            "First command review (seconds)",
+            draft_config(&root)?.command_review_seconds as u32,
+            1,
+            86400,
+        )?;
+        (check, timeout)
     };
-    crate::ui::clear_notes();
-    crate::ui::notice("Choose when Chuggin first checks a running command, in seconds. This sets the first review point for commands and validation checks; the watchdog can inspect work that takes longer.".into());
-    let timeout = number(
-        "First command review (seconds)",
-        draft_config(&root)?.command_review_seconds as u32,
-        1,
-        86400,
-    )?;
     // Do not accidentally initialize or commit an ancestor repository.
     let top = project::git(&root, &["rev-parse", "--show-toplevel"]).ok();
     if let Some(top) = top {
@@ -645,14 +726,19 @@ pub fn wizard() -> Result<PathBuf> {
     }
     let preferences = draft_config(&root)?;
     let mut accepted = json!({"repo":".","goal":goal,"state_dir":".chuggin","helpers":preferences.helpers,"active_hours":{"mode":"shared"},
+        "activity_mode":preferences.activity_mode,
+        "sampling":preferences.sampling,"setup_sampling":preferences.setup_sampling,"chat_sampling":preferences.chat_sampling,
         "model":preferences.model,"setup_model":preferences.setup_model,
         "reasoning":preferences.reasoning,"setup_reasoning":preferences.setup_reasoning,"chat_reasoning":preferences.chat_reasoning,
-        "command_review_seconds":timeout,"checks":[{"argv":check,"timeout_seconds":timeout}]});
+        "command_review_seconds":timeout,"checks":if chaos {json!([])} else {json!([{"argv":check,"timeout_seconds":timeout}])}});
     for (key, value) in draft_settings(&root)?.as_object().unwrap() {
         accepted[key] = value.clone();
     }
     // The validation prompt is the final choice for the command review interval.
     accepted["command_review_seconds"] = json!(timeout);
+    if chaos {
+        accepted["allow_goal_completion"] = json!(false);
+    }
     save(&config, &accepted)?;
     // Check merged project/global settings before starting.
     runner::load(&config)?;
@@ -661,9 +747,11 @@ pub fn wizard() -> Result<PathBuf> {
         fs::remove_file(preferences)?;
     }
     crate::ui::clear_notes();
-    crate::ui::notice(
-        "\nGoal accepted and saved. Chuggin will edit this folder on its current branch, keep recovery saves, and commit completed tasks. Existing staged changes are preserved. Select Resume project to start.".to_string(),
-    );
+    crate::ui::notice(if chaos {
+        "Session saved: No goals, only chaos. No objective or validation command is assigned. Conversation history and recovery saves persist across restarts. Select Resume project to start.".into()
+    } else {
+        "\nGoal accepted and saved. Chuggin will edit this folder on its current branch, keep recovery saves, and commit completed tasks. Existing staged changes are preserved. Select Resume project to start.".into()
+    });
     Ok(config)
 }
 
@@ -693,6 +781,89 @@ fn available_models(s: &Settings) -> Result<Vec<String>> {
     );
     Ok(names)
 }
+fn sampling_for_model(
+    current: &crate::sampling::Settings,
+    model: &str,
+    url: &str,
+) -> Result<Option<crate::sampling::Settings>> {
+    if !current.has_override() {
+        return Ok(Some(current.clone()));
+    }
+    let model_name = model.to_owned();
+    let endpoint = url.to_owned();
+    let found = crate::ui::busy("Checking selected model sampling", move || {
+        crate::sampling::discover(&endpoint, &model_name)
+    });
+    if found.as_ref().is_ok_and(|caps| caps.supports(current)) {
+        return Ok(Some(current.clone()));
+    }
+    let reason = match found {
+        Ok(caps) => caps.detail,
+        Err(error) => error.to_string(),
+    };
+    crate::ui::clear_notes();
+    crate::ui::notice(format!(
+        "Selected model: {model}\nCurrent sampling: {}\n{reason}\nThe current overrides are not verified for this model. Choose whether to use its provider defaults before saving the model change.",
+        current.label()
+    ));
+    match crate::menu::select(
+        "Sampling for selected model",
+        &[
+            "Use provider default and save model".into(),
+            "Cancel model change".into(),
+        ],
+        0,
+    )? {
+        Some(0) => Ok(Some(crate::sampling::Settings::ProviderDefault)),
+        _ => Ok(None),
+    }
+}
+
+fn inherited_sampling_patch(
+    config: &runner::Config,
+    selection: &crate::model_picker::Selection,
+    patch: &mut Value,
+) -> Result<bool> {
+    let url = selection.local_url.as_deref().unwrap_or(&config.ollama_url);
+    for (model, current, key) in [
+        (
+            &config.setup_model,
+            &config.setup_sampling,
+            "setup_sampling",
+        ),
+        (&config.chat_model, &config.chat_sampling, "chat_sampling"),
+    ] {
+        if model.is_empty() && current.has_override() {
+            crate::ui::clear_notes();
+            crate::ui::notice(format!(
+                "The {key} role follows the project model and will use {}.",
+                selection.model
+            ));
+            let Some(next) = sampling_for_model(current, &selection.model, url)? else {
+                return Ok(false);
+            };
+            if next != *current {
+                patch[key] = json!(next);
+            }
+        }
+    }
+    if config.helpers.enabled
+        && config.helpers.model.is_empty()
+        && config.helpers.sampling.has_override()
+    {
+        let Some(next) = sampling_for_model(&config.helpers.sampling, &selection.model, url)?
+        else {
+            return Ok(false);
+        };
+        if next != config.helpers.sampling {
+            let mut helpers = config.helpers.clone();
+            helpers.sampling = next;
+            patch["helpers"] = json!(helpers);
+        }
+    }
+    Ok(true)
+}
+
 pub fn choose_model(project: Option<&Path>) -> Result<()> {
     let defaults = settings()?;
     let (model, url) = if let Some(path) = project {
@@ -709,19 +880,50 @@ pub fn choose_model(project: Option<&Path>) -> Result<()> {
     let Some(selection) = crate::model_picker::choose(&model, &url, title)? else {
         return Ok(());
     };
+    let effective_config = if let Some(path) = project {
+        runner::load(path)?
+    } else {
+        draft_config_with(&std::env::current_dir()?, &settings()?, &json!({}))?
+    };
+    let current_sampling = effective_config.sampling.clone();
+    let Some(sampling) = sampling_for_model(
+        &current_sampling,
+        &selection.model,
+        selection.local_url.as_deref().unwrap_or(&url),
+    )?
+    else {
+        return Ok(());
+    };
+    let mut patch = selection.patch("model");
+    if sampling != current_sampling {
+        patch["sampling"] = json!(sampling);
+    }
+    if !inherited_sampling_patch(&effective_config, &selection, &mut patch)? {
+        return Ok(());
+    }
     if let Some(path) = project {
         if runner::needs_migration(path)? {
             let mut config: Value = serde_json::from_slice(&fs::read(path)?)?;
-            for (key, value) in selection.patch("model").as_object().unwrap() {
+            for (key, value) in patch.as_object().unwrap() {
                 config[key] = value.clone();
             }
             save(path, &config)?;
         } else {
-            save_project_patch(Some(path), selection.patch("model"))?;
+            save_project_patch(Some(path), patch)?;
         }
     } else {
         let mut defaults = settings()?;
         defaults.model = selection.model.clone();
+        defaults.sampling = sampling;
+        if let Some(value) = patch.get("setup_sampling") {
+            defaults.setup_sampling = serde_json::from_value(value.clone())?;
+        }
+        if let Some(value) = patch.get("chat_sampling") {
+            defaults.chat_sampling = serde_json::from_value(value.clone())?;
+        }
+        if let Some(value) = patch.get("helpers") {
+            defaults.helpers = serde_json::from_value(value.clone())?;
+        }
         if let Some(url) = &selection.local_url {
             defaults.ollama_url = url.clone();
         }
@@ -742,7 +944,22 @@ pub fn choose_project_model(project: Option<&Path>) -> Result<()> {
         &config.ollama_url,
         "Choose model for this project",
     )? {
-        save_draft_patch(&root, selection.patch("model"))?;
+        let Some(sampling) = sampling_for_model(
+            &config.sampling,
+            &selection.model,
+            selection.local_url.as_deref().unwrap_or(&config.ollama_url),
+        )?
+        else {
+            return Ok(());
+        };
+        let mut patch = selection.patch("model");
+        if sampling != config.sampling {
+            patch["sampling"] = json!(sampling);
+        }
+        if !inherited_sampling_patch(&config, &selection, &mut patch)? {
+            return Ok(());
+        }
+        save_draft_patch(&root, patch)?;
         crate::ui::notice(format!("Project model saved: {}", selection.model));
     }
     Ok(())
@@ -787,7 +1004,22 @@ pub fn choose_setup_model(project: Option<&Path>) -> Result<()> {
         &config.ollama_url,
         "Setup model · this project",
     )? {
-        save_project_patch(project, selection.patch("setup_model"))?;
+        let name = if selection.model.is_empty() {
+            &config.model
+        } else {
+            &selection.model
+        };
+        let Some(sampling) = sampling_for_model(
+            &config.setup_sampling,
+            name,
+            selection.local_url.as_deref().unwrap_or(&config.ollama_url),
+        )?
+        else {
+            return Ok(());
+        };
+        let mut patch = selection.patch("setup_model");
+        patch["setup_sampling"] = json!(sampling);
+        save_project_patch(project, patch)?;
     }
     Ok(())
 }
@@ -919,6 +1151,251 @@ pub fn choose_setup_reasoning(project: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// These controls describe sampling only; they never add a creativity prompt.
+fn sampling_choice(
+    current: &crate::sampling::Settings,
+    model: &str,
+    url: &str,
+    title: &str,
+) -> Result<Option<crate::sampling::Settings>> {
+    use crate::sampling::Settings;
+    let name = model.to_owned();
+    let address = url.to_owned();
+    let capabilities = crate::ui::busy("Checking sampling controls (no generation)", move || {
+        crate::sampling::discover(&address, &name)
+    }).unwrap_or_else(|error|crate::sampling::Capabilities {parameters:Vec::new(),verified:false,source:"Metadata unavailable".into(),detail:format!("Could not verify sampler controls: {error}. Provider default and Legacy remain available.")});
+    loop {
+        crate::ui::clear_notes();
+        crate::ui::notice(format!(
+            "Sampling affects token selection, independently of thinking effort and session mode. Presets are starting points, not universal quality guarantees. Only temperature changes in the built-in presets; other parameters retain provider/model defaults. Changes apply to the next request.\n\nModel: {model}\n{}\nSource: {}\n\nCurrent: {}\nExplicit profile values: {}",
+            capabilities.detail,
+            capabilities.source,
+            current.label(),
+            Value::Object(current.custom_values().parameters())
+        ));
+        let presets = [
+            Settings::ProviderDefault,
+            Settings::Focused,
+            Settings::Exploratory,
+            Settings::Wildcard,
+        ];
+        let mut rows: Vec<String> = presets
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}{}",
+                    p.label(),
+                    if capabilities.supports(p) {
+                        ""
+                    } else {
+                        " · unavailable"
+                    }
+                )
+            })
+            .collect();
+        rows.extend([
+            "Custom… · supported parameters".into(),
+            Settings::Legacy.label(),
+            "Back".into(),
+        ]);
+        let selected = presets.iter().position(|p| p == current).unwrap_or(
+            if matches!(current, Settings::Custom(_)) {
+                4
+            } else {
+                5
+            },
+        );
+        let Some(choice) = crate::menu::select(title, &rows, selected)? else {
+            return Ok(None);
+        };
+        let next = match choice {
+            0..=3 => presets[choice].clone(),
+            4 => {
+                let Some(values) = custom_sampling(current.custom_values(), &capabilities)? else {
+                    continue;
+                };
+                Settings::Custom(values)
+            }
+            5 => Settings::Legacy,
+            _ => return Ok(None),
+        };
+        if let Err(error) = capabilities.validate_selection(&next) {
+            crate::ui::show("Sampling unavailable", &error.to_string())?;
+            continue;
+        }
+        return Ok(Some(next));
+    }
+}
+
+fn custom_sampling(
+    mut values: crate::sampling::Values,
+    capabilities: &crate::sampling::Capabilities,
+) -> Result<Option<crate::sampling::Values>> {
+    const FIELDS: [(&str, &str); 8] = [
+        ("temperature", "Temperature · 0–2"),
+        ("top_p", "Top-p · 0–1"),
+        ("top_k", "Top-k · 0 disables cutoff"),
+        ("min_p", "Min-p · 0–1"),
+        ("repeat_penalty", "Repetition penalty · 1 unchanged"),
+        ("presence_penalty", "Presence penalty · -2–2"),
+        ("frequency_penalty", "Frequency penalty · -2–2"),
+        ("seed", "Seed · optional integer"),
+    ];
+    loop {
+        crate::ui::clear_notes();
+        crate::ui::notice("Enter default to remove one override. Higher sampling variation can affect tool-call quality as well as prose. Repetition penalties operate on tokens; Chuggin's repeated-phrase recovery remains separate. A seed is a best-effort comparison aid, not a guarantee across providers or hardware.".into());
+        let map = values.parameters();
+        let mut rows: Vec<String> = FIELDS
+            .iter()
+            .map(|(key, label)| {
+                format!(
+                    "{label}: {}{}",
+                    map.get(*key)
+                        .map(ToString::to_string)
+                        .unwrap_or("Default".into()),
+                    if capabilities.supports_parameter(key) {
+                        ""
+                    } else {
+                        " · unavailable"
+                    }
+                )
+            })
+            .collect();
+        rows.extend([
+            "Reset all to defaults".into(),
+            "Save custom sampling".into(),
+            "Back".into(),
+        ]);
+        match crate::menu::select("Custom sampling", &rows, 0)? {
+            Some(i @ 0..=7) => {
+                let (key, label) = FIELDS[i];
+                if !capabilities.supports_parameter(key) {
+                    crate::ui::show(
+                        "Sampling parameter unavailable",
+                        &format!(
+                            "{key}\n{}\nYou can reset all overrides or choose Provider default.",
+                            capabilities.detail
+                        ),
+                    )?;
+                    continue;
+                }
+                let previous = map.get(key).map(ToString::to_string).unwrap_or_default();
+                crate::ui::clear_notes();
+                crate::ui::notice(
+                    "Enter a numeric value, or type default to remove this override.".into(),
+                );
+                let text = ask(label, &previous)?;
+                let mut edited = map.clone();
+                if text.trim().is_empty() || text.trim().eq_ignore_ascii_case("default") {
+                    edited.remove(key);
+                } else {
+                    let value: Value = match serde_json::from_str(text.trim()) {
+                        Ok(Value::Number(n)) => Value::Number(n),
+                        _ => {
+                            crate::ui::show(
+                                "Invalid sampling value",
+                                "Enter a number, or leave blank for Default.",
+                            )?;
+                            continue;
+                        }
+                    };
+                    edited.insert(key.into(), value);
+                }
+                let candidate =
+                    serde_json::from_value::<crate::sampling::Values>(Value::Object(edited));
+                match candidate
+                    .and_then(|v| v.validate().map(|_| v).map_err(serde::de::Error::custom))
+                {
+                    Ok(candidate) => values = candidate,
+                    Err(error) => crate::ui::show("Invalid sampling value", &error.to_string())?,
+                }
+            }
+            Some(8) => values = crate::sampling::Values::default(),
+            Some(9) => return Ok(Some(values)),
+            _ => return Ok(None),
+        }
+    }
+}
+
+pub fn project_sampling(project: Option<&Path>, field: &str) -> Result<()> {
+    let c = editing_config(project)?;
+    let (current, name, title): (&crate::sampling::Settings, &str, &str) = match field {
+        "sampling" => (
+            &c.sampling,
+            c.model.as_str(),
+            "Loop sampling · this project",
+        ),
+        "setup_sampling" => (
+            &c.setup_sampling,
+            if c.setup_model.is_empty() {
+                &c.model
+            } else {
+                &c.setup_model
+            },
+            "Setup sampling · this project",
+        ),
+        "chat_sampling" => (
+            &c.chat_sampling,
+            if c.chat_model.is_empty() {
+                &c.model
+            } else {
+                &c.chat_model
+            },
+            "Chat sampling · this project",
+        ),
+        _ => anyhow::bail!("Unknown sampling role"),
+    };
+    if let Some(setting) = sampling_choice(current, name, &c.ollama_url, title)? {
+        let mut patch = json!({});
+        patch[field] = json!(setting);
+        save_project_patch(project, patch)?;
+    }
+    Ok(())
+}
+
+fn default_sampling_menu() -> Result<()> {
+    loop {
+        let s = settings()?;
+        let Some(role) = crate::menu::select(
+            "Sampling defaults · global",
+            &[
+                format!("Loop: {}", s.sampling.label()),
+                format!("Setup: {}", s.setup_sampling.label()),
+                format!("Chat: {}", s.chat_sampling.label()),
+                "Back".into(),
+            ],
+            0,
+        )?
+        else {
+            return Ok(());
+        };
+        let (setting, model) = match role {
+            0 => (&s.sampling, &s.model),
+            1 => (
+                &s.setup_sampling,
+                if s.setup_model.is_empty() {
+                    &s.model
+                } else {
+                    &s.setup_model
+                },
+            ),
+            2 => (&s.chat_sampling, &s.model),
+            _ => return Ok(()),
+        };
+        if let Some(next) =
+            sampling_choice(setting, model, &s.ollama_url, "Sampling default · global")?
+        {
+            let mut fresh = settings()?;
+            match role {
+                0 => fresh.sampling = next,
+                1 => fresh.setup_sampling = next,
+                _ => fresh.chat_sampling = next,
+            };
+            save(&settings_path()?, &fresh)?;
+        }
+    }
+}
+
 fn editing_config(project: Option<&Path>) -> Result<runner::Config> {
     match project {
         Some(path) => runner::load(path),
@@ -982,6 +1459,7 @@ pub fn settings_menu() -> Result<()> {
             format!("Default loop thinking     {}", s.reasoning.label()),
             format!("Default setup thinking    {}", s.setup_reasoning.label()),
             format!("Default chat thinking     {}", s.chat_reasoning.label()),
+            "Sampling defaults…".into(),
             "Back".into(),
         ];
         let Some(index) =
@@ -1149,6 +1627,10 @@ pub fn settings_menu() -> Result<()> {
                     continue;
                 };
                 s.chat_reasoning = setting;
+            }
+            15 => {
+                default_sampling_menu()?;
+                continue;
             }
             _ => return Ok(()),
         }
@@ -1421,8 +1903,10 @@ pub enum ProjectSetting {
     Completion,
     More,
     Global,
+    Sampling,
+    Mode,
 }
-pub const PROJECT_SETTINGS: [ProjectSetting; 10] = [
+pub const PROJECT_SETTINGS: [ProjectSetting; 12] = [
     ProjectSetting::Model,
     ProjectSetting::Thinking,
     ProjectSetting::Context,
@@ -1431,6 +1915,8 @@ pub const PROJECT_SETTINGS: [ProjectSetting; 10] = [
     ProjectSetting::Duration,
     ProjectSetting::ActiveHours,
     ProjectSetting::Completion,
+    ProjectSetting::Sampling,
+    ProjectSetting::Mode,
     ProjectSetting::More,
     ProjectSetting::Global,
 ];
@@ -1439,6 +1925,8 @@ impl ProjectSetting {
         match self {
             Self::Model => "Project model",
             Self::Thinking => "Loop thinking",
+            Self::Sampling => "Loop sampling",
+            Self::Mode => "Session mode",
             Self::Context => "Context window (tokens)",
             Self::Output => "Response limit (tokens)",
             Self::Timeout => "Request timeout (minutes; 0 unlimited)",
@@ -1453,6 +1941,8 @@ impl ProjectSetting {
         match self {
             Self::Model => c.model.clone(),
             Self::Thinking => c.reasoning.label(),
+            Self::Sampling => c.sampling.label(),
+            Self::Mode => c.activity_mode.label().into(),
             Self::Context => token_count(c.context_tokens),
             Self::Output => token_count(c.output_tokens),
             Self::Timeout => (c.request_timeout_seconds as f64 / 60.0).to_string(),
@@ -1462,7 +1952,14 @@ impl ProjectSetting {
                 .at(chrono::Utc::now())
                 .map(|s| s.description)
                 .unwrap_or_else(|e| e.to_string()),
-            Self::Completion => if c.allow_goal_completion { "on" } else { "off" }.into(),
+            Self::Completion => if c.activity_mode.is_chaos() {
+                "Unavailable in this mode"
+            } else if c.allow_goal_completion {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
             Self::More => "Setup and chat models, thinking, helpers, tool requests, MCP".into(),
             Self::Global => "Shared connections and defaults for projects".into(),
         }
@@ -1501,6 +1998,14 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
         match setting {
             ProjectSetting::Model => choose_project_model(path)?,
             ProjectSetting::Thinking => choose_project_reasoning(path)?,
+            ProjectSetting::Sampling => project_sampling(path, "sampling")?,
+            ProjectSetting::Mode => choose_activity_mode(path)?,
+            ProjectSetting::Completion if c.activity_mode.is_chaos() => {
+                crate::ui::show(
+                    "Continuous session",
+                    "This mode keeps scheduling inference until you pause or stop it. The model has no tool to complete the overall session.",
+                )?;
+            }
             ProjectSetting::ActiveHours => project_active_hours_menu(path)?,
             ProjectSetting::More => more_project_settings(path)?,
             ProjectSetting::Global => settings_menu()?,
@@ -1576,6 +2081,8 @@ pub fn more_project_settings(path: Option<&Path>) -> Result<()> {
                 ),
                 "External AI access (MCP)".into(),
                 "Tool requests".into(),
+                format!("Setup sampling · {}", c.setup_sampling.label()),
+                format!("Chat sampling · {}", c.chat_sampling.label()),
                 "Back".into(),
             ],
             0,
@@ -1604,7 +2111,22 @@ pub fn more_project_settings(path: Option<&Path>) -> Result<()> {
                     &c.ollama_url,
                     "Chat model · this project",
                 )? {
-                    save_project_patch(path, model.patch("chat_model"))?;
+                    let name = if model.model.is_empty() {
+                        &c.model
+                    } else {
+                        &model.model
+                    };
+                    let Some(sampling) = sampling_for_model(
+                        &c.chat_sampling,
+                        name,
+                        model.local_url.as_deref().unwrap_or(&c.ollama_url),
+                    )?
+                    else {
+                        continue;
+                    };
+                    let mut patch = model.patch("chat_model");
+                    patch["chat_sampling"] = json!(sampling);
+                    save_project_patch(path, patch)?;
                 }
             }
             4 => {
@@ -1644,6 +2166,8 @@ pub fn more_project_settings(path: Option<&Path>) -> Result<()> {
                     )?;
                 }
             }
+            8 => project_sampling(path, "setup_sampling")?,
+            9 => project_sampling(path, "chat_sampling")?,
             _ => return Ok(()),
         }
     }
@@ -1669,6 +2193,7 @@ fn helper_rows(helpers: &crate::agents::Settings) -> Vec<String> {
         ),
         format!("Model responses per helper · {}", helpers.max_calls),
         format!("Thinking · {}", helpers.reasoning.label()),
+        format!("Sampling · {}", helpers.sampling.label()),
         "Back".into(),
     ]
 }
@@ -1771,6 +2296,30 @@ fn helpers_scope(project: Option<&Path>, project_scope: bool) -> Result<()> {
                     continue;
                 };
                 helpers.reasoning = setting;
+            }
+            4 => {
+                let (model, url) = if project.is_some() || project_scope {
+                    let c = editing_config(project)?;
+                    (c.model, c.ollama_url)
+                } else {
+                    let s = settings()?;
+                    (s.model, s.ollama_url)
+                };
+                let name = if helpers.model.is_empty() {
+                    &model
+                } else {
+                    &helpers.model
+                };
+                let Some(next) = sampling_choice(
+                    &helpers.sampling,
+                    name,
+                    &url,
+                    "Investigation helper sampling",
+                )?
+                else {
+                    continue;
+                };
+                helpers.sampling = next;
             }
             _ => return Ok(()),
         }

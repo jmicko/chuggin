@@ -989,6 +989,7 @@ fn conversation(
                 Arc::new(AtomicBool::new(false)),
             )?;
             model.set_reasoning(config.setup_reasoning.clone());
+            model.set_sampling(config.setup_sampling.clone());
             model.set_request_timeout(config.request_timeout_seconds);
             let trace_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let trace = root.join(format!(".chuggin/goal-setup-traces/request-{trace_id}"));

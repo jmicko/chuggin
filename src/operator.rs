@@ -187,8 +187,9 @@ impl Controller {
             ["scheduled", "one_cycle", "until_close"].contains(&mode),
             "Unknown resume mode"
         );
-        let report = self.config()?.state_dir.join("goal-completion.json");
-        if reopen && report.exists() {
+        let config = self.config()?;
+        let report = config.state_dir.join("goal-completion.json");
+        if reopen && !config.activity_mode.is_chaos() && report.exists() {
             fs::remove_file(report)?;
         }
         if !self.running.load(Ordering::SeqCst) {
@@ -308,7 +309,7 @@ impl Controller {
             .as_ref()
             .map(|l| json!({"session":l.session,"granted":l.granted}));
         Ok(
-            json!({"version":env!("CARGO_PKG_VERSION"),"config":self.path,"project":c.repo,"running":self.running.load(Ordering::SeqCst),"closing":self.closing.load(Ordering::SeqCst),"paused":self.controls.is_paused(),"pause_requested":self.controls.pause_requested(),"manual_pause":self.controls.manual_pause(),"holds":self.controls.reasons(),"schedule":self.controls.schedule_status().ok(),"stop_requested":self.stop.load(Ordering::SeqCst),"active_commands":project::active_checks(),"editing":lease,"interrupted_editing":read_json(&c.state_dir.join("operator/editing.json")).ok(),"interrupted_controller":read_json(&c.state_dir.join("operator/interrupted-controller.json")).ok(),"generation":self.generation.load(Ordering::SeqCst),"model":c.model,"goal":c.goal,"state":read_json(&c.state_dir.join("state.json")).ok().map(|v|compact_state(&v)),"active_elapsed_seconds":self.elapsed(),"nudges":crate::nudge::read(&c.state_dir)?,"last_error":self.last_error.lock().unwrap().clone()}),
+            json!({"version":env!("CARGO_PKG_VERSION"),"config":self.path,"project":c.repo,"running":self.running.load(Ordering::SeqCst),"closing":self.closing.load(Ordering::SeqCst),"paused":self.controls.is_paused(),"pause_requested":self.controls.pause_requested(),"manual_pause":self.controls.manual_pause(),"holds":self.controls.reasons(),"schedule":self.controls.schedule_status().ok(),"stop_requested":self.stop.load(Ordering::SeqCst),"active_commands":project::active_checks(),"editing":lease,"interrupted_editing":read_json(&c.state_dir.join("operator/editing.json")).ok(),"interrupted_controller":read_json(&c.state_dir.join("operator/interrupted-controller.json")).ok(),"generation":self.generation.load(Ordering::SeqCst),"model":c.model,"activity_mode":c.activity_mode,"goal":c.goal,"state":read_json(&c.state_dir.join("state.json")).ok().map(|v|compact_state(&v)),"active_elapsed_seconds":self.elapsed(),"nudges":crate::nudge::read(&c.state_dir)?,"last_error":self.last_error.lock().unwrap().clone()}),
         )
     }
     pub fn begin_edit(&self, session: &str) -> Result<Value> {
@@ -484,6 +485,9 @@ impl Controller {
             let ordinary = [
                 "model",
                 "reasoning",
+                "sampling",
+                "setup_sampling",
+                "chat_sampling",
                 "setup_model",
                 "setup_reasoning",
                 "chat_model",
@@ -505,6 +509,48 @@ impl Controller {
         }
         let proposed = runner::load_value(&self.path, &config)?;
         proposed.active_hours.at(chrono::Utc::now())?;
+        if [
+            "model",
+            "sampling",
+            "setup_model",
+            "setup_sampling",
+            "chat_model",
+            "chat_sampling",
+            "helpers",
+        ]
+        .iter()
+        .any(|key| patch.contains_key(*key))
+        {
+            let setup = if proposed.setup_model.is_empty() {
+                &proposed.model
+            } else {
+                &proposed.setup_model
+            };
+            let chat = if proposed.chat_model.is_empty() {
+                &proposed.model
+            } else {
+                &proposed.chat_model
+            };
+            for (sampling, model) in [
+                (&proposed.sampling, &proposed.model),
+                (&proposed.setup_sampling, setup),
+                (&proposed.chat_sampling, chat),
+            ] {
+                if sampling.has_override() {
+                    crate::sampling::discover(&proposed.ollama_url, model)?
+                        .validate_selection(sampling)?;
+                }
+            }
+            if proposed.helpers.enabled && proposed.helpers.sampling.has_override() {
+                let model = if proposed.helpers.model.is_empty() {
+                    &proposed.model
+                } else {
+                    &proposed.helpers.model
+                };
+                crate::sampling::discover(&proposed.ollama_url, model)?
+                    .validate_selection(&proposed.helpers.sampling)?;
+            }
+        }
         crate::setup::save(&self.path, &config)?;
         if patch.contains_key("active_hours") {
             self.controls.respect_schedule();
@@ -690,6 +736,10 @@ impl Controller {
             ),
             "update_settings" => self.update_working_settings(args, false),
             "set_goal" => {
+                ensure!(
+                    !c.activity_mode.is_chaos(),
+                    "This session has no assigned goal. Use a temporary nudge, or create a goal-driven project."
+                );
                 let _guard = self.settings.lock().unwrap();
                 check_revision(&self.path, args)?;
                 let goal = text(args, "goal")?.trim();

@@ -159,6 +159,50 @@ the run can exceed the chosen duration by the remaining cycle time. Resuming
 starts a new timer. The setting persists as `run_duration_seconds` in `chuggin.json`
 and also applies to command-line runs.
 
+## No goals, only chaos
+
+Setup first offers **Work toward a goal** or **No goals, only chaos**. The latter
+starts a persistent conversation with tools and an environment, without an
+assigned objective. It skips goal drafting and a mandatory validation command.
+The name is a label in the interface; the model receives neutral environment and
+tool instructions rather than a request to act chaotically.
+
+Every response boundary schedules another opportunity to generate, using the
+saved conversation. Text-only responses, silence, and no file changes do not end
+the session. There is no deliberate delay between cycles. Human pause, stop,
+active hours, timers, and provider backoff still apply. The existing repeated-text,
+repeated-thinking, and action-loop detectors and recovery remain enabled.
+
+Tasks are optional records of activities the model chooses. Finishing one never
+ends the session. With no configured checks, completion is recorded as a model
+report and validation reads **No checks configured**, never a passing result.
+If checks are explicitly configured, their existing completion gates apply.
+All work remains visible and is preserved in recovery snapshots. Mode is fixed
+for a saved session to avoid silently mixing its history with goal-driven
+instructions; start in a new directory to choose another mode.
+
+### Sampling profiles
+
+**Settings → Loop sampling** offers Provider default, Focused (temperature 0.4),
+Exploratory (0.9), Wildcard (1.1), Custom, and Legacy. Presets change only
+temperature; their values are starting points, not universal recommendations.
+New Chaos sessions select Exploratory where the provider supports it, otherwise
+Provider default. Established projects retain Legacy behavior until changed.
+Provider default sends no sampling overrides, including for structured replies.
+
+Custom exposes supported temperature, top-p, top-k, min-p, repetition, presence,
+frequency penalty, and seed controls. Type **default** to remove one override,
+or reset all. Provider support differs; unavailable controls are explained rather
+than silently dropped. A model change with incompatible loop sampling offers an
+explicit reset to provider defaults before saving. Thinking effort remains an
+independent setting.
+
+Profiles are saved per project and apply at the next request without interrupting
+an active response. Setup/chat controls are in More project settings; helpers
+have independent sampling in their settings. Global sampling defaults are under
+Global settings. Watchdogs and command diagnostics retain their normal behavior.
+Request traces record the selected profile and actual resolved overrides.
+
 ## Live project settings
 
 Tab **5 Settings** in the observation view opens the provider/model picker and edits request
@@ -461,7 +505,7 @@ Validation is project-defined. There is no mandatory Rust regression-writing
 stage, test-name gate, or language-specific acceptance rule. The agent can add and
 run suitable tests and investigate missing checks using the normal tools.
 
-The working conversation uses native tool calls and temperature 0.4. Task metadata
+The working conversation uses native tool calls. Legacy local/Groq sampling uses temperature 0.4; explicit profiles and provider defaults are selectable. Task metadata
 is recorded through tools; ordinary work does not require a staged JSON report.
 Setup goal drafting still uses structured output and formatting repair.
 Repeated JSON fields and fenced code are allowed. Sustained repeated words,

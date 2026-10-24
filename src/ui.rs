@@ -926,6 +926,7 @@ struct HelperActivity {
     speed: f64,
 }
 struct Dashboard {
+    validation_unconfigured: bool,
     workspace: String,
     workspace_branch: String,
     workspace_head: String,
@@ -985,6 +986,7 @@ struct Dashboard {
 impl Dashboard {
     fn new(config: &runner::Config) -> Self {
         let mut d = Self {
+            validation_unconfigured: config.activity_mode.is_chaos() && config.checks.is_empty(),
             workspace: config.repo.display().to_string(),
             workspace_branch: String::new(),
             workspace_head: String::new(),
@@ -994,7 +996,11 @@ impl Dashboard {
             chat: ChatPanel::default(),
             entries: VecDeque::new(),
             phase: "Ready".into(),
-            task: "Waiting for the next task".into(),
+            task: if config.activity_mode.is_chaos() {
+                "No activity selected".into()
+            } else {
+                "Waiting for the next task".into()
+            },
             cycle: 0,
             calls: 0,
             context_usage: crate::context_usage::load(
@@ -1392,13 +1398,19 @@ impl Dashboard {
                 }
             }
             Event::ValidationDone { passed, checkpoint } => {
-                self.last_check = Some(passed);
+                self.last_check = if self.validation_unconfigured {
+                    None
+                } else {
+                    Some(passed)
+                };
                 if passed && let Some(reference) = checkpoint {
                     self.last_passing_checkpoint = Some(reference.chars().take(8).collect());
                 }
                 self.push(
                     Kind::Check,
-                    if passed {
+                    if self.validation_unconfigured {
+                        "No checks configured · work saved"
+                    } else if passed {
                         "✓ Configured checks passed"
                     } else {
                         "× Validation needs attention · work is kept for repair"
@@ -1929,7 +1941,11 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             "1 Live",
             "2 Model",
             "3 Checks",
-            "4 Goal",
+            if c.activity_mode.is_chaos() {
+                "4 Session"
+            } else {
+                "4 Goal"
+            },
             "5 Settings",
             "6 Chat",
         ])
@@ -1998,7 +2014,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     } else if d.tab == 5 {
         d.chat.lines(inner.width.saturating_sub(1) as usize)
     } else {
-        d.lines(inner.width.saturating_sub(1) as usize, &c.goal)
+        d.lines(inner.width.saturating_sub(1) as usize, if c.activity_mode.is_chaos() { "No goals, only chaos\n\nNo objective is assigned. The model may use tools, select its own activities, or generate text without a task. Responses continue in the same saved conversation. Repeated-phrase recovery stays enabled.\n\nYou retain pause, stop, schedule and timer controls. Sampling changes apply to the next request." } else { &c.goal })
     };
     d.total_rows = lines.len();
     d.rows = output.height as usize;
@@ -2164,6 +2180,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
                 d.last_activity.elapsed().as_secs()
             )),
             Line::from(match d.last_check {
+                _ if c.checks.is_empty() => "No checks configured",
                 Some(true) => "✓ Latest checks passed",
                 Some(false) => "× Checks need attention",
                 None if d.finished.is_some() => "No check result recorded",
@@ -2171,6 +2188,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             })
             .fg(match d.last_check {
                 Some(true) => GREEN,
+                _ if c.checks.is_empty() => MUTED,
                 Some(false) => GOLD,
                 None => MUTED,
             }),
@@ -2534,6 +2552,20 @@ fn dashboard_session(
                                     ProjectSetting::Model => {
                                         crate::setup::choose_project_model(Some(path))?
                                     }
+                                    ProjectSetting::Sampling => {
+                                        crate::setup::project_sampling(Some(path), "sampling")?
+                                    }
+                                    ProjectSetting::Mode => {
+                                        crate::setup::choose_activity_mode(Some(path))?
+                                    }
+                                    ProjectSetting::Completion
+                                        if config.activity_mode.is_chaos() =>
+                                    {
+                                        show(
+                                            "Continuous session",
+                                            "This mode keeps scheduling inference until you pause or stop it. The model has no overall completion tool.",
+                                        )?;
+                                    }
                                     ProjectSetting::Thinking => {
                                         crate::setup::choose_project_reasoning(Some(path))?
                                     }
@@ -2770,6 +2802,29 @@ pub fn busy<T: Send + 'static>(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    #[test]
+    fn chaos_without_checks_has_neutral_validation_feedback() {
+        let mut c = config();
+        c.activity_mode = crate::activity::Mode::Chaos;
+        c.goal.clear();
+        c.checks.clear();
+        let mut d = Dashboard::new(&c);
+        d.apply(Event::ValidationDone {
+            passed: false,
+            checkpoint: Some("abc123".into()),
+        });
+        d.tab = 2;
+        let text = d
+            .lines(100, "")
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("No checks configured"));
+        assert!(!text.contains("Validation needs attention"));
+        assert!(!text.contains("checks passed"));
+        assert!(d.last_passing_checkpoint.is_none());
+    }
     #[test]
     fn long_model_catalog_keeps_selected_model_details_and_navigation_visible() {
         let choices: Vec<String> = (0..80).map(|i| format!("model-{i} · Free")).collect();
@@ -3090,7 +3145,7 @@ mod tests {
         assert_eq!(e.value, "héllo\nworld");
     }
     fn config() -> runner::Config {
-        runner::Config {reasoning:crate::reasoning::Setting::Default,setup_model:String::new(),setup_reasoning:crate::reasoning::Setting::Default,chat_reasoning:crate::reasoning::Setting::Default,helpers:crate::agents::Settings::default(),chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
+        runner::Config {activity_mode:crate::activity::Mode::Goal,sampling:crate::sampling::Settings::default(),setup_sampling:crate::sampling::Settings::default(),chat_sampling:crate::sampling::Settings::default(),reasoning:crate::reasoning::Setting::Default,setup_model:String::new(),setup_reasoning:crate::reasoning::Setting::Default,chat_reasoning:crate::reasoning::Setting::Default,helpers:crate::agents::Settings::default(),chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
     }
     fn screen_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();
