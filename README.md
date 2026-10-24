@@ -166,6 +166,10 @@ starts a persistent conversation with tools and an environment, without an
 assigned objective. It skips goal drafting and a mandatory validation command.
 The name is a label in the interface; the model receives neutral environment and
 tool instructions rather than a request to act chaotically.
+The saved mode identifier is `type2`; older `chaos` identifiers remain readable.
+Mode identifiers are omitted from model-facing startup, resume, helper, and
+diagnostic messages. Use a neutral workspace directory name for an experiment:
+paths and local configuration remain discoverable through ordinary computer access.
 
 Every response boundary schedules another opportunity to generate, using the
 saved conversation. Text-only responses, silence, and no file changes do not end

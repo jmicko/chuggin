@@ -568,11 +568,14 @@ fn command(root: &Path) -> Command {
 fn chaos_continues_without_tasks_or_idle_delays_and_retains_conversation_on_restart() {
     let server = Server::custom(false, false, None, |_, n| {
         (
-            format!("CHAOS_OBSERVATION_{n}: I am done and have no next task."),
+            format!("OBSERVATION_{n}: I am done and have no next task."),
             json!([]),
         )
     });
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::Builder::new()
+        .prefix("conversation-")
+        .tempdir()
+        .unwrap();
     let path = chaos_fixture(root.path(), &server.url);
     let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     config["implementation_calls"] = json!(2);
@@ -583,7 +586,7 @@ fn chaos_continues_without_tasks_or_idle_delays_and_retains_conversation_on_rest
     // requesting responses even when the model has not selected an activity.
     run_cycles_bounded(root.path(), 3);
     let first = state(root.path());
-    assert_eq!(first["activity_mode"], "chaos");
+    assert_eq!(first["activity_mode"], "type2");
     assert_eq!(first["cycle"], 3);
     assert!(first["current_task"].is_null());
     assert!(first["completed_tasks"].as_array().unwrap().is_empty());
@@ -611,7 +614,7 @@ fn chaos_continues_without_tasks_or_idle_delays_and_retains_conversation_on_rest
     assert!(
         requests[3]["messages"]
             .to_string()
-            .contains("CHAOS_OBSERVATION_0")
+            .contains("OBSERVATION_0")
     );
     for request in requests.iter() {
         let messages = request["messages"].to_string();
@@ -619,6 +622,9 @@ fn chaos_continues_without_tasks_or_idle_delays_and_retains_conversation_on_rest
         assert!(!messages.contains("toward the main goal"));
         assert!(!messages.contains("use set_task to select useful work"));
         assert!(!messages.contains("You are working toward an overall project goal"));
+        assert!(!messages.contains("activity_mode"));
+        assert!(!messages.to_lowercase().contains("type2"));
+        assert!(!messages.to_lowercase().contains("chaos"));
     }
 }
 
@@ -3970,7 +3976,7 @@ mod terminal_ui {
 
         let config: Value =
             serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
-        assert_eq!(config["activity_mode"], "chaos");
+        assert_eq!(config["activity_mode"], "type2");
         assert!(config["goal"].as_str().is_none_or(str::is_empty));
         assert!(config["checks"].as_array().unwrap().is_empty());
         assert_eq!(config["model"], "fake");

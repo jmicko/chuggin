@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum Mode {
     #[default]
     Goal,
+    #[serde(rename = "type2", alias = "chaos")]
     Chaos,
 }
 
@@ -19,5 +20,23 @@ impl Mode {
 
     pub fn is_chaos(self) -> bool {
         self == Self::Chaos
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Mode;
+
+    #[test]
+    fn neutral_identifier_preserves_existing_sessions_and_human_label() {
+        assert_eq!(serde_json::to_value(Mode::Chaos).unwrap(), "type2");
+        for name in ["type2", "chaos"] {
+            assert_eq!(
+                serde_json::from_value::<Mode>(serde_json::json!(name)).unwrap(),
+                Mode::Chaos
+            );
+        }
+        assert_eq!(serde_json::to_value(Mode::Goal).unwrap(), "goal");
+        assert_eq!(Mode::Chaos.label(), "No goals, only chaos");
     }
 }

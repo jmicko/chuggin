@@ -1330,11 +1330,18 @@ fn save_conversation(c: &Config, session: &Conversation) -> Result<()> {
     save(&c.state_dir.join("conversation.json"), session)
 }
 fn activity_context(c: &Config, s: &State) -> Value {
-    let mut context = json!({"activity_mode":c.activity_mode,"workspace":s.working_workspace,"configured_checks":c.checks,"instruction":crate::prompts::orient(c.activity_mode)});
+    let mut context = json!({"workspace":s.working_workspace,"configured_checks":c.checks,"instruction":crate::prompts::orient(c.activity_mode)});
     if !c.activity_mode.is_chaos() {
         context["main_goal"] = json!(if s.goal.is_empty() { &c.goal } else { &s.goal });
     }
     context
+}
+fn resumed_context(c: &Config, state: &State) -> Value {
+    if c.activity_mode.is_chaos() {
+        json!({"role":"user","content":json!({"workspace":state.working_workspace,"branch":state.working_branch,"head":state.branch_head,"instruction":"This is the same self-directed conversation without an assigned project goal. Existing files, observations, and any activity records are retained. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work. Recording tasks is optional; completed tasks may create normal commits. Decide what, if anything, to pursue next."}).to_string()})
+    } else {
+        json!({"role":"user","content":format!("Current overall goal: {}. Current visible project folder: {}. Branch: {}. HEAD: {}. Work directly here. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work; completed tasks may create normal commits.",c.goal,state.working_workspace.display(),state.working_branch,state.branch_head)})
+    }
 }
 fn finish_migration_handoff(session: &mut Conversation) {
     let Some(note) = session.migration_handoff.take() else {
@@ -1668,7 +1675,7 @@ fn recover_commands(
     }
     session.command_watch.diagnoses += 1;
     let id = session.command_watch.diagnoses;
-    let mut input = json!({"activity_mode":c.activity_mode,"goal":c.goal,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"checkpoint":s.working_ref,"observed_project_tree":current,"repetitions":session.command_watch.count,"command":session.command_watch.command,"recent_commands":session.command_watch.recent,"recent_activity_including_inspections":session.command_watch.activity,"latest_check_feedback":project::excerpt(&s.feedback,4000),"progress_note_metadata":{"note_task_id":session.note.task_id,"bytes":session.note.model_note.len(),"instruction":"Use read_progress_note only if needed. It may describe an earlier task; historical fixes are not evidence of progress during these repeated commands."},"instruction":"Determine whether this repeated work is justified. The project snapshot excludes ignored build outputs and cannot establish external side effects. Inspect evidence, then propose a concrete next action. The full main conversation has deliberately not been copied."});
+    let mut input = json!({"goal":c.goal,"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":s.completed_tasks.last(),"checkpoint":s.working_ref,"observed_project_tree":current,"repetitions":session.command_watch.count,"command":session.command_watch.command,"recent_commands":session.command_watch.recent,"recent_activity_including_inspections":session.command_watch.activity,"latest_check_feedback":project::excerpt(&s.feedback,4000),"progress_note_metadata":{"note_task_id":session.note.task_id,"bytes":session.note.model_note.len(),"instruction":"Use read_progress_note only if needed. It may describe an earlier task; historical fixes are not evidence of progress during these repeated commands."},"instruction":"Determine whether this repeated work is justified. The project snapshot excludes ignored build outputs and cannot establish external side effects. Inspect evidence, then propose a concrete next action. The full main conversation has deliberately not been copied."});
     if c.activity_mode.is_chaos() {
         input["goal"] = Value::Null;
         input["activity_context"] = json!(
@@ -2627,7 +2634,7 @@ fn work(
                         session.helper_links.insert(key, id.clone());
                         save_conversation(c, session)?;
                         let tree = working_tree(&root, &c.state_dir)?;
-                        let input = json!({"question":args["question"],"selected_evidence":args["evidence"],"activity_mode":c.activity_mode,"goal":if c.activity_mode.is_chaos() { Value::Null } else { json!(s.goal) },"task":s.current_task,"task_id":s.current_task.as_ref().map(|_|s.task_serial),"inspected_tree":tree,"active_nudge":crate::nudge::read(&c.state_dir)?.active,"task_evidence":session.note.context_at(s.current_task.as_ref().map(|_|s.task_serial),Some(&tree)),"running_commands":jobs.running_snapshots()?,"workspace":root,"config_path":config_path});
+                        let input = json!({"question":args["question"],"selected_evidence":args["evidence"],"goal":if c.activity_mode.is_chaos() { Value::Null } else { json!(s.goal) },"task":s.current_task,"task_id":s.current_task.as_ref().map(|_|s.task_serial),"inspected_tree":tree,"active_nudge":crate::nudge::read(&c.state_dir)?.active,"task_evidence":session.note.context_at(s.current_task.as_ref().map(|_|s.task_serial),Some(&tree)),"running_commands":jobs.running_snapshots()?,"workspace":root,"config_path":config_path});
                         crate::events::log(format!(
                             "Investigation {id}: {}",
                             project::excerpt(args["question"].as_str().unwrap_or(""), 160)
@@ -3070,11 +3077,7 @@ pub fn run_controlled_with_commands(
     if !unattached.is_empty() {
         session.messages.push(json!({"role":"user","content":json!({"unattached_commands":unattached,"instruction":"These saved command handles belong to a previous controller and are not reattached. Their execution status is unknown; inspect saved command logs and the current project before retrying. Do not assume they crashed or completed successfully, and do not send tools to retired handles."}).to_string()}));
     }
-    let resumed_context = if c.activity_mode.is_chaos() {
-        json!({"role":"user","content":json!({"activity_mode":c.activity_mode,"workspace":state.working_workspace,"branch":state.working_branch,"head":state.branch_head,"instruction":"This is the same self-directed conversation without an assigned project goal. Existing files, observations, and any activity records are retained. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work. Recording tasks is optional; completed tasks may create normal commits. Decide what, if anything, to pursue next."}).to_string()})
-    } else {
-        json!({"role":"user","content":format!("Current overall goal: {}. Current visible project folder: {}. Branch: {}. HEAD: {}. Work directly here. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work; completed tasks may create normal commits.",c.goal,state.working_workspace.display(),state.working_branch,state.branch_head)})
-    };
+    let resumed_context = resumed_context(&c, &state);
     if crate::groq::model_id(&c.model).is_some() && session.messages.len() >= 2 {
         // Groq's free request allowance cannot afford a second copy of a long goal.
         // Replace the pinned goal with current authoritative state when resuming.
@@ -3549,6 +3552,108 @@ mod conversation_tests {
             "output_tokens":1024,"implementation_calls":4,"retry_seconds":0
         }))
         .unwrap()
+    }
+
+    fn assert_no_mode_metadata(value: &impl Serialize) {
+        let text = serde_json::to_string(value).unwrap().to_lowercase();
+        for private_label in ["activity_mode", "type2", "chaos"] {
+            assert!(
+                !text.contains(private_label),
+                "New model context must not inject private mode metadata: {private_label}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_and_resumed_model_contexts_do_not_inject_mode_identifiers() {
+        for mode in [crate::activity::Mode::Goal, crate::activity::Mode::Chaos] {
+            let dir = tempfile::Builder::new()
+                .prefix("conversation-")
+                .tempdir()
+                .unwrap();
+            let mut c = chaos_config(dir.path());
+            c.activity_mode = mode;
+            if !mode.is_chaos() {
+                c.goal = "Investigate the provided sample".into();
+            }
+            fs::create_dir(&c.state_dir).unwrap();
+            let state = State {
+                activity_mode: mode,
+                goal: c.goal.clone(),
+                working_workspace: dir.path().into(),
+                working_ref: "existing-snapshot".into(),
+                ..State::default()
+            };
+            let session = load_conversation(&c, &state).unwrap();
+            assert_no_mode_metadata(&session.messages);
+            let loaded = load_conversation(&c, &state).unwrap();
+            assert_eq!(loaded.messages, session.messages);
+            assert_no_mode_metadata(&resumed_context(&c, &state));
+            if !mode.is_chaos() {
+                assert!(
+                    session.messages[1]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Investigate the provided sample")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn context_handoff_omits_private_mode_without_rewriting_historical_messages() {
+        let dir = tempfile::Builder::new()
+            .prefix("conversation-")
+            .tempdir()
+            .unwrap();
+        let c = chaos_config(dir.path());
+        fs::create_dir(&c.state_dir).unwrap();
+        let state = State {
+            activity_mode: c.activity_mode,
+            working_workspace: dir.path().into(),
+            working_ref: "existing-snapshot".into(),
+            ..State::default()
+        };
+        let mut session = load_conversation(&c, &state).unwrap();
+        let historical = json!({"role":"user","content":"Historical observation: {\"activity_mode\":\"chaos\"}; retain this original record."});
+        session.messages.push(historical.clone());
+        save_conversation(&c, &session).unwrap();
+        let mut loaded = load_conversation(&c, &state).unwrap();
+        assert_eq!(loaded.messages, session.messages);
+        assert_eq!(loaded.messages.last(), Some(&historical));
+        let resume = resumed_context(&c, &state);
+        assert_no_mode_metadata(&resume);
+        loaded.messages.push(resume);
+        let before_handoff = loaded.messages.clone();
+        refresh_conversation(
+            &c,
+            &state,
+            &mut loaded,
+            &c.state_dir,
+            "Repeated reasoning was archived",
+            false,
+        )
+        .unwrap();
+        assert_no_mode_metadata(&loaded.messages);
+        let archive: Conversation = serde_json::from_slice(
+            &fs::read(c.state_dir.join("conversation-before-refresh-0.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archive.messages, before_handoff);
+        assert!(archive.messages.contains(&historical));
+        // The runtime still retains its mode for resume/ownership checks.
+        assert!(
+            serde_json::to_value(&c)
+                .unwrap()
+                .get("activity_mode")
+                .is_some()
+        );
+        assert!(
+            serde_json::to_value(&state)
+                .unwrap()
+                .get("activity_mode")
+                .is_some()
+        );
     }
 
     #[test]
