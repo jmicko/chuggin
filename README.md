@@ -429,7 +429,8 @@ Messages and read receipts survive restarts outside the private computer.
 reply to, **F2** loads older messages, and **F3** returns to the latest page.
 Receipts mean fetched by the model or displayed in an active, focused Messages
 view, rather than agreement or understanding. A background or away terminal
-does not silently read mail. Exact and lightly reformatted duplicate model
+does not silently read mail. Terminals without focus reports require recent
+deliberate input; hovering the mouse is insufficient. Exact and lightly reformatted duplicate model
 messages return `already_sent`, including after restarting; changed facts and
 new human input allow a new message. This is conservative text matching, not
 semantic paraphrase detection. There is no arbitrary cap on unanswered mail.

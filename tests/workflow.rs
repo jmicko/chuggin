@@ -4686,7 +4686,7 @@ mod terminal_ui {
         );
         assert_eq!(doc["status"], "complete", "{doc}");
         assert_eq!(doc["result"]["content"]["text"], "Inside");
-        let fixture = r#"<!doctype html><title>Browser fixture</title><h1>Private browser fixture</h1><label>Name <input aria-label="Name"></label><button onclick="document.querySelector('output').textContent='Count '+(++window.count)">Count</button><select aria-label="Colour"><option value="red">Red</option><option value="blue">Blue</option></select><output>Count 0</output><script>window.count=0</script>"#;
+        let fixture = r#"<!doctype html><title>Browser fixture</title><h1>Private browser fixture</h1><label>Name <input aria-label="Name"></label><button onclick="document.querySelector('output').textContent='Count '+(++window.count)">Count</button><select aria-label="Colour"><option value="red">Red</option><option value="blue">Blue</option></select><output>Count 0</output><div role="option" aria-selected="false" onclick="this.setAttribute('aria-selected','true')">Custom choice</div><div role="checkbox" tabindex="0" aria-checked="false" onclick="this.setAttribute('aria-checked','true')">Custom checkbox</div><script>window.count=0</script>"#;
         assert_eq!(
             tool(
                 "write_file",
@@ -4759,6 +4759,29 @@ mod terminal_ui {
         );
         assert_eq!(selected["status"], "complete", "{selected}");
         assert_eq!(element(&selected["result"], "Colour")["value"], "blue");
+        page = selected["result"].clone();
+        let choice = element(&page, "Custom choice");
+        let chosen = tool(
+            "browser",
+            json!({"action":"click","tab_id":tab,"snapshot_id":page["snapshot_id"],"element_id":choice["id"]}),
+        );
+        assert_eq!(chosen["status"], "complete", "{chosen}");
+        assert_eq!(
+            element(&chosen["result"], "Custom choice")["aria_selected"],
+            "true"
+        );
+        page = chosen["result"].clone();
+        let checkbox = element(&page, "Custom checkbox");
+        assert_eq!(checkbox["aria_checked"], "false");
+        let checked = tool(
+            "browser",
+            json!({"action":"click","tab_id":tab,"snapshot_id":page["snapshot_id"],"element_id":checkbox["id"]}),
+        );
+        assert_eq!(checked["status"], "complete", "{checked}");
+        assert_eq!(
+            element(&checked["result"], "Custom checkbox")["aria_checked"],
+            "true"
+        );
         assert!(
             Command::new("podman")
                 .args([

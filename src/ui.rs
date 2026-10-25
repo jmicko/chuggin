@@ -964,6 +964,7 @@ struct Dashboard {
     chat: ChatPanel,
     messages: messages::MessagesPanel,
     focused: bool,
+    focus_known: bool,
     last_human_input: Option<Instant>,
     mailbox_button: Option<Rect>,
     entries: VecDeque<Entry>,
@@ -1032,6 +1033,7 @@ impl Dashboard {
             chat: ChatPanel::default(),
             messages: messages::MessagesPanel::default(),
             focused: false,
+            focus_known: false,
             last_human_input: None,
             mailbox_button: None,
             entries: VecDeque::new(),
@@ -1123,6 +1125,48 @@ impl Dashboard {
             "── New session · full diagnostic history remains in .chuggin/ ──".into(),
         );
         d
+    }
+    fn observe_input(&mut self, input: &Input) -> bool {
+        match input {
+            Input::FocusGained => {
+                self.focused = true;
+                self.focus_known = true;
+                return true;
+            }
+            Input::FocusLost => {
+                self.focused = false;
+                self.focus_known = true;
+                return true;
+            }
+            Input::Key(_) | Input::Paste(_) => {
+                self.last_human_input = Some(Instant::now());
+                self.focused = true;
+            }
+            Input::Mouse(m)
+                if matches!(
+                    m.kind,
+                    MouseEventKind::Down(_)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                        | MouseEventKind::ScrollLeft
+                        | MouseEventKind::ScrollRight
+                ) =>
+            {
+                self.last_human_input = Some(Instant::now());
+                if !self.focus_known {
+                    self.focused = true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+    fn reader_focused(&self) -> bool {
+        self.focused
+            && (self.focus_known
+                || self
+                    .last_human_input
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(30)))
     }
     fn restore_history(&mut self, dir: &Path) {
         match crate::observation_history::read(dir) {
@@ -2632,6 +2676,10 @@ fn dashboard_session(
     let rx = events::subscribe();
     crate::engine::foreground(Some(client.clone()));
     d.tab = initial_tab;
+    if initial_tab == 6 {
+        d.focused = true;
+        d.last_human_input = Some(Instant::now());
+    }
     let mut cursor = d.history_sequence;
     let mut sent_stop = false;
     let result = (|| -> Result<bool> {
@@ -2694,30 +2742,19 @@ fn dashboard_session(
             }
             d.messages.poll(&config.state_dir, false);
             draw(|f| render_dashboard(f, &mut d, &config, stop.load(Ordering::SeqCst)))?;
-            if d.tab == 6 && !d.help && d.nudge_edit.is_none() {
+            if d.tab == 6 && !d.help && d.nudge_edit.is_none() && !event::poll(Duration::ZERO)? {
+                let reader_focused = d.reader_focused();
                 d.messages.acknowledge(
                     &config.state_dir,
-                    d.focused,
+                    reader_focused,
                     d.last_human_input
                         .is_some_and(|t| t.elapsed() < Duration::from_secs(30)),
                     crate::communication::presence().status,
                 );
             }
             if let Some(e) = input()? {
-                match e {
-                    Input::FocusGained => {
-                        d.focused = true;
-                        continue;
-                    }
-                    Input::FocusLost => {
-                        d.focused = false;
-                        continue;
-                    }
-                    Input::Key(_) | Input::Mouse(_) | Input::Paste(_) => {
-                        d.last_human_input = Some(Instant::now());
-                        d.focused = true;
-                    }
-                    _ => {}
+                if d.observe_input(&e) {
+                    continue;
                 }
                 if desktop_requested(&e, d.desktop_button) && config.execution.is_private() {
                     if let Err(error) = crate::setup::view_private_desktop(Some(path)) {
@@ -3155,6 +3192,45 @@ pub fn busy<T: Send + 'static>(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    #[test]
+    fn passive_mouse_motion_cannot_reopen_an_unfocused_mailbox() {
+        let mut d = Dashboard::new(&config());
+        assert!(!d.reader_focused());
+        let key = Input::Key(event::KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE));
+        d.observe_input(&key);
+        assert!(d.reader_focused());
+        d.last_human_input = Some(Instant::now() - Duration::from_secs(31));
+        assert!(
+            !d.reader_focused(),
+            "Unknown focus requires recent deliberate input"
+        );
+        d.observe_input(&Input::FocusGained);
+        assert!(d.reader_focused());
+        d.observe_input(&Input::FocusLost);
+        let last = d.last_human_input;
+        let movement = Input::Mouse(event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 3,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        d.observe_input(&movement);
+        assert!(!d.reader_focused());
+        assert_eq!(d.last_human_input, last);
+        let scroll = Input::Mouse(event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 3,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        d.observe_input(&scroll);
+        assert!(
+            !d.reader_focused(),
+            "Scrolling an explicitly unfocused window must not fabricate a focus event"
+        );
+        d.observe_input(&Input::FocusGained);
+        assert!(d.reader_focused());
+    }
     #[test]
     fn home_keeps_messages_desktop_and_quit_visible_with_a_full_menu() {
         let items = [
