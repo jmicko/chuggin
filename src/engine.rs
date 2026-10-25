@@ -236,12 +236,27 @@ impl Client {
             .append(true)
             .open(&log_path)?;
         let log_offset = log.metadata()?.len();
-        let mut child = std::process::Command::new(std::env::current_exe()?)
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command
             .arg("engine")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .stderr(log.try_clone()?)
-            .spawn()?;
+            .stderr(log.try_clone()?);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // The controller outlives its viewer. Closing that viewer's PTY
+            // must not send a hangup to the background project owner.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command.spawn()?;
         serde_json::to_writer(
             child
                 .stdin
@@ -722,6 +737,11 @@ pub fn force_foreground() {
 
 /// Headless runs attach to the same owner as TUI and MCP.
 pub fn run(path: &Path, count: Option<u64>, stop: Arc<AtomicBool>) -> Result<()> {
+    let config = crate::runner::load(path)?;
+    if crate::sandbox::desktop_update_pending(&config) {
+        close_idle(path)?;
+        crate::sandbox::prepare(&config)?;
+    }
     let client = Client::connect(path)?;
     ensure!(
         client.request(json!({"action":"status"}))?["running"] != true,

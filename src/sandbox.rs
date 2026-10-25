@@ -1,6 +1,7 @@
 //! A private Linux computer. Only Podman's CLI and a read-only tool runtime are
 //! available to the host controller; no host home, config, or control socket is
 //! mounted into the computer. Missing/failed isolation never falls back to host.
+mod desktop;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -245,10 +246,20 @@ fn exec_base(t: &Target) -> Command {
         "--env",
         "HOME=/root",
         "--env",
+        "XDG_RUNTIME_DIR=/run/desktop",
+        "--env",
         "NO_PROXY=localhost,127.0.0.1,::1",
         "--env",
         "no_proxy=localhost,127.0.0.1,::1",
     ]);
+    if desktop::installed(t) {
+        cmd.args([
+            "--env",
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/desktop/bus",
+            "--env",
+            "PULSE_SERVER=unix:/run/desktop/pulse/native",
+        ]);
+    }
     if t.internet {
         for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
             cmd.args(["--env", &format!("{key}=http://127.0.0.1:3128")]);
@@ -412,7 +423,9 @@ pub fn tool(root: &Path, name: &str, args: &Value, art: &Path) -> Option<Result<
             let mut cmd = exec_base(&t);
             if name == "capture_screenshot" {
                 if args["list_windows"] == true {
-                    cmd.args(["timeout", "--kill-after=2", "8", "wmctrl", "-l"]);
+                    // Include application classes: untitled documents and
+                    // translated window titles alone do not identify their app.
+                    cmd.args(["timeout", "--kill-after=2", "8", "wmctrl", "-lx"]);
                     return Ok(String::from_utf8_lossy(&bounded(
                         cmd,
                         None,
@@ -603,6 +616,9 @@ pub fn customize_tools(tools: &mut Value) {
 }
 
 pub fn prepare(c: &crate::runner::Config) -> Result<()> {
+    ensure!(c.execution.is_private(), "No private computer selected");
+    // Setup changes an installation only while it owns the idle project.
+    let _ownership = crate::runner::lock_project(c)?;
     let information = info()?;
     c.execution.validate()?;
     let t = target(c)?;
@@ -610,16 +626,15 @@ pub fn prepare(c: &crate::runner::Config) -> Result<()> {
     stage_runtime(&t)?;
     let context = t.state.join("computer/build");
     fs::create_dir_all(&context)?;
-    fs::write(
-        context.join("Containerfile"),
-        include_str!("../assets/computer/Containerfile"),
-    )?;
-    fs::write(
-        context.join("start-desktop"),
-        include_str!("../assets/computer/start-desktop"),
-    )?;
+    for (name, contents) in COMPUTER_ASSETS {
+        fs::write(context.join(name), contents)?;
+    }
     let tag = image_tag();
-    if !podman().args(["image", "exists", &tag]).status()?.success() {
+    let exists = podman()
+        .args(["container", "exists", &t.name])
+        .status()?
+        .success();
+    if !exists && !podman().args(["image", "exists", &tag]).status()?.success() {
         let log = fs::File::create(t.state.join("computer/build.log"))?;
         let mut child = podman()
             .args(["build", "--tag", &tag, "--file"])
@@ -649,10 +664,6 @@ pub fn prepare(c: &crate::runner::Config) -> Result<()> {
         );
     }
     crate::sandbox_network::start(&t)?;
-    let exists = podman()
-        .args(["container", "exists", &t.name])
-        .status()?
-        .success();
     if !exists {
         let Settings::Podman {
             memory_mb,
@@ -705,28 +716,76 @@ pub fn prepare(c: &crate::runner::Config) -> Result<()> {
         cmd.arg(&tag);
         checked(cmd.output()?)?;
     }
-    validate_instance(
-        &t,
-        &serde_json::from_slice::<Value>(&run(&["inspect", &t.name])?)?[0],
-    )?;
+    let instance = serde_json::from_slice::<Value>(&run(&["inspect", &t.name])?)?[0].clone();
+    validate_instance(&t, &instance)?;
     start_checked(c, &t)?;
+    desktop::ensure(&t)?;
+    start_desktop_services(&t)?;
     crate::setup::save(
         &t.state.join("computer/ready.json"),
-        &json!({"name":t.name,"image":tag,"storage":information["store"]["graphRoot"]}),
+        &json!({"name":t.name,"image":instance["ImageName"].as_str().or(instance["Config"]["Image"].as_str()).unwrap_or(&tag),"storage":information["store"]["graphRoot"]}),
     )?;
     register(c)
 }
 
+const COMPUTER_ASSETS: &[(&str, &str)] = &[
+    (
+        "Containerfile",
+        include_str!("../assets/computer/Containerfile"),
+    ),
+    (
+        "desktop-packages",
+        include_str!("../assets/computer/desktop-packages"),
+    ),
+    (
+        "start-desktop",
+        include_str!("../assets/computer/start-desktop"),
+    ),
+    (
+        "start-session",
+        include_str!("../assets/computer/start-session"),
+    ),
+    (
+        "start-audio",
+        include_str!("../assets/computer/start-audio"),
+    ),
+];
+
+pub fn desktop_update_pending(c: &crate::runner::Config) -> bool {
+    c.execution.is_private()
+        && c.state_dir.join("computer/ready.json").exists()
+        && desktop::pending(c)
+}
+
+fn start_desktop_services(t: &Target) -> Result<()> {
+    let mut cmd = exec_base(t);
+    cmd.args(["/bin/sh", "/opt/session-runtime/start-session"]);
+    bounded(cmd, None, Duration::from_secs(75), 16000)
+        .context("Could not prepare the private desktop session and virtual audio")?;
+    Ok(())
+}
+
 fn image_tag() -> String {
     let mut hash = Sha256::new();
-    hash.update(include_bytes!("../assets/computer/Containerfile"));
-    hash.update(include_bytes!("../assets/computer/start-desktop"));
+    for (name, contents) in COMPUTER_ASSETS {
+        hash.update(name);
+        hash.update(b"\0");
+        hash.update(contents);
+    }
     let digest = format!("{:x}", hash.finalize());
     format!("localhost/chuggin-computer:desktop-{}", &digest[..16])
 }
 
 fn stage_runtime(t: &Target) -> Result<()> {
     fs::create_dir_all(&t.runtime)?;
+    for (name, contents) in COMPUTER_ASSETS
+        .iter()
+        .filter(|(name, _)| matches!(*name, "start-session" | "start-audio"))
+    {
+        let mut script = tempfile::NamedTempFile::new_in(&t.runtime)?;
+        script.write_all(contents.as_bytes())?;
+        script.persist(t.runtime.join(name))?;
+    }
     let binary = std::env::current_exe()?;
     copy_runtime(&binary, &t.runtime.join("tool-runner"))?;
     let output = Command::new("ldd").arg(&binary).output()?;
@@ -793,6 +852,9 @@ pub fn ready(c: &crate::runner::Config) -> Result<()> {
     )?;
     crate::sandbox_network::start(&t)?;
     start_checked(c, &t)?;
+    if desktop::installed(&t) {
+        start_desktop_services(&t)?;
+    }
     register(c)
 }
 

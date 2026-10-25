@@ -9,7 +9,7 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
 };
 thread_local! { static GUEST: Cell<bool> = const {Cell::new(false)}; }
 pub fn active() -> bool {
@@ -46,6 +46,7 @@ pub fn command(id: &str, argv: &[String]) -> Result<()> {
     enter()?;
     ensure!(!argv.is_empty(), "Empty command");
     let path = job_path(id)?;
+    enable_command_reaper()?;
     let mut cmd = Command::new(&argv[0]);
     #[cfg(unix)]
     {
@@ -60,13 +61,97 @@ pub fn command(id: &str, argv: &[String]) -> Result<()> {
         .stderr(Stdio::inherit())
         .spawn()?;
     fs::write(&path, child.id().to_string())?;
-    let status = child.wait()?;
+    let status = wait_for_command(&mut child);
     #[cfg(unix)]
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
+    #[cfg(target_os = "linux")]
+    {
+        let remaining = finish_command_children(std::time::Duration::from_secs(1));
+        if remaining > 0 {
+            eprintln!(
+                "Command cleanup: {remaining} descendant processes outlived the cleanup grace period. No additional process groups were stopped."
+            );
+        }
+    }
     let _ = fs::remove_file(path);
+    let status = status?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+fn enable_command_reaper() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // This worker owns one command. Adopt orphaned grandchildren here so
+        // older computers with an Xfce PID 1 do not accumulate their zombies.
+        let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        ensure!(
+            result == 0,
+            "Could not enable private-command child cleanup: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+fn wait_for_command(child: &mut Child) -> std::io::Result<ExitStatus> {
+    #[cfg(target_os = "linux")]
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        // Reap adopted children while a GUI is open, without consuming the
+        // managed child's status before std::process::Child can observe it.
+        reap_finished_children(Some(child.id() as libc::pid_t));
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    #[cfg(not(target_os = "linux"))]
+    child.wait()
+}
+
+#[cfg(target_os = "linux")]
+fn command_children(exclude: Option<libc::pid_t>) -> Vec<libc::pid_t> {
+    let mut children = Vec::new();
+    if let Ok(tasks) = fs::read_dir("/proc/self/task") {
+        for task in tasks.filter_map(std::result::Result::ok) {
+            if let Ok(pids) = fs::read_to_string(task.path().join("children")) {
+                children.extend(
+                    pids.split_whitespace()
+                        .filter_map(|pid| pid.parse::<libc::pid_t>().ok())
+                        .filter(|pid| *pid > 1 && Some(*pid) != exclude),
+                );
+            }
+        }
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
+}
+
+#[cfg(target_os = "linux")]
+fn reap_finished_children(exclude: Option<libc::pid_t>) {
+    for pid in command_children(exclude) {
+        loop {
+            let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if result >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn finish_command_children(grace: std::time::Duration) -> usize {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        reap_finished_children(None);
+        let remaining = command_children(None).len();
+        if remaining == 0 || std::time::Instant::now() >= deadline {
+            return remaining;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 pub fn serve() -> Result<()> {
     enter()?;
@@ -375,6 +460,132 @@ fn desktop(args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_command_cleanup_reaps_nested_children_without_waiting_on_escaped_work() {
+        // Subreaper is process-wide: isolate this test from the shared test
+        // runner and its other subprocesses.
+        let mut probe = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sandbox_guest::tests::private_command_reaper_probe",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CHUGGIN_PRIVATE_REAPER_PROBE", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if probe.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                panic!("Private child cleanup exceeded its test deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = probe.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "Subprocess helper for private-command cleanup; never set subreaper on the main test runner"]
+    fn private_command_reaper_probe() {
+        use std::{
+            os::unix::process::CommandExt,
+            time::{Duration, Instant},
+        };
+        assert_eq!(
+            std::env::var("CHUGGIN_PRIVATE_REAPER_PROBE").as_deref(),
+            Ok("1")
+        );
+        enable_command_reaper().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut managed = Command::new("sh");
+        managed
+            .args([
+                "-c",
+                r#"
+            sh -c 'sleep 2 & printf "%s\n" "$!" > "$PROBE_DIR/grandchild"; wait' &
+            printf '%s\n' "$!" > "$PROBE_DIR/intermediate"
+            while [ ! -s "$PROBE_DIR/grandchild" ]; do sleep 0.01; done
+            exit 7
+        "#,
+            ])
+            .env("PROBE_DIR", dir.path())
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = managed.spawn().unwrap();
+        let group = child.id() as libc::pid_t;
+        let status = wait_for_command(&mut child).unwrap();
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "The main command's status must not be consumed by orphan reaping"
+        );
+        let intermediate: libc::pid_t = fs::read_to_string(dir.path().join("intermediate"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            command_children(None).contains(&intermediate),
+            "The orphaned intermediate must be adopted by this command worker"
+        );
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+        assert_eq!(finish_command_children(Duration::from_secs(1)), 0);
+        assert_eq!(
+            unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+
+        let mut escaped = Command::new("sleep");
+        escaped
+            .arg("2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            escaped.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut escaped = escaped.spawn().unwrap();
+        let started = Instant::now();
+        assert_eq!(finish_command_children(Duration::from_millis(50)), 1);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(
+            escaped.try_wait().unwrap().is_none(),
+            "Cleanup must leave a live process outside the stopped command group alone"
+        );
+        escaped.kill().unwrap();
+        escaped.wait().unwrap();
+        assert_eq!(finish_command_children(Duration::from_secs(1)), 0);
+    }
     #[test]
     fn guest_files_use_absolute_paths_and_require_current_replacement_evidence() {
         std::thread::spawn(|| {

@@ -1,8 +1,11 @@
 FROM docker.io/library/debian:stable-slim
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps dbus-x11 xfce4-session xfce4-panel xfdesktop4 xfwm4 xfce4-terminal thunar xvfb x11-utils x11vnc novnc websockify imagemagick xdotool wmctrl mesa-utils libgl1-mesa-dri socat chromium file poppler-utils unzip ffmpeg && rm -rf /var/lib/apt/lists/*
-COPY start-desktop /usr/local/bin/start-desktop
-RUN chmod 755 /usr/local/bin/start-desktop
+COPY desktop-packages /tmp/desktop-packages
+RUN apt-get update && xargs -r apt-get install -y --no-install-recommends < /tmp/desktop-packages && rm -rf /var/lib/apt/lists/* /tmp/desktop-packages
+RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
+COPY start-desktop start-audio start-session /usr/local/bin/
+RUN chmod 755 /usr/local/bin/start-desktop /usr/local/bin/start-audio /usr/local/bin/start-session
 WORKDIR /root
-ENV HOME=/root DISPLAY=:1
-ENTRYPOINT ["/usr/local/bin/start-desktop"]
+ENV HOME=/root DISPLAY=:1 LANG=C.UTF-8
+ENV XDG_RUNTIME_DIR=/run/desktop DBUS_SESSION_BUS_ADDRESS=unix:path=/run/desktop/bus PULSE_SERVER=unix:/run/desktop/pulse/native
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start-desktop"]

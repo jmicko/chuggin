@@ -763,7 +763,7 @@ fn prepare_computer_interactive(path: Option<&Path>) -> Result<bool> {
             crate::engine::close_idle_interactive(path)?;
         }
         let result = crate::ui::busy(
-            "Setting up private computer · downloading/building desktop and verifying resource limits",
+            "Preparing private computer · checking desktop applications and resource limits",
             move || crate::sandbox::prepare(&c),
         );
         match result {
@@ -844,7 +844,10 @@ pub fn ensure_computer_interactive(path: &Path) -> Result<bool> {
     if !c.execution.is_private() {
         return Ok(true);
     }
-    if !crate::sandbox::installed() || !c.state_dir.join("computer/ready.json").exists() {
+    if !crate::sandbox::installed()
+        || !c.state_dir.join("computer/ready.json").exists()
+        || crate::sandbox::desktop_update_pending(&c)
+    {
         return prepare_computer_interactive(Some(path));
     }
     Ok(true)

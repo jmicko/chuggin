@@ -1,0 +1,71 @@
+#!/bin/sh
+# Share one private desktop session across the desktop and managed applications.
+set -eu
+export XDG_RUNTIME_DIR=/run/desktop
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/desktop/bus
+export PULSE_SERVER=unix:/run/desktop/pulse/native
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+if [ "${COMPUTER_SESSION_LOCKED:-0}" != 1 ]; then
+    # --close keeps daemon children from inheriting the preparation lock.
+    flock --close --wait 45 "$XDG_RUNTIME_DIR/session-start.lock" \
+        env COMPUTER_SESSION_LOCKED=1 /bin/sh "$0" || {
+        printf 'Private desktop session preparation failed or another preparation did not finish within 45 seconds.\n' >&2
+        exit 1
+    }
+    exit 0
+fi
+unset COMPUTER_SESSION_LOCKED
+
+bus_ready() {
+    timeout --kill-after=1 2 dbus-send --session --print-reply --reply-timeout=1000 \
+        --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus.ListNames >/dev/null 2>&1
+}
+
+if ! bus_ready; then
+    # Earlier images started Xfce with dbus-run-session. Reuse its bus, keeping
+    # running applications alive; do not replace the desktop to add packages.
+    if [ -L "$XDG_RUNTIME_DIR/bus" ]; then
+        rm -f "$XDG_RUNTIME_DIR/bus"
+    fi
+    if [ ! -e "$XDG_RUNTIME_DIR/bus" ]; then
+        for comm in /proc/[0-9]*/comm; do
+            [ -r "$comm" ] || continue
+            IFS= read -r process < "$comm" || continue
+            [ "$process" = xfce4-session ] || continue
+            environment="${comm%/comm}/environ"
+            [ -r "$environment" ] || continue
+            address=$(tr '\000' '\n' < "$environment" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | head -n 1)
+            case "$address" in
+                unix:path=*)
+                    path=${address#unix:path=}
+                    path=${path%%,*}
+                    if [ "$path" != "$XDG_RUNTIME_DIR/bus" ] && [ -S "$path" ]; then
+                        ln -s "$path" "$XDG_RUNTIME_DIR/bus"
+                        break
+                    fi
+                    ;;
+            esac
+        done
+    fi
+    if ! bus_ready; then
+        # /run is transient; a stopped computer can retain a dead socket inode.
+        if [ -S "$XDG_RUNTIME_DIR/bus" ] || [ -L "$XDG_RUNTIME_DIR/bus" ]; then
+            rm -f "$XDG_RUNTIME_DIR/bus"
+        elif [ -e "$XDG_RUNTIME_DIR/bus" ]; then
+            printf 'Cannot start private desktop: %s is not a session socket.\n' "$XDG_RUNTIME_DIR/bus" >&2
+            exit 1
+        fi
+        dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" \
+            --print-pid > "$XDG_RUNTIME_DIR/bus.pid" 2> "$XDG_RUNTIME_DIR/dbus.log" || {
+            printf 'Private desktop session bus failed. See %s/dbus.log.\n' "$XDG_RUNTIME_DIR" >&2
+            cat "$XDG_RUNTIME_DIR/dbus.log" >&2
+            exit 1
+        }
+        bus_ready || { printf 'Private desktop session bus did not become ready.\n' >&2; exit 1; }
+    fi
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+/bin/sh "$script_dir/start-audio"

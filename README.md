@@ -200,7 +200,12 @@ checks prerequisites, downloads/builds the desktop and verifies resource limits;
 there is no separate check or preparation step. It gives the model its own
 persistent Debian installation,
 starting in `/root`, with an Xfce desktop. It can use system directories and
-install applications such as GIMP or Blender. Host project files are not imported.
+install additional applications. The default desktop already includes LibreOffice
+Writer, Calc, Impress and Draw; GIMP; Inkscape; Audacity; Blender; Atril for PDFs;
+Mousepad; Xarchiver; and Parole, alongside Chromium and the file manager. Fonts,
+emoji, spellcheck, archive formats and desktop settings are included. Application
+inventory exposes what is installed without assigning an activity to the model.
+Host project files are not imported.
 Existing host sessions retain their environment; start a new session directory
 to use the private computer.
 
@@ -264,8 +269,20 @@ computer · keep its files** to stop it after finishing the loop and commands;
 resume/prepare starts it again. Conversation history and file-hash observations
 stay outside the container; these records are not backups of its contents.
 New installations reuse a desktop image identified by its embedded build assets;
-application-only updates do not rebuild that image. Existing installations keep
-their own files and image.
+application-only updates do not rebuild that image. Existing installations receive
+missing desktop applications on their next idle setup/resume, using their current
+container and files. A running controller must stop before installation can begin.
+Setup streams progress and saves `computer/desktop-apps.log` when packages are
+needed; it preserves existing configuration files and refuses package removals.
+It does not perform a full system upgrade. Completion is recorded outside the
+computer, so later starts respect applications the model deliberately removes.
+
+Audio applications have a private virtual output and loopback input for editing,
+playback and recording inside the computer. No host microphone, speaker or sound
+device is shared. The noVNC desktop viewer currently displays video only; it does
+not stream that private audio to the human browser. Desktop applications share
+one private session bus and clipboard. CPU/memory limits and software rendering
+remain configurable separately from the installed applications.
 
 Alongside tool-routing, isolation-policy and missing-dependency tests, a real
 rootless Podman integration test exercises setup, private file edits, screenshots,
@@ -465,10 +482,9 @@ The private Linux computer provides tools for more than editing source files:
   checks before replacement. They are not goals or automatically injected into
   context. The model chooses whether to use them.
 
-Fresh private computers include Chromium, Poppler and FFmpeg. Existing
-installations retain their files and packages; missing tools give an explicit
-installation command to run **inside the private computer**. Updating Chuggin
-does not change a running computer. Browser page interaction may continue while
+Private computers include Chromium, Poppler and FFmpeg as part of the desktop
+bundle. Updating Chuggin does not change a running computer; idle setup/resume
+adds any missing bundle packages while preserving its files. Browser page interaction may continue while
 an unrelated finite command runs; ordinary file mutations still follow the
 command ownership rules. The separate assistant must acquire editing ownership
 before controlling the browser, so it cannot race the loop.

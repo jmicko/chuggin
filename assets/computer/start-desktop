@@ -3,6 +3,8 @@ set -eu
 mkdir -p /run/session-jobs /run/desktop
 chmod 700 /run/session-jobs /run/desktop
 export XDG_RUNTIME_DIR=/run/desktop
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/desktop/bus
+export PULSE_SERVER=unix:/run/desktop/pulse/native
 export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
 if [ -S /run/public-web/public-web.sock ]; then
     socat TCP-LISTEN:3128,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/public-web/public-web.sock &
@@ -16,4 +18,5 @@ Xvfb :1 -screen 0 1440x900x24 -nolisten tcp &
 until xdpyinfo -display :1 >/dev/null 2>&1; do sleep 0.2; done
 x11vnc -display :1 -forever -shared -localhost -nopw -rfbport 5900 -quiet &
 websockify --web /usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900 &
-exec dbus-run-session -- xfce4-session
+/usr/local/bin/start-session
+exec xfce4-session

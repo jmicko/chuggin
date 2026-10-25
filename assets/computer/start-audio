@@ -1,0 +1,102 @@
+#!/bin/sh
+# Private audio only: no hardware discovery, host socket, or network listener.
+set -eu
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/desktop}"
+export PULSE_SERVER="unix:$XDG_RUNTIME_DIR/pulse/native"
+audio_dir="$XDG_RUNTIME_DIR/pulse"
+audio_log="$XDG_RUNTIME_DIR/audio.log"
+audio_pid=
+
+fail() {
+    printf 'Private desktop audio could not start: %s\n' "$1" >&2
+    if [ -f "$audio_log" ]; then
+        printf 'Audio diagnostics (%s):\n' "$audio_log" >&2
+        tail -n 40 "$audio_log" >&2
+    fi
+    if [ -n "$audio_pid" ]; then
+        kill "$audio_pid" 2>/dev/null || :
+        wait "$audio_pid" 2>/dev/null || :
+    fi
+    exit 1
+}
+
+for program in pulseaudio pactl timeout; do
+    command -v "$program" >/dev/null 2>&1 || fail "Missing $program; install pulseaudio and pulseaudio-utils inside this computer."
+done
+mkdir -p "$audio_dir"
+chmod 700 "$XDG_RUNTIME_DIR" "$audio_dir"
+
+# An older desktop may already have started PulseAudio with its auto_null
+# fallback. Add this computer's virtual devices to that server, rather than
+# replacing it and interrupting applications that already have audio streams.
+has_device() {
+    devices=$(timeout --kill-after=1 2 pactl list short "$1" 2>> "$audio_log") || fail "Cannot inspect the private audio devices."
+    printf '%s\n' "$devices" | awk -v target="$2" '$2 == target { found = 1 } END { exit !found }'
+}
+
+ensure_virtual_devices() {
+    old_sink=$(timeout --kill-after=1 2 pactl get-default-sink 2>> "$audio_log") || fail "Cannot inspect the current audio output."
+    old_source=$(timeout --kill-after=1 2 pactl get-default-source 2>> "$audio_log") || fail "Cannot inspect the current audio input."
+    added_sink=no
+    if ! has_device sinks desktop; then
+        timeout --kill-after=1 3 pactl load-module module-null-sink \
+            sink_name=desktop channels=2 rate=48000 \
+            "sink_properties=\"device.description='Private desktop output'\"" >> "$audio_log" 2>&1 || fail "Cannot add the private virtual output to the existing sound server."
+        added_sink=yes
+    fi
+    if ! has_device sources desktop_input; then
+        timeout --kill-after=1 3 pactl load-module module-remap-source \
+            master=desktop.monitor source_name=desktop_input \
+            "source_properties=\"device.description='Private desktop loopback'\"" >> "$audio_log" 2>&1 || fail "Cannot add the private loopback input to the existing sound server."
+    fi
+    # Select our defaults only when introducing the output to a server that
+    # previously had no usable device. Later deliberate routing stays intact,
+    # even if the user selects auto_null after our devices have been created.
+    if [ "$added_sink" = yes ]; then
+        case "$old_sink" in
+            auto_null|'@NONE@'|'')
+                timeout --kill-after=1 2 pactl set-default-sink desktop >> "$audio_log" 2>&1 || fail "Cannot select the private virtual output."
+                ;;
+        esac
+        case "$old_source" in
+            auto_null.monitor|'@NONE@'|'')
+                timeout --kill-after=1 2 pactl set-default-source desktop_input >> "$audio_log" 2>&1 || fail "Cannot select the private loopback input."
+                ;;
+        esac
+    fi
+}
+
+# Repeated preparation keeps the same server and the session's chosen routing.
+# PULSE_SERVER always names this private socket, never a host audio service.
+if timeout --kill-after=1 2 pactl info >/dev/null 2>&1; then
+    ensure_virtual_devices
+    exit 0
+fi
+
+cat > "$audio_dir/server.pa" <<EOF
+.fail
+load-module module-null-sink sink_name=desktop channels=2 rate=48000 sink_properties="device.description='Private desktop output'"
+load-module module-remap-source master=desktop.monitor source_name=desktop_input source_properties="device.description='Private desktop loopback'"
+set-default-sink desktop
+set-default-source desktop_input
+load-module module-native-protocol-unix socket=$audio_dir/native auth-anonymous=1
+EOF
+
+# Keep the server in the container's process tree. A minimal script avoids
+# physical sound-card discovery and optional host/session integration modules.
+pulseaudio --daemonize=no --exit-idle-time=-1 --use-pid-file=no \
+    --high-priority=no --realtime=no --fail=yes \
+    --log-target=stderr -n --file="$audio_dir/server.pa" > "$audio_log" 2>&1 &
+audio_pid=$!
+deadline=$(($(date +%s) + 10))
+while ! timeout --kill-after=1 1 pactl info >/dev/null 2>&1; do
+    kill -0 "$audio_pid" 2>/dev/null || fail "The private PulseAudio server exited."
+    [ "$(date +%s)" -lt "$deadline" ] || fail "The private audio socket did not become ready within 10 seconds."
+    sleep 0.1
+done
+
+sink=$(timeout --kill-after=1 2 pactl get-default-sink) || fail "Cannot inspect the virtual output."
+source=$(timeout --kill-after=1 2 pactl get-default-source) || fail "Cannot inspect the virtual input."
+[ "$sink" = desktop ] || fail "The virtual output was not selected."
+[ "$source" = desktop_input ] || fail "The loopback input was not selected."

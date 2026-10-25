@@ -960,6 +960,9 @@ fn private_tools_and_commands_never_fall_back_to_the_host() {
     )
     .unwrap();
     fs::write(computer.join("ready.json"), "{}").unwrap();
+    // This fixture exercises routing, not package installation. Its isolated
+    // fake computer already represents the current desktop bundle.
+    fs::write(computer.join("desktop-apps.json"),json!({"name":name,"revision":format!("{:x}",Sha256::digest(include_bytes!("../assets/computer/desktop-packages")))}).to_string()).unwrap();
     let inspect = json!([{"Config":{"Labels":{"io.chuggin.session":name}},
         "HostConfig":{"Privileged":false,"NetworkMode":"none","SecurityOpt":["no-new-privileges"]},
         "Mounts":[{"Source":runtime,"Destination":"/opt/session-runtime","RW":false},
@@ -3746,6 +3749,13 @@ mod terminal_ui {
             ui.send(b"jjjjjj\r");
             ui.wait("PROJECT CHAT");
             if turn == 1 {
+                assert!(
+                    !root
+                        .path()
+                        .join("state/operator/interrupted-controller.json")
+                        .exists(),
+                    "Closing the previous terminal must not kill its background controller"
+                );
                 ui.wait("Hello from project chat");
             }
             ui.send(if turn == 0 {
@@ -3776,6 +3786,7 @@ mod terminal_ui {
             });
             ui.wait("Hello from project chat");
             assert!(!root.path().join("state/state.json").exists());
+            ui.wait("Loop stopped. Chat available.");
             ui.send(b"\t\t");
             ui.wait("Run saved");
             ui.send(b"\r");
@@ -4543,6 +4554,7 @@ mod terminal_ui {
             Ok("1")
         );
         use sha2::{Digest, Sha256};
+        use std::time::Instant;
         let server = Server::custom(false, false, None, |_, _| {
             ("Waiting for the human test.".into(), json!([]))
         });
@@ -4587,7 +4599,7 @@ mod terminal_ui {
         ui.send(b"jjjjjjjjjj\r");
         ui.wait("Where should this session run?");
         ui.send(b"\r");
-        ui.wait_for("More project settings", Duration::from_secs(600));
+        ui.wait_for("More project settings", Duration::from_secs(1800));
         assert!(server.requests.lock().unwrap().is_empty());
         assert!(root.path().join("state/computer/ready.json").exists());
         ui.send(b"\x1b");
@@ -4660,10 +4672,71 @@ mod terminal_ui {
         assert_ne!(hidden["status"], "complete", "{hidden}");
         assert!(!hidden.to_string().contains("PRIVATE_HOST_CANARY"));
         assert!(!repo.join("probe.txt").exists());
-        let info = tool("computer_info", json!({}));
+        let info = tool("computer_info", json!({"limit":100}));
+        let init = Command::new("podman")
+            .args(["--remote=false", "exec", &computer.0, "cat", "/proc/1/comm"])
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&init.stdout).trim(),
+            "tini",
+            "New desktops must reap orphaned GUI processes"
+        );
         assert_eq!(info["status"], "complete", "{info}");
         for capability in ["browser", "pdf_text", "media_metadata"] {
             assert_eq!(info["result"]["capabilities"][capability], true, "{info}");
+        }
+        let mut applications = info["result"]["applications"].as_array().unwrap().clone();
+        let mut next = info["result"]["next_offset"].as_u64();
+        while let Some(offset) = next {
+            let page = tool("computer_info", json!({"offset":offset,"limit":100}));
+            assert_eq!(page["status"], "complete", "{page}");
+            applications.extend(
+                page["result"]["applications"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .cloned(),
+            );
+            next = page["result"]["next_offset"].as_u64();
+            assert!(
+                next.is_none_or(|n| n > offset),
+                "Application paging did not advance: {page}"
+            );
+        }
+        assert_eq!(
+            applications.len() as u64,
+            info["result"]["application_count"].as_u64().unwrap()
+        );
+        let desktop_app = |needle: &str| {
+            applications
+                .iter()
+                .find(|app| {
+                    format!(
+                        "{} {}",
+                        app["id"].as_str().unwrap_or(""),
+                        app["name"].as_str().unwrap_or("")
+                    )
+                    .to_ascii_lowercase()
+                    .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("Missing desktop application {needle}: {applications:?}"))
+        };
+        for needle in [
+            "writer",
+            "calc",
+            "impress",
+            "gimp",
+            "inkscape",
+            "audacity",
+            "blender",
+            "atril",
+            "mousepad",
+            "xarchiver",
+            "parole",
+        ] {
+            desktop_app(needle);
         }
         let application = info["result"]["applications"]
             .as_array()
@@ -4679,6 +4752,81 @@ mod terminal_ui {
                 .as_array()
                 .unwrap()
                 .is_empty()
+        );
+        let windows = || {
+            let listing = tool("capture_screenshot", json!({"list_windows":true}));
+            assert_eq!(listing["status"], "complete", "{listing}");
+            listing["result"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .filter_map(|line| {
+                    line.split_whitespace()
+                        .next()
+                        .map(|id| (id.to_owned(), line.to_owned()))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        for (needle, title) in [
+            ("mousepad", "mousepad"),
+            ("writer", "libreoffice"),
+            ("gimp", "gimp"),
+            ("audacity", "audacity"),
+            ("blender", "blender"),
+        ] {
+            let before = windows();
+            let application = desktop_app(needle);
+            let resolved = tool(
+                "application_command",
+                json!({"application_id":application["id"]}),
+            );
+            assert_eq!(resolved["status"], "complete", "{needle}: {resolved}");
+            let launched = tool("run_command", resolved["result"]["run_command"].clone());
+            assert_eq!(launched["status"], "complete", "{needle}: {launched}");
+            let command = launched["result"]["command_id"].clone();
+            let deadline = Instant::now() + Duration::from_secs(45);
+            let window = loop {
+                let visible = windows();
+                if let Some((id, _)) = visible.iter().find(|(id, line)| {
+                    !before.contains_key(*id) && line.to_ascii_lowercase().contains(title)
+                }) {
+                    break id.clone();
+                }
+                let status = tool(
+                    "command_status",
+                    json!({"command_id":command,"wait_ms":200}),
+                );
+                assert_eq!(status["status"], "complete", "{needle}: {status}");
+                assert_eq!(
+                    status["result"]["running"], true,
+                    "{needle} exited before showing its window: {status}"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "{needle} did not show its editor window: {visible:?}; command {status}"
+                );
+                thread::sleep(Duration::from_millis(100));
+            };
+            let status = tool("command_status", json!({"command_id":command,"wait_ms":0}));
+            assert_eq!(status["result"]["running"], true, "{needle}: {status}");
+            let capture = tool("capture_screenshot", json!({"window_id":window}));
+            assert_eq!(capture["status"], "complete", "{needle}: {capture}");
+            assert!(
+                capture["result"]["source_width"].as_u64().unwrap() > 0,
+                "{needle}: {capture}"
+            );
+            let stopped = tool(
+                "stop_command",
+                json!({"command_id":command,"reason":format!("Finished checking the {needle} desktop window")}),
+            );
+            assert_eq!(stopped["status"], "complete", "{needle}: {stopped}");
+            assert_ne!(stopped["result"]["running"], true, "{needle}: {stopped}");
+        }
+        let reaped=Command::new("podman").args(["--remote=false","exec",&computer.0,"sh","-c","for attempt in 1 2 3 4 5 6 7 8 9 10; do if ! ps -eo stat= | grep -q '^Z'; then exit 0; fi; sleep 0.2; done; ps -eo pid,ppid,stat,comm; exit 1"]).output().unwrap();
+        assert!(
+            reaped.status.success(),
+            "Closed GUI applications left zombie processes: {}",
+            String::from_utf8_lossy(&reaped.stdout)
         );
         let doc = tool(
             "inspect_document",
@@ -4880,6 +5028,125 @@ mod terminal_ui {
                 json!({"summary":"Checked private files and desktop"})
             )["status"],
             "complete"
+        );
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        ui.send(b"q");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        let original_id = Command::new("podman")
+            .args([
+                "--remote=false",
+                "container",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                &computer.0,
+            ])
+            .output()
+            .unwrap();
+        assert!(original_id.status.success());
+        let removed = Command::new("podman")
+            .args([
+                "--remote=false",
+                "exec",
+                "--env",
+                "DEBIAN_FRONTEND=noninteractive",
+                &computer.0,
+                "timeout",
+                "--kill-after=2",
+                "60",
+                "apt-get",
+                "remove",
+                "-y",
+                "mousepad",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            removed.status.success(),
+            "Failed removing Mousepad in the disposable computer: {} {}",
+            String::from_utf8_lossy(&removed.stdout),
+            String::from_utf8_lossy(&removed.stderr)
+        );
+        assert!(
+            !Command::new("podman")
+                .args([
+                    "--remote=false",
+                    "exec",
+                    &computer.0,
+                    "sh",
+                    "-c",
+                    "command -v mousepad"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::remove_file(root.path().join("state/computer/desktop-apps.json")).unwrap();
+        let mut ui = TerminalProcess::start_with_environment(root.path(), &[("PATH", &path)]);
+        ui.wait("Resume project");
+        ui.send(b"\r");
+        ui.wait_for("LIVE", Duration::from_secs(1800));
+        ui.send(b"p");
+        ui.wait("CYCLE PAUSED");
+        assert!(
+            root.path()
+                .join("state/computer/desktop-apps.json")
+                .is_file()
+        );
+        assert!(
+            Command::new("podman")
+                .args([
+                    "--remote=false",
+                    "exec",
+                    &computer.0,
+                    "sh",
+                    "-c",
+                    "command -v mousepad"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let retained = Command::new("podman")
+            .args([
+                "--remote=false",
+                "exec",
+                &computer.0,
+                "cat",
+                "/root/probe.txt",
+            ])
+            .output()
+            .unwrap();
+        assert!(retained.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&retained.stdout),
+            "Inside the private computer"
+        );
+        let current_id = Command::new("podman")
+            .args([
+                "--remote=false",
+                "container",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                &computer.0,
+            ])
+            .output()
+            .unwrap();
+        assert!(current_id.status.success());
+        assert_eq!(
+            current_id.stdout, original_id.stdout,
+            "Upgrade replaced the existing computer"
+        );
+        assert_eq!(fs::read_to_string(&canary).unwrap(), "PRIVATE_HOST_CANARY");
+        let upgrade_log =
+            fs::read_to_string(root.path().join("state/computer/desktop-apps.log")).unwrap();
+        assert!(
+            upgrade_log.contains("mousepad"),
+            "The real package repair did not appear in its diagnostic log"
         );
         ui.send(b"\x03");
         ui.wait("Run saved");
