@@ -94,6 +94,7 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             .into(),
             "Project settings".into(),
             "Global settings".into(),
+            "Quit".into(),
         ];
         let root = effective
             .as_ref()
@@ -137,6 +138,9 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
         let Some(choice) = crate::ui::home_select(&items, &root, model, &status)? else {
             return Ok(());
         };
+        if items[choice] == "Quit" {
+            return Ok(());
+        }
         let action: Result<()> = (|| {
             match choice {
                 0 => {

@@ -3650,7 +3650,7 @@ mod terminal_ui {
         ui.home();
         ui.wait("Resume project");
         ui.wait("fake");
-        ui.send(b"q");
+        ui.choose("Quit");
         ui.restored();
         config["model"] = json!("fake");
         let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();

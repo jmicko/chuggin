@@ -922,8 +922,8 @@ $XDG_CONFIG_HOME/chuggin/settings.json. Project-local chuggin.json contains the 
 goal, repository, checks, and state location. Project overrides take precedence;
 shared settings are reloaded when starting a run.
 
-The welcome screen has three entries: **Resume project** (or **Set up this
-project**), **Project settings**, and **Global settings**. Press Esc or Q to quit.
+The welcome screen has four entries: **Resume project** (or **Set up this
+project**), **Project settings**, **Global settings**, and **Quit**. Esc or Q also quits.
 After first-time setup, a success screen confirms that settings are saved and
 returns to the welcome screen after three seconds; Enter skips the countdown.
 Setup does not start the loop.

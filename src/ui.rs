@@ -236,6 +236,7 @@ fn splash(
                         "Resume project" => "Continue saved work",
                         "Project settings" => "Goal, model, schedule, and project tools",
                         "Global settings" => "Shared connections and defaults",
+                        "Quit" => "Return to your shell",
                         _ => "",
                     })
                     .fg(MUTED),
@@ -3273,8 +3274,14 @@ mod tests {
         assert!(d.reader_focused());
     }
     #[test]
-    fn home_shows_only_the_three_main_categories_at_common_terminal_sizes() {
-        let items = ["Resume project", "Project settings", "Global settings"].map(str::to_owned);
+    fn home_shows_main_categories_and_quit_at_common_terminal_sizes() {
+        let items = [
+            "Resume project",
+            "Project settings",
+            "Global settings",
+            "Quit",
+        ]
+        .map(str::to_owned);
         for (width, height) in [(110, 36), (80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
@@ -3814,10 +3821,15 @@ mod tests {
     #[test]
     fn renders_splash_and_live_dashboard_at_multiple_sizes() {
         let c = config();
-        let items = vec!["Resume project", "Project settings", "Global settings"]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>();
+        let items = vec![
+            "Resume project",
+            "Project settings",
+            "Global settings",
+            "Quit",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
         for (w, h) in [(120, 40), (100, 30), (70, 24), (46, 14), (25, 8)] {
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             t.draw(|f| {
