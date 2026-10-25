@@ -840,7 +840,7 @@ fn chaos_accepts_silent_responses_across_intervals_and_cold_resume() {
 }
 
 #[test]
-fn goal_recovers_repeated_empty_responses_without_losing_or_replaying_work() {
+fn goal_continues_empty_responses_without_resetting_history_or_replaying_work() {
     let server = Server::custom(false, false, None, |_, n| match n {
         0 => (
             String::new(),
@@ -867,7 +867,8 @@ fn goal_recovers_repeated_empty_responses_without_losing_or_replaying_work() {
     // The streak and current task survive a cold restart.
     run_cycles_bounded(root.path(), 1);
     assert!(
-        root.path()
+        !root
+            .path()
             .join("state/cycle-000003/conversation-before-refresh-0.json")
             .exists()
     );
@@ -876,24 +877,18 @@ fn goal_recovers_repeated_empty_responses_without_losing_or_replaying_work() {
     run_cycles_bounded(root.path(), 1);
     let requests = server.requests.lock().unwrap();
     assert_eq!(requests.len(), 6);
-    assert!(
-        !requests[4]["messages"]
-            .to_string()
-            .contains("The provider ended its last response")
+    assert_eq!(
+        requests[4]["messages"].as_array().unwrap().last().unwrap()["content"],
+        "Continue the current task from the existing files and observations. Report your next finding or use the tools to inspect what you need."
     );
     assert!(
         requests[4]["messages"]
             .to_string()
             .contains("Refine the saved material")
     );
-    let archived: Value = serde_json::from_slice(
-        &fs::read(
-            root.path()
-                .join("state/cycle-000003/conversation-before-refresh-0.json"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
+    let archived: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
+            .unwrap();
     assert_eq!(
         archived["messages"]
             .as_array()
@@ -4399,7 +4394,7 @@ mod terminal_ui {
             serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
         assert_eq!(config["execution"]["kind"], "podman");
         ui.send(b"\r");
-        ui.wait("Prepare or start private computer");
+        ui.wait("Podman not installed");
         ui.send(b"\x1b");
         ui.wait("Resume project");
         ui.send(b"q");
@@ -4410,6 +4405,204 @@ mod terminal_ui {
         for call in fs::read_to_string(log).unwrap().lines() {
             assert_eq!(call, "--remote=false --version");
         }
+    }
+
+    #[test]
+    fn empty_reply_backoff_can_be_retried_manually_without_resetting_context() {
+        let server = Server::custom(false, false, None, |_, n| {
+            if n == 0 {
+                (String::new(), json!([]))
+            } else {
+                ("The conversation continued.".into(), json!([]))
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let config = fixture(root.path(), &server.url, true);
+        let mut value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        value["retry_seconds"] = json!(600);
+        fs::write(&config, value.to_string()).unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"\r");
+        ui.wait("keeping conversation history");
+        ui.send(b"t");
+        ui.wait_until("manual retry reached the provider", || {
+            server.requests.lock().unwrap().len() >= 2
+        });
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(
+            requests[1]["messages"].as_array().unwrap().last().unwrap()["content"],
+            "Continue the current task from the existing files and observations. Report your next finding or use the tools to inspect what you need."
+        );
+        drop(requests);
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        ui.send(b"q");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        assert!(
+            !root
+                .path()
+                .join("state/cycle-000001/conversation-before-refresh-0.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    #[ignore = "Requires Podman and the desktop image; creates and removes an isolated test computer"]
+    fn real_private_computer_setup_files_and_desktop() {
+        assert_eq!(
+            std::env::var("CHUGGIN_REAL_PODMAN_TEST").as_deref(),
+            Ok("1")
+        );
+        use sha2::{Digest, Sha256};
+        let server = Server::custom(false, false, None, |_, _| {
+            ("Waiting for the human test.".into(), json!([]))
+        });
+        let root = tempfile::tempdir().unwrap();
+        let config = chaos_fixture(root.path(), &server.url);
+        let mut value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        value["execution"] = json!({"kind":"podman"});
+        fs::write(&config, value.to_string()).unwrap();
+        let repo = fs::canonicalize(root.path().join("repo")).unwrap();
+        let hash = format!("{:x}", Sha256::digest(repo.as_os_str().as_encoded_bytes()));
+        struct Computer(String);
+        impl Drop for Computer {
+            fn drop(&mut self) {
+                let _ = Command::new("podman")
+                    .args(["--remote=false", "rm", "--force", "--time=0", &self.0])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+        let computer = Computer(format!("chuggin-{}", &hash[..24]));
+        let canary = root.path().join("host-only.txt");
+        fs::write(&canary, "PRIVATE_HOST_CANARY").unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"\r");
+        ui.wait("Set up now (recommended)");
+        ui.send(b"\r");
+        ui.wait("Private computer ready");
+        ui.send(b"\r");
+        ui.wait("LIVE");
+        ui.send(b"p");
+        ui.wait("CYCLE PAUSED");
+        let runtime = root.path().join(".chuggin/global/chuggin/runtime");
+        let socket = fs::read_dir(runtime)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|s| s == "sock"))
+            .unwrap();
+        let rpc = |v: Value| -> Value {
+            use std::os::unix::net::UnixStream;
+            let mut s = UnixStream::connect(&socket).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(65))).unwrap();
+            writeln!(s, "{v}").unwrap();
+            let mut line = String::new();
+            BufReader::new(s).read_line(&mut line).unwrap();
+            let reply: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(reply["ok"], true, "{reply}");
+            reply["result"].clone()
+        };
+        let session = rpc(json!({"action":"open_session"}))["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let serial = AtomicUsize::new(0);
+        let tool = |name: &str, args: Value| {
+            rpc(
+                json!({"action":"call","session_id":session,"name":name,"arguments":args,"operation_id":format!("desktop-test-{}",serial.fetch_add(1,Ordering::SeqCst))}),
+            )
+        };
+        assert_eq!(tool("begin_edit", json!({}))["result"]["granted"], true);
+        let written = tool(
+            "write_file",
+            json!({"path":"/root/probe.txt","content":"Inside the private computer"}),
+        );
+        assert_eq!(written["status"], "complete", "{written}");
+        let read = tool("read_file", json!({"path":"/root/probe.txt"}));
+        assert!(
+            read.to_string().contains("Inside the private computer"),
+            "{read}"
+        );
+        let hidden = tool("read_file", json!({"path":canary}));
+        assert_ne!(hidden["status"], "complete", "{hidden}");
+        assert!(!hidden.to_string().contains("PRIVATE_HOST_CANARY"));
+        assert!(!repo.join("probe.txt").exists());
+        assert!(
+            Command::new("podman")
+                .args([
+                    "--remote=false",
+                    "exec",
+                    "--env",
+                    "DISPLAY=:1",
+                    &computer.0,
+                    "timeout",
+                    "20",
+                    "sh",
+                    "-c",
+                    "until xdpyinfo >/dev/null 2>&1; do sleep 0.2; done"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let movement = tool("desktop_action", json!({"action":"move","x":250,"y":200}));
+        assert_eq!(movement["status"], "complete", "{movement}");
+        let screenshot = tool("capture_screenshot", json!({}));
+        assert_eq!(screenshot["status"], "complete", "{screenshot}");
+        assert_eq!(screenshot["result"]["source_width"], 1440);
+        if let Ok(destination) = std::env::var("CHUGGIN_SANDBOX_SCREENSHOT") {
+            fs::copy(
+                screenshot["result"]["_chuggin_images"][0]["path"]
+                    .as_str()
+                    .unwrap(),
+                destination,
+            )
+            .unwrap();
+        }
+        let web = Command::new("podman")
+            .args([
+                "--remote=false",
+                "exec",
+                &computer.0,
+                "curl",
+                "--max-time",
+                "10",
+                "--proxy",
+                "http://127.0.0.1:3128",
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "http://127.0.0.1/",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&web.stdout),
+            "403",
+            "{}",
+            String::from_utf8_lossy(&web.stderr)
+        );
+        assert_eq!(
+            tool(
+                "end_edit",
+                json!({"summary":"Checked private files and desktop"})
+            )["status"],
+            "complete"
+        );
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        ui.send(b"q");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
     }
 
     #[test]

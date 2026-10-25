@@ -208,6 +208,50 @@ fn info() -> Result<Value> {
     );
     Ok(v)
 }
+
+pub fn prerequisite_report() -> Result<String> {
+    let v = info()?;
+    let controllers = v["host"]["cgroupControllers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    Ok(format!(
+        "Podman {}\n✓ Rootless containers enabled\n✓ Linux cgroup v2 available\nSession manager: {}\nReported controllers: {}\n\nChuggin configures CPU, memory and process limits itself and verifies them inside the new computer. Controllers can become available when a limited container starts. You do not need to configure resource limits manually.\n\nNext: choose Set up private computer. Chuggin will download/build the desktop, create its isolated installation, and check that it works. This does not start the model.",
+        v["version"]["Version"].as_str().unwrap_or("detected"),
+        v["host"]["cgroupManager"].as_str().unwrap_or("unknown"),
+        controllers
+    ))
+}
+
+pub fn repair_commands(error: &str) -> Option<String> {
+    let e = error.to_lowercase();
+    let release = fs::read_to_string("/etc/os-release").unwrap_or_default();
+    if (e.contains("newuidmap") || e.contains("newgidmap"))
+        && install_command("linux", &release) == Some("sudo apt install podman")
+    {
+        return Some("sudo apt install uidmap".into());
+    }
+    if e.contains("controller")
+        && (e.contains("not available") || e.contains("delegate") || e.contains("not enforce"))
+    {
+        return Some("sudo mkdir -p /etc/systemd/system/user@.service.d\nprintf '[Service]\\nDelegate=cpu cpuset io memory pids\\n' | sudo tee /etc/systemd/system/user@.service.d/90-chuggin-delegation.conf\nsudo systemctl daemon-reload\n# Save your work, then log out and back in before checking again.".into());
+    }
+    None
+}
+
+pub fn setup_error(error: &anyhow::Error) -> String {
+    let detail = format!("{error:#}");
+    let next=repair_commands(&detail).map(|cmd|format!("Suggested commands (not run):\n\n{cmd}")).unwrap_or_else(||
+        "No automatic host configuration change was made. The exact error is shown above. You can inspect Podman's environment with:\n\npodman --remote=false info --debug\n\nDesktop build errors are recorded in the session's computer/build.log.".into());
+    format!(
+        "Private computer setup could not finish:\n\n{detail}\n\n{next}\n\nRootless setup reference: https://github.com/containers/podman/blob/main/troubleshooting.md"
+    )
+}
 fn exec_base(t: &Target) -> Command {
     let mut cmd = podman();
     cmd.args([
@@ -566,13 +610,27 @@ pub fn prepare(c: &crate::runner::Config) -> Result<()> {
     let tag = format!("localhost/chuggin-computer:{}", env!("CARGO_PKG_VERSION"));
     if !podman().args(["image", "exists", &tag]).status()?.success() {
         let log = fs::File::create(t.state.join("computer/build.log"))?;
-        let status = podman()
+        let mut child = podman()
             .args(["build", "--tag", &tag, "--file"])
             .arg(context.join("Containerfile"))
             .arg(&context)
             .stdout(log.try_clone()?)
             .stderr(log)
-            .status()?;
+            .spawn()?;
+        let mut reader = fs::File::open(t.state.join("computer/build.log"))?;
+        let status = loop {
+            let mut bytes = Vec::new();
+            (&mut reader).take(8000).read_to_end(&mut bytes)?;
+            if !bytes.is_empty() {
+                crate::events::send(crate::events::Event::Delta(
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                ));
+            }
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
         ensure!(
             status.success(),
             "Desktop image preparation failed. See {}",

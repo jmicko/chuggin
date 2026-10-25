@@ -537,7 +537,7 @@ pub fn computer_environment(path: Option<&Path>) -> Result<()> {
                     );
                     save_execution(path, crate::sandbox::Settings::private())?;
                     if !crate::sandbox::installed() {
-                        podman_instructions()?;
+                        podman_instructions(path)?;
                         return Ok(());
                     }
                 }
@@ -546,32 +546,21 @@ pub fn computer_environment(path: Option<&Path>) -> Result<()> {
                     return Ok(());
                 }
                 2 => {
-                    podman_instructions()?;
+                    podman_instructions(path)?;
                 }
                 _ => return Ok(()),
             }
         } else {
             match choice {
                 0 => {
-                    podman_instructions()?;
+                    podman_instructions(path)?;
                 }
                 1 => {
                     if !crate::sandbox::installed() {
-                        podman_instructions()?;
+                        podman_instructions(path)?;
                         continue;
                     }
-                    if let Some(path) = path {
-                        crate::engine::close_idle_interactive(path)?;
-                    }
-                    let computer = c.clone();
-                    crate::ui::busy(
-                        "Preparing private Linux computer · build output saved in session history",
-                        move || crate::sandbox::prepare(&computer),
-                    )?;
-                    crate::ui::show(
-                        "Private computer ready",
-                        "The desktop is ready. Resume from the home screen to start inference. View private desktop opens its screen in your browser.",
-                    )?;
+                    prepare_computer_interactive(path)?;
                 }
                 2 => {
                     crate::sandbox::ready(&c)?;
@@ -663,13 +652,129 @@ fn save_execution(path: Option<&Path>, execution: crate::sandbox::Settings) -> R
         save_draft_patch(&std::env::current_dir()?, json!({"execution":execution}))
     }
 }
-fn podman_instructions() -> Result<()> {
+fn prepare_computer_interactive(path: Option<&Path>) -> Result<bool> {
+    loop {
+        let c = editing_config(path)?;
+        anyhow::ensure!(
+            c.execution.is_private(),
+            "Select the private computer environment first"
+        );
+        if let Some(path) = path {
+            crate::engine::close_idle_interactive(path)?;
+        }
+        let result = crate::ui::busy(
+            "Setting up private computer · downloading/building desktop and verifying resource limits",
+            move || crate::sandbox::prepare(&c),
+        );
+        match result {
+            Ok(()) => {
+                crate::ui::show(
+                    "Private computer ready",
+                    "The isolated Linux installation is ready. CPU, memory and process limits were checked inside it. No model has been started. View private desktop opens its screen in your browser.",
+                )?;
+                return Ok(true);
+            }
+            Err(error) => {
+                crate::ui::clear_notes();
+                crate::ui::notice(crate::sandbox::setup_error(&error));
+                let commands = crate::sandbox::repair_commands(&format!("{error:#}"));
+                match crate::menu::select(
+                    "Private computer setup needs attention",
+                    &[
+                        "Try setup again".into(),
+                        if commands.is_some() {
+                            "Copy suggested commands".into()
+                        } else {
+                            "Copy diagnostic command".into()
+                        },
+                        "Back · keep existing files".into(),
+                    ],
+                    0,
+                )? {
+                    Some(0) => {}
+                    Some(1) => copy_command(
+                        commands
+                            .as_deref()
+                            .unwrap_or("podman --remote=false info --debug"),
+                    )?,
+                    _ => return Ok(false),
+                }
+            }
+        }
+    }
+}
+fn copy_command(text: &str) -> Result<()> {
+    let (title,notice)=match crate::clipboard::copy(text) {
+        Ok(crate::clipboard::CopyResult::Copied)=>("Copied to clipboard","Paste into another terminal with Ctrl+Shift+V. Keep Chuggin open while pasting. Nothing has been run or installed.".into()),
+        Ok(crate::clipboard::CopyResult::TerminalRequested)=>("Clipboard request sent to terminal","Your terminal may ask permission or may not support clipboard requests. Try pasting into another terminal with Ctrl+Shift+V. Nothing has been run or installed.".into()),
+        Err(e)=>("Clipboard unavailable",format!("{e}\n\nNothing has been run or installed.")),
+    };
+    crate::ui::show(title, &format!("{text}\n\n{notice}"))
+}
+fn podman_instructions(path: Option<&Path>) -> Result<()> {
     loop {
         if crate::sandbox::installed() {
-            return crate::ui::show(
-                "Podman detected",
-                "Podman is installed. Prepare/start checks its rootless configuration and resource-limit support before allowing any model tools.",
+            let report = crate::ui::busy(
+                "Checking Podman prerequisites",
+                crate::sandbox::prerequisite_report,
             );
+            crate::ui::clear_notes();
+            match report {
+                Ok(text) => {
+                    crate::ui::notice(text);
+                    if editing_config(path)?.execution.is_private() {
+                        match crate::menu::select(
+                            "Podman checks passed",
+                            &[
+                                "Set up private computer (recommended)".into(),
+                                "Check again".into(),
+                                "Back".into(),
+                            ],
+                            0,
+                        )? {
+                            Some(0) => {
+                                prepare_computer_interactive(path)?;
+                                return Ok(());
+                            }
+                            Some(1) => continue,
+                            _ => return Ok(()),
+                        }
+                    } else {
+                        return crate::ui::show(
+                            "Podman checks passed",
+                            "Rootless containers and cgroup v2 are available. Choose Use a private Linux computer in Computer environment to create its desktop.",
+                        );
+                    }
+                }
+                Err(e) => {
+                    crate::ui::notice(crate::sandbox::setup_error(&e));
+                    let commands = crate::sandbox::repair_commands(&format!("{e:#}"));
+                    match crate::menu::select(
+                        "Podman prerequisite check failed",
+                        &[
+                            "Check again".into(),
+                            if commands.is_some() {
+                                "Copy suggested commands".into()
+                            } else {
+                                "Copy diagnostic command".into()
+                            },
+                            "Back".into(),
+                        ],
+                        0,
+                    )? {
+                        Some(0) => continue,
+                        Some(1) => {
+                            copy_command(
+                                commands
+                                    .as_deref()
+                                    .unwrap_or("podman --remote=false info --debug"),
+                            )?;
+                            continue;
+                        }
+                        _ => return Ok(()),
+                    }
+                }
+            }
         }
         crate::ui::clear_notes();
         crate::ui::notice(crate::sandbox::missing_help());
@@ -690,24 +795,7 @@ fn podman_instructions() -> Result<()> {
             Some(0) => {}
             Some(1) => {
                 let text = command.unwrap_or("https://podman.io/docs/installation");
-                match crate::clipboard::copy(text) {
-                    Ok(crate::clipboard::CopyResult::Copied) => crate::ui::show(
-                        "Copied to clipboard",
-                        &format!(
-                            "{text}\n\nPaste into another terminal with Ctrl+Shift+V. Keep Chuggin open while pasting. Nothing has been run or installed."
-                        ),
-                    )?,
-                    Ok(crate::clipboard::CopyResult::TerminalRequested) => crate::ui::show(
-                        "Clipboard request sent to terminal",
-                        &format!(
-                            "{text}\n\nYour terminal may ask permission or may not support clipboard requests. Try pasting into another terminal with Ctrl+Shift+V. Nothing has been run or installed."
-                        ),
-                    )?,
-                    Err(e) => crate::ui::show(
-                        "Clipboard unavailable",
-                        &format!("{e}\n\n{text}\n\nNothing has been run or installed."),
-                    )?,
-                }
+                copy_command(text)?;
             }
             _ => return Ok(()),
         }
@@ -719,8 +807,30 @@ pub fn ensure_computer_interactive(path: &Path) -> Result<bool> {
         return Ok(true);
     }
     if !crate::sandbox::installed() || !c.state_dir.join("computer/ready.json").exists() {
-        computer_environment(Some(path))?;
-        return Ok(false);
+        if !crate::sandbox::installed() {
+            podman_instructions(Some(path))?;
+            return Ok(false);
+        }
+        crate::ui::clear_notes();
+        crate::ui::notice(
+            "This session uses a private Linux computer. Podman is installed, but its desktop has not been created yet. Chuggin can set it up and verify resource limits automatically. Setup downloads/builds a desktop image; inference starts only after setup succeeds.".into(),
+        );
+        return match crate::menu::select(
+            "Set up private computer",
+            &[
+                "Set up now (recommended)".into(),
+                "Computer options".into(),
+                "Back".into(),
+            ],
+            0,
+        )? {
+            Some(0) => prepare_computer_interactive(Some(path)),
+            Some(1) => {
+                computer_environment(Some(path))?;
+                Ok(false)
+            }
+            _ => Ok(false),
+        };
     }
     Ok(true)
 }

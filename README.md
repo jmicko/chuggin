@@ -213,9 +213,16 @@ another terminal with Ctrl+Shift+V. Keep Chuggin open while pasting. Copying run
 nothing. When a desktop clipboard is unavailable, Chuggin can request clipboard
 access through the terminal and reports that the request is unconfirmed.
 
-In **More project settings → Computer environment**, choose **Prepare or start
-private computer** to explicitly download/build its desktop image. Build output
-is saved in the session's `computer/build.log`. **View private desktop** opens a
+Resume offers **Set up now (recommended)** if the private computer is not ready.
+Chuggin downloads/builds its desktop, creates the installation and verifies CPU,
+memory and process limits itself. Changing models or editing settings does not
+require a prepared computer. The prerequisite screen reports actual detected
+rootless/cgroup support; failures show the exact error and copyable repair
+commands where available. Host configuration commands are never silently run.
+
+In **More project settings → Computer environment**, **Prepare or start
+private computer** performs the same setup. Build output streams in the terminal
+and is saved in the session's `computer/build.log`. **View private desktop** opens a
 local, token-protected noVNC viewer in your browser. The model has
 `capture_screenshot` and `desktop_action` tools for its private display; inspecting
 pixels requires a vision-capable inference model. Neither the human desktop nor
@@ -246,9 +253,19 @@ computer · keep its files** to stop it after finishing the loop and commands;
 resume/prepare starts it again. Conversation history and file-hash observations
 stay outside the container; these records are not backups of its contents.
 
-The initial implementation is covered by tool-routing, isolation-policy and
-missing-dependency tests. A real desktop run still needs verification on a host
-with Podman installed.
+Alongside tool-routing, isolation-policy and missing-dependency tests, a real
+rootless Podman integration test exercises setup, private file edits, screenshots,
+pointer controls and blocked host/local-network access. It is opt-in and requires
+Podman and the desktop image; the ordinary test suite uses simulated providers.
+
+### Empty provider replies
+
+In goal mode, an empty reply preserves the complete conversation. The next
+request ends with a direct continuation after the cycle's context updates.
+Repeated empty replies use increasing delays capped at 15 minutes; they do not
+trigger an automatic conversation reset or replay tools. Raw replies remain in
+diagnostic history. Context-capacity handoffs and repetition recovery are separate
+mechanisms. Unassigned sessions continue to allow deliberate silence.
 
 ### Sampling profiles
 

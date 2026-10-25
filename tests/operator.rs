@@ -28,6 +28,9 @@ impl Fixture {
         Self::with_mode(url, context_tokens, false)
     }
     fn with_mode(url: &str, context_tokens: u32, unversioned: bool) -> Self {
+        Self::with_computer(url, context_tokens, unversioned, false)
+    }
+    fn with_computer(url: &str, context_tokens: u32, unversioned: bool, private: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         if !unversioned {
             for args in [
@@ -74,6 +77,9 @@ impl Fixture {
             config["activity_mode"] = json!("type2");
             config["goal"] = json!("");
             config["checks"] = json!([]);
+        }
+        if private {
+            config["execution"] = json!({"kind":"podman"});
         }
         fs::write(
             dir.path().join("chuggin.json"),
@@ -188,6 +194,22 @@ impl Fixture {
             thread::sleep(Duration::from_millis(30));
         }
     }
+}
+
+#[test]
+fn unprepared_private_computer_allows_status_and_model_settings_without_starting_tools() {
+    let f = Fixture::with_computer("http://127.0.0.1:9", 8192, true, true);
+    let session = f.session();
+    let id = session.as_str();
+    let settings = f.call(id, "get_settings", json!({}));
+    assert_eq!(settings["status"], "complete", "{settings}");
+    let result = &settings["result"];
+    let changed=f.rpc(json!({"action":"human_settings","expected_revision":result["revision"],"settings":{"model":"beam:cloud"}}));
+    assert_eq!(changed["status"], "complete", "{changed}");
+    assert_eq!(f.rpc(json!({"action":"status"}))["model"], "beam:cloud");
+    let read = f.call(id, "read_file", json!({"path":"/etc/os-release"}));
+    assert_ne!(read["status"], "complete", "{read}");
+    assert!(!f.dir.path().join(".chuggin/state.json").exists());
 }
 impl Drop for Fixture {
     fn drop(&mut self) {

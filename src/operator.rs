@@ -60,6 +60,7 @@ pub struct Controller {
     settings: Mutex<()>,
     workspace: Mutex<()>,
     handoffs: Mutex<()>,
+    private_ready: Mutex<bool>,
     pub last_error: Mutex<Option<String>>,
     started: Mutex<Option<Instant>>,
     ended_elapsed: Mutex<Option<u64>>,
@@ -74,7 +75,6 @@ impl Controller {
             "Review the one-time project upgrade from Resume project first"
         );
         let locks = runner::lock_project(&c)?;
-        crate::sandbox::ready(&c)?;
         crate::sandbox::register(&c)?;
         let controls = Arc::new(RunControl::default());
         controls.configure(&path);
@@ -135,6 +135,7 @@ impl Controller {
             settings: Mutex::new(()),
             workspace: Mutex::new(()),
             handoffs: Mutex::new(()),
+            private_ready: Mutex::new(false),
             last_error: Mutex::default(),
             started: Mutex::default(),
             ended_elapsed: Mutex::default(),
@@ -146,6 +147,16 @@ impl Controller {
     }
     pub fn config(&self) -> Result<runner::Config> {
         runner::load(&self.path)
+    }
+    fn computer_ready(&self, c: &runner::Config) -> Result<()> {
+        if c.execution.is_private() {
+            let mut ready = self.private_ready.lock().unwrap();
+            if !*ready {
+                crate::sandbox::ready(c)?;
+                *ready = true;
+            }
+        }
+        Ok(())
     }
     pub fn open_session(&self, requested: Option<&str>) -> Result<String> {
         let session = requested.map(str::to_owned).unwrap_or_else(id);
@@ -316,6 +327,7 @@ impl Controller {
         )
     }
     pub fn begin_edit(&self, session: &str) -> Result<Value> {
+        self.computer_ready(&self.config()?)?;
         self.touch(session)?;
         let mut lease = self.lease.lock().unwrap();
         if let Some(l) = lease.as_ref() {
@@ -574,8 +586,14 @@ impl Controller {
         operation: &str,
     ) -> Result<Value> {
         self.touch(session)?;
-        ensure!(
+        let c = self.config()?;
+        let available = if c.execution.is_private() {
+            schemas_for(&c)
+        } else {
             schemas()
+        };
+        ensure!(
+            available
                 .as_array()
                 .unwrap()
                 .iter()
@@ -616,6 +634,24 @@ impl Controller {
     }
     fn execute(self: &Arc<Self>, session: &str, name: &str, args: &Value) -> Result<Value> {
         let c = self.config()?;
+        if [
+            "read_file",
+            "list_files",
+            "search",
+            "project_map",
+            "lookup_symbol",
+            "view_image",
+            "capture_screenshot",
+            "write_file",
+            "edit_file",
+            "desktop_action",
+            "run_command",
+            "project_diff",
+        ]
+        .contains(&name)
+        {
+            self.computer_ready(&c)?;
+        }
         ensure!(
             !c.execution.is_private() || !["compiler_diagnostics", "run_checks"].contains(&name),
             "Project-specific checks are not configured in this computer. Run a command inside it instead."

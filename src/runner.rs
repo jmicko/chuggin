@@ -2439,6 +2439,11 @@ fn work(
         }
         session.observed_tree = proposal_tree.clone();
         let proposal_generation = m.controls.changed.load(Ordering::SeqCst);
+        if session.empty_response_streak > 0 && !c.activity_mode.is_chaos() {
+            // End the request with a direct continuation, after checkpoint and
+            // cycle context. Keep all useful history and its cached prefix.
+            session.messages.push(json!({"role":"user","content":"Continue the current task from the existing files and observations. Report your next finding or use the tools to inspect what you need."}));
+        }
         let requested = m.chat(&session.messages, Some(session.tools.clone()), false);
         if let Some(usage) = m.take_context_usage() {
             session.last_context_usage = Some(usage.clone());
@@ -2512,24 +2517,11 @@ fn work(
             && response_thinking.trim().is_empty()
             && !c.activity_mode.is_chaos()
         {
-            session.empty_response_streak += 1;
+            session.empty_response_streak = session.empty_response_streak.saturating_add(1);
             crate::events::log(format!(
-                "Provider returned an empty response ({} consecutive); recovering the current conversation without replaying actions.",
+                "Provider returned an empty response ({} consecutive); keeping all conversation history and requesting continuation on the next call. No actions were replayed.",
                 session.empty_response_streak
             ));
-            if session.empty_response_streak >= 3 {
-                refresh_conversation(
-                    c,
-                    s,
-                    session,
-                    art,
-                    "Repeated empty provider responses; archived the unproductive conversation",
-                    false,
-                )?;
-                session.empty_response_streak = 0;
-            } else {
-                session.messages.push(json!({"role":"user","content":"The provider ended its last response without text or actions. Continue the current task using the available tools and current files, or report concrete findings. No action was executed or replayed for that response."}));
-            }
             save_conversation(c, session)?;
             break;
         }
@@ -3737,16 +3729,37 @@ pub fn run_controlled_with_commands(
             break;
         }
         crate::events::send(crate::events::Event::Phase("Between cycles".into()));
-        for _ in 0..if c.activity_mode.is_chaos() {
-            0
+        let delay = if session.empty_response_streak > 0 {
+            c.retry_seconds
+                .max(1)
+                .saturating_mul(1u64 << session.empty_response_streak.saturating_sub(1).min(10))
+                .min(900)
         } else {
             c.retry_seconds
-        } {
+        };
+        let empty_wait = session.empty_response_streak > 0 && !c.activity_mode.is_chaos();
+        if empty_wait {
+            model.controls.provider_wait_started();
+        }
+        for remaining in (0..if c.activity_mode.is_chaos() { 0 } else { delay }).rev() {
             model.pause_point();
-            if stop.load(Ordering::SeqCst) || time_up() {
+            if stop.load(Ordering::SeqCst)
+                || time_up()
+                || (empty_wait && model.controls.take_retry())
+            {
                 break;
             }
+            if empty_wait {
+                crate::events::send(crate::events::Event::ProviderWait {
+                    reason: "Empty reply; keeping conversation history. Press T to retry now."
+                        .into(),
+                    seconds: remaining + 1,
+                });
+            }
             thread::sleep(Duration::from_secs(1));
+        }
+        if empty_wait {
+            model.controls.provider_wait_finished();
         }
     }
     if time_up() {

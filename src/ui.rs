@@ -2357,7 +2357,7 @@ fn dashboard_session(
     start: bool,
     chat: bool,
 ) -> Result<bool> {
-    if !crate::setup::ensure_computer_interactive(path)? {
+    if (start || chat) && !crate::setup::ensure_computer_interactive(path)? {
         return Ok(false);
     }
     let mut config = runner::load(path)?;
