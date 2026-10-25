@@ -225,9 +225,12 @@ commands are never silently run.
 Setup problems show the actual error and copyable repair commands; missing Podman
 shows its installation command. Successful setup continues without extra menus.
 Build output streams in the terminal and is saved in the session's
-`computer/build.log`. **Open desktop** on the home screen or **F4** in the observation
-view opens a local, token-protected noVNC viewer in your browser, without pausing
-the model. **More project settings → Computer environment → Advanced computer
+`computer/build.log`. **Open desktop** on the home screen or the highlighted,
+clickable **F4 Open desktop** button at the top of the observation view opens a
+local, token-protected noVNC viewer in a separate browser tab, without pausing
+the model. **Alt+D** also opens it. The desktop screen offers **Open browser again**
+and **Copy desktop link** if your browser does not appear. Reopening reuses the same
+viewer address while Chuggin stays open. **More project settings → Computer environment → Advanced computer
 settings** holds resource limits and optional setup checks. The model has
 `capture_screenshot` and `desktop_action` tools for its private display; inspecting
 pixels requires a vision-capable inference model. Neither the human desktop nor

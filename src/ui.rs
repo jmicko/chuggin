@@ -976,6 +976,7 @@ struct Dashboard {
     remote_active_elapsed: Option<Duration>,
     finished_phase_elapsed: Option<Duration>,
     expanded_commands: bool,
+    desktop_button: Option<Rect>,
     last_output: Instant,
     partial_model: String,
     partial_check: String,
@@ -1045,6 +1046,7 @@ impl Dashboard {
             remote_active_elapsed: None,
             finished_phase_elapsed: None,
             expanded_commands: false,
+            desktop_button: None,
             last_output: Instant::now(),
             partial_model: String::new(),
             partial_check: String::new(),
@@ -1820,6 +1822,8 @@ fn dashboard_footer(
 fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stopping: bool) {
     base(f);
     let a = f.area().inner(Margin::new(1, 0));
+    d.desktop_button = (c.execution.is_private() && a.width >= 44 && a.height >= 4)
+        .then(|| Rect::new(a.right().saturating_sub(19), a.y, 19, 1));
     let paused = d.finished.is_none() && d.controls.is_paused();
     let pausing = d.finished.is_none() && d.controls.pause_requested() && !paused;
     if d.nudge_edit.is_none() && d.finished.is_some() && (a.height < 20 || a.width < 44) {
@@ -1832,6 +1836,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             .bold(),
             a,
         );
+        render_desktop_button(f, d.desktop_button);
         return;
     }
     if a.height < 14 || a.width < 44 {
@@ -1843,6 +1848,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             "Working · P pause after current operation"
         };
         f.render_widget(p(format!("CHUGGIN\n\nResize to at least 46 × 14 to view the dashboard.\n{state}\nT retry provider now\nCtrl+C: finish cycle; again: force stop")).fg(ACCENT),a);
+        render_desktop_button(f, d.desktop_button);
         return;
     }
     let (footer, footer_height) = dashboard_footer(d, c, stopping, paused, pausing, a.width);
@@ -1894,7 +1900,14 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             .fg(MUTED),
         );
     }
-    f.render_widget(Paragraph::new(header), r[0]);
+    let header_area = Rect {
+        width: r[0]
+            .width
+            .saturating_sub(if d.desktop_button.is_some() { 20 } else { 0 }),
+        ..r[0]
+    };
+    f.render_widget(Paragraph::new(header), header_area);
+    render_desktop_button(f, d.desktop_button);
     let phases = ["Orient", "Work", "Check", "Review", "Checkpoint"];
     let mut steps = Vec::new();
     for (i, s) in phases.iter().enumerate() {
@@ -2299,8 +2312,27 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     if d.help {
         let area = a.inner(Margin::new(2, 1));
         f.render_widget(Clear, area);
-        f.render_widget(p("P              Pause / continue current cycle\nT              Retry provider now; queue while paused\nCtrl+C / Q     Finish cycle, then stop\nCtrl+C again   Force stop immediately\nR              Cancel stop / resume saved run\nN              Add / manage a temporary nudge\n1–6 / Tab      Live, model, checks, goal, settings, chat\n↑↓ / wheel     Scroll a few lines\nPgUp / PgDn    Scroll a page\nHome / End     Oldest / latest output\nF              Follow live output\nE              Expand / collapse command output\nF4             Open private desktop (private computer)\n/              Search current view\nEsc            Clear search / close help\n\nPause waits for the current operation; the run timer holds.\nStarted commands may finish. Full logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.").block(panel("Keyboard guide · ? / Esc closes")),area);
+        f.render_widget(p("P              Pause / continue current cycle\nT              Retry provider now; queue while paused\nCtrl+C / Q     Finish cycle, then stop\nCtrl+C again   Force stop immediately\nR              Cancel stop / resume saved run\nN              Add / manage a temporary nudge\n1–6 / Tab      Live, model, checks, goal, settings, chat\n↑↓ / wheel     Scroll a few lines\nPgUp / PgDn    Scroll a page\nHome / End     Oldest / latest output\nF              Follow live output\nE              Expand / collapse command output\nF4 / Alt+D     Open private desktop; or click the top button\n/              Search current view\nEsc            Clear search / close help\n\nPause waits for the current operation; the run timer holds.\nStarted commands may finish. Full logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.").block(panel("Keyboard guide · ? / Esc closes")),area);
     }
+}
+
+fn render_desktop_button(f: &mut Frame, area: Option<Rect>) {
+    if let Some(area) = area {
+        f.render_widget(
+            Paragraph::new(" F4 Open desktop ")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(BG).bg(ACCENT).bold()),
+            area,
+        );
+    }
+}
+
+fn desktop_requested(event: &Input, area: Option<Rect>) -> bool {
+    pressed(event).is_some_and(|k| {
+        k.code == KeyCode::F(4)
+            || (matches!(k.code, KeyCode::Char('d' | 'D'))
+                && k.modifiers.contains(KeyModifiers::ALT))
+    }) || matches!(event, Input::Mouse(m) if m.kind == MouseEventKind::Down(event::MouseButton::Left) && area.is_some_and(|area| area.contains(Position::new(m.column,m.row))))
 }
 
 pub fn dashboard(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
@@ -2441,9 +2473,7 @@ fn dashboard_session(
             }
             draw(|f| render_dashboard(f, &mut d, &config, stop.load(Ordering::SeqCst)))?;
             if let Some(e) = input()? {
-                if pressed(&e).is_some_and(|k| k.code == KeyCode::F(4))
-                    && config.execution.is_private()
-                {
+                if desktop_requested(&e, d.desktop_button) && config.execution.is_private() {
                     if let Err(error) = crate::setup::view_private_desktop(Some(path)) {
                         clear_notes();
                         show("Could not open private desktop", &format!("{error:#}"))?;
@@ -2849,6 +2879,46 @@ pub fn busy<T: Send + 'static>(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    #[test]
+    fn private_desktop_action_is_visible_and_clickable_in_live_and_paused_views() {
+        let mut c = config();
+        c.execution = crate::sandbox::Settings::private();
+        for (width, height) in [(46, 14), (70, 24), (110, 36)] {
+            let mut d = Dashboard::new(&c);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for stopped in [false, true] {
+                d.finished = stopped.then(|| "Saved work".into());
+                terminal
+                    .draw(|f| render_dashboard(f, &mut d, &c, false))
+                    .unwrap();
+                assert!(
+                    screen_text(&terminal)
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .contains("F4 Open desktop")
+                );
+                let area = d.desktop_button.unwrap();
+                let click = Input::Mouse(event::MouseEvent {
+                    kind: MouseEventKind::Down(event::MouseButton::Left),
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE,
+                });
+                assert!(desktop_requested(&click, d.desktop_button));
+                assert!(!desktop_requested(&click, None));
+            }
+        }
+        assert!(desktop_requested(
+            &Input::Key(event::KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE)),
+            None
+        ));
+        assert!(desktop_requested(
+            &Input::Key(event::KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT)),
+            None
+        ));
+    }
+
     #[test]
     fn pending_validation_clears_failure_status_without_claiming_success() {
         let mut c = config();

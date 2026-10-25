@@ -4523,6 +4523,16 @@ mod terminal_ui {
                 .unwrap()
                 .starts_with("http://127.0.0.1:")
         );
+        if let Ok(check) = std::env::var("CHUGGIN_DESKTOP_BROWSER_CHECK") {
+            assert!(
+                Command::new(check)
+                    .arg(fs::read_to_string(&opened).unwrap().trim())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "The real browser could not display the private desktop"
+            );
+        }
         ui.send(b"\r");
         ui.wait("CYCLE PAUSED");
         let runtime = root.path().join(".chuggin/global/chuggin/runtime");

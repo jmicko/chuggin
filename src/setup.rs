@@ -652,24 +652,83 @@ pub fn view_private_desktop(path: Option<&Path>) -> Result<()> {
     }
     let url = crate::ui::busy("Opening private desktop", move || {
         crate::sandbox::ready(&c)?;
-        crate::sandbox_network::desktop(&crate::sandbox::target(&c)?)
+        let url = crate::sandbox_network::desktop(&crate::sandbox::target(&c)?)?;
+        let response = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()?
+            .get(&url)
+            .send()
+            .context("The private desktop viewer did not respond")?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "The private desktop viewer returned {}",
+            response.status()
+        );
+        Ok(url)
     })?;
+    let mut browser = launch_desktop_browser(&url);
+    loop {
+        crate::ui::clear_notes();
+        crate::ui::notice(format!(
+            "The private desktop opens in a separate web browser window or tab.\n\n{browser}\n\n{url}\n\nClosing the browser does not stop or pause the model. Back to Chuggin keeps the viewer available; keep Chuggin open while using it. You can reopen it with the Open desktop button, F4 or Alt+D."
+        ));
+        match crate::menu::select(
+            "Private desktop",
+            &[
+                "Back to Chuggin".into(),
+                "Open browser again".into(),
+                "Copy desktop link".into(),
+            ],
+            0,
+        )? {
+            Some(1) => browser = launch_desktop_browser(&url),
+            Some(2) => {
+                let message = match crate::clipboard::copy(&url) {
+                    Ok(crate::clipboard::CopyResult::Copied) => "Desktop link copied. Paste it into your browser's address bar. Keep Chuggin open while viewing.".into(),
+                    Ok(crate::clipboard::CopyResult::TerminalRequested) => "A clipboard request was sent to your terminal. Try pasting into your browser's address bar; your terminal may require permission.".into(),
+                    Err(error) => format!("Could not copy the desktop link: {error}"),
+                };
+                crate::ui::show("Desktop link", &message)?;
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn launch_desktop_browser(url: &str) -> String {
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(&url)
+        match std::process::Command::new("xdg-open")
+            .arg(url)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
+            .spawn()
+        {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    if let Ok(status) = child.wait()
+                        && !status.success()
+                    {
+                        crate::events::log(format!(
+                            "Desktop browser launcher exited with {status}. Use Open desktop → Copy desktop link to open it manually."
+                        ));
+                    }
+                });
+                "Browser launch requested. If no desktop tab appears, choose Open browser again or Copy desktop link.".into()
+            }
+            Err(error) => format!(
+                "Could not launch your browser: {error}. Choose Copy desktop link and paste it into your browser."
+            ),
+        }
     }
-    crate::ui::clear_notes();
-    crate::ui::show(
-        "Private desktop",
-        &format!(
-            "Opening the private desktop in your browser. If it does not open, use this local address:\n\n{url}\n\nClosing the browser does not stop or pause the model. Keep Chuggin open while using the viewer. Open desktop is on the home screen; F4 opens it from the observation view."
-        ),
-    )
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = url;
+        "Choose Copy desktop link and paste it into your browser.".into()
+    }
 }
 fn save_execution(path: Option<&Path>, execution: crate::sandbox::Settings) -> Result<()> {
     execution.validate()?;
