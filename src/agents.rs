@@ -40,7 +40,7 @@ impl Default for Settings {
             model: String::new(),
             reasoning: crate::reasoning::Setting::default(),
             sampling: crate::sampling::Settings::default(),
-            max_calls: 12,
+            max_calls: 20,
         }
     }
 }
