@@ -193,8 +193,11 @@ instructions; start in a new directory to choose another mode.
 
 ### Private Linux computer (Podman)
 
-New unassigned sessions ask which computer to use. **Use a private Linux
-computer (Podman)** gives the model its own persistent Debian installation,
+New unassigned sessions offer two choices: **Private computer (Podman)** or
+**This computer · direct access**. Choosing the private computer automatically
+checks prerequisites, downloads/builds the desktop and verifies resource limits;
+there is no separate check or preparation step. It gives the model its own
+persistent Debian installation,
 starting in `/root`, with an Xfce desktop. It can use system directories and
 install applications such as GIMP or Blender. Host project files are not imported.
 Existing host sessions retain their environment; start a new session directory
@@ -213,17 +216,19 @@ another terminal with Ctrl+Shift+V. Keep Chuggin open while pasting. Copying run
 nothing. When a desktop clipboard is unavailable, Chuggin can request clipboard
 access through the terminal and reports that the request is unconfirmed.
 
-Resume offers **Set up now (recommended)** if the private computer is not ready.
-Chuggin downloads/builds its desktop, creates the installation and verifies CPU,
-memory and process limits itself. Changing models or editing settings does not
-require a prepared computer. The prerequisite screen reports actual detected
-rootless/cgroup support; failures show the exact error and copyable repair
-commands where available. Host configuration commands are never silently run.
+Resume automatically completes setup if the private computer is not ready.
+Chuggin creates the installation and verifies CPU, memory and process limits
+itself, using defaults of 4 CPUs, 4 GiB RAM and public web access. Changing models
+or editing settings does not require a prepared computer. Host configuration
+commands are never silently run.
 
-In **More project settings → Computer environment**, **Prepare or start
-private computer** performs the same setup. Build output streams in the terminal
-and is saved in the session's `computer/build.log`. **View private desktop** opens a
-local, token-protected noVNC viewer in your browser. The model has
+Setup problems show the actual error and copyable repair commands; missing Podman
+shows its installation command. Successful setup continues without extra menus.
+Build output streams in the terminal and is saved in the session's
+`computer/build.log`. **Open desktop** on the home screen or **F4** in the observation
+view opens a local, token-protected noVNC viewer in your browser, without pausing
+the model. **More project settings → Computer environment → Advanced computer
+settings** holds resource limits and optional setup checks. The model has
 `capture_screenshot` and `desktop_action` tools for its private display; inspecting
 pixels requires a vision-capable inference model. Neither the human desktop nor
 its display socket is shared. Initial rendering is software-only, with no GPU

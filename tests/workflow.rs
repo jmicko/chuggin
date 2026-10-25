@@ -4307,7 +4307,7 @@ mod terminal_ui {
         .unwrap();
         fs::write(
             root.path().join(".chuggin/project-draft-settings.json"),
-            json!({"model":"fake","execution":{"kind":"host"}}).to_string(),
+            json!({"model":"fake"}).to_string(),
         )
         .unwrap();
         fs::write(root.path().join("observation.txt"), "Existing material").unwrap();
@@ -4318,6 +4318,9 @@ mod terminal_ui {
         ui.wait("Choose a mode");
         ui.wait("Work toward a goal");
         ui.wait("No goals, only chaos");
+        ui.send(b"j\r");
+        ui.wait("Where should this session run?");
+        ui.wait("Private computer (Podman)");
         ui.send(b"j\r");
         ui.wait("Resume project");
         let screen = ui.parser.screen().contents();
@@ -4332,6 +4335,7 @@ mod terminal_ui {
         let config: Value =
             serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
         assert_eq!(config["activity_mode"], "type2");
+        assert_eq!(config["execution"]["kind"], "host");
         assert!(config["goal"].as_str().is_none_or(str::is_empty));
         assert!(config["checks"].as_array().unwrap().is_empty());
         assert_eq!(config["model"], "fake");
@@ -4384,7 +4388,7 @@ mod terminal_ui {
         let mut ui = TerminalProcess::start_with_environment(root.path(), &[("PATH", &path)]);
         ui.wait("Set up this project");
         ui.send(b"\r");
-        ui.wait("Use a private Linux computer");
+        ui.wait("Private computer (Podman)");
         ui.send(b"\r");
         ui.wait("Podman not installed");
         ui.wait("Chuggin has installed nothing");
@@ -4463,7 +4467,7 @@ mod terminal_ui {
         let root = tempfile::tempdir().unwrap();
         let config = chaos_fixture(root.path(), &server.url);
         let mut value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-        value["execution"] = json!({"kind":"podman"});
+        value["execution"] = json!({"kind":"host"});
         fs::write(&config, value.to_string()).unwrap();
         let repo = fs::canonicalize(root.path().join("repo")).unwrap();
         let hash = format!("{:x}", Sha256::digest(repo.as_os_str().as_encoded_bytes()));
@@ -4480,15 +4484,46 @@ mod terminal_ui {
         let computer = Computer(format!("chuggin-{}", &hash[..24]));
         let canary = root.path().join("host-only.txt");
         fs::write(&canary, "PRIVATE_HOST_CANARY").unwrap();
-        let mut ui = TerminalProcess::start(root.path());
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.path().join("browser-bin");
+        fs::create_dir(&bin).unwrap();
+        let opened = root.path().join("opened-desktop-url");
+        fs::write(
+            bin.join("xdg-open"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" > {}\n",
+                shell_words::quote(opened.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("xdg-open"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let mut ui = TerminalProcess::start_with_environment(root.path(), &[("PATH", &path)]);
         ui.wait("Resume project");
+        ui.send(b"jjjjjjj\r");
+        ui.wait("More project settings");
+        ui.send(b"jjjjjjjjjj\r");
+        ui.wait("Where should this session run?");
         ui.send(b"\r");
-        ui.wait("Set up now (recommended)");
-        ui.send(b"\r");
-        ui.wait("Private computer ready");
+        ui.wait("More project settings");
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert!(root.path().join("state/computer/ready.json").exists());
+        ui.send(b"\x1b");
+        ui.wait("Open desktop");
         ui.send(b"\r");
         ui.wait("LIVE");
         ui.send(b"p");
+        ui.wait("CYCLE PAUSED");
+        ui.wait("F4 desktop");
+        ui.send(b"\x1bOS");
+        ui.wait("Closing the browser does not stop or pause the model");
+        ui.wait_until("desktop browser launched", || opened.exists());
+        assert!(
+            fs::read_to_string(&opened)
+                .unwrap()
+                .starts_with("http://127.0.0.1:")
+        );
+        ui.send(b"\r");
         ui.wait("CYCLE PAUSED");
         let runtime = root.path().join(".chuggin/global/chuggin/runtime");
         let socket = fs::read_dir(runtime)
@@ -4659,8 +4694,10 @@ mod terminal_ui {
         ui.send(b"jjjjjjjjjj\r");
         ui.wait("Computer environment");
         ui.send(b"j\r");
-        ui.wait("Private computer ready");
-        ui.send(b"\r");
+        ui.wait("Advanced computer settings");
+        ui.send(b"j\r");
+        ui.wait("Advanced computer settings");
+        ui.send(b"\x1b");
         ui.wait("Computer environment");
         ui.send(b"\x1b");
         ui.wait("More project settings");
@@ -4756,7 +4793,7 @@ mod terminal_ui {
         );
         ui.wait("Set up this project");
         ui.send(b"\r");
-        ui.wait("Use a private Linux computer");
+        ui.wait("Private computer (Podman)");
         ui.send(b"\r");
         ui.wait("Copy install command to clipboard");
         ui.send(b"j\r");

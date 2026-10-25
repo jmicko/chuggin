@@ -496,147 +496,180 @@ pub fn choose_activity_mode(project: Option<&Path>) -> Result<()> {
 }
 
 pub fn computer_environment(path: Option<&Path>) -> Result<()> {
+    if !editing_config(path)?.execution.is_private() {
+        return choose_computer_environment(path);
+    }
     loop {
         let c = editing_config(path)?;
+        if !c.execution.is_private() {
+            return Ok(());
+        }
         crate::ui::clear_notes();
         crate::ui::notice(format!(
-            "Current environment: {}\n\nA private computer has a persistent Linux installation and its own desktop. Chuggin's configuration, conversation history, inference connections and keys stay outside it. No host home, project folder, GPU or desktop socket is shared.\n\nPodman is a user-installed prerequisite. Chuggin never installs it. The first desktop image download/preparation happens only when you select Prepare. Existing session files are not imported into the computer.",
+            "{}\n\nChuggin sets up and starts the private computer automatically when needed. Its installation and files persist. Open desktop is also on the home screen; F4 opens it from the observation view.\n\nDefault limits: 4 CPUs, 4 GiB RAM, public web access. Advanced settings lets you change limits or troubleshoot setup.",
             c.execution.label()
         ));
-        let options = if c.execution.is_private() {
-            vec![
-                "Check Podman / installation instructions".into(),
-                "Prepare or start private computer".into(),
-                "View private desktop".into(),
-                "Computer resource limits".into(),
-                "Shut down private computer · keep its files".into(),
-                "Use this computer instead".into(),
-                "Back".into(),
-            ]
-        } else {
-            vec![
-                "Use a private Linux computer (Podman)".into(),
-                "Use this computer · unrestricted host commands".into(),
-                "Check Podman / installation instructions".into(),
-                "Back".into(),
-            ]
-        };
+        let options = vec![
+            "Open desktop".into(),
+            "Advanced computer settings".into(),
+            "Shut down private computer · keep its files".into(),
+            "Back".into(),
+        ];
         let Some(choice) = crate::menu::select("Computer environment", &options, 0)? else {
             return Ok(());
         };
-        if !c.execution.is_private() {
-            match choice {
-                0 => {
-                    anyhow::ensure!(
-                        c.activity_mode.is_chaos(),
-                        "Choose No goals, only chaos in a new session to use a private computer"
-                    );
-                    anyhow::ensure!(
-                        !c.state_dir.join("state.json").exists(),
-                        "This conversation already uses this computer. Start in a new session folder to keep its history separate."
-                    );
-                    save_execution(path, crate::sandbox::Settings::private())?;
-                    if !crate::sandbox::installed() {
-                        podman_instructions(path)?;
-                        return Ok(());
-                    }
+        match choice {
+            0 => view_private_desktop(path)?,
+            1 => advanced_computer_settings(path)?,
+            2 => {
+                if let Some(path) = path {
+                    crate::engine::close_idle_interactive(path)?;
                 }
-                1 => {
-                    save_execution(path, crate::sandbox::Settings::Host)?;
-                    return Ok(());
-                }
-                2 => {
-                    podman_instructions(path)?;
-                }
-                _ => return Ok(()),
+                crate::sandbox::stop(&c)?;
+                crate::ui::show(
+                    "Private computer shut down",
+                    "Its installation and files are retained. Resume or Open desktop starts it again. Any applications inside the computer were closed.",
+                )?;
             }
-        } else {
-            match choice {
-                0 => {
-                    podman_instructions(path)?;
-                }
-                1 => {
-                    if !crate::sandbox::installed() {
-                        podman_instructions(path)?;
-                        continue;
-                    }
-                    prepare_computer_interactive(path)?;
-                }
-                2 => {
-                    crate::sandbox::ready(&c)?;
-                    let url = crate::sandbox_network::desktop(&crate::sandbox::target(&c)?)?;
-                    #[cfg(target_os = "linux")]
-                    {
-                        let _ = std::process::Command::new("xdg-open")
-                            .arg(&url)
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn();
-                    }
-                    crate::ui::show(
-                        "Private desktop",
-                        &format!(
-                            "Open this local, session-specific address in your browser:\n\n{url}\n\nThe viewer is available while this Chuggin process stays open. Closing the browser does not stop the computer."
-                        ),
-                    )?;
-                }
-                3 => {
-                    let crate::sandbox::Settings::Podman {
-                        memory_mb,
-                        cpus,
-                        internet,
-                    } = c.execution
-                    else {
-                        unreachable!()
-                    };
-                    let memory = number("Computer memory limit (MiB)", memory_mb, 512, 1_048_576)?;
-                    let processors = number("Computer CPU limit", cpus, 1, 1024)?;
-                    let network = crate::menu::select(
-                        "Computer Internet access",
-                        &[
-                            "Public web through isolated HTTP/HTTPS proxy".into(),
-                            "Disabled".into(),
-                        ],
-                        usize::from(!internet),
-                    )?
-                    .map(|n| n == 0)
-                    .unwrap_or(internet);
-                    save_execution(
-                        path,
-                        crate::sandbox::Settings::Podman {
-                            memory_mb: memory,
-                            cpus: processors,
-                            internet: network,
-                        },
-                    )?;
-                    crate::ui::show(
-                        "Computer limits saved",
-                        "Limits apply when you next prepare/start the computer. GPU access is not enabled in this first version. The desktop uses software rendering. Container storage shares host disk space; it is not a hard per-computer disk quota.",
-                    )?;
-                }
-                4 => {
-                    if let Some(path) = path {
-                        crate::engine::close_idle_interactive(path)?;
-                    }
-                    crate::sandbox::stop(&c)?;
-                    crate::ui::show(
-                        "Private computer shut down",
-                        "Its installation and files are retained. Prepare/start or resume starts it again. Any applications inside the computer were closed.",
-                    )?;
-                }
-                5 => {
-                    anyhow::ensure!(
-                        !c.state_dir.join("state.json").exists()
-                            && !c.state_dir.join("computer/ready.json").exists(),
-                        "This environment already contains state. Use a new session folder to choose another computer; existing data is retained."
-                    );
-                    save_execution(path, crate::sandbox::Settings::Host)?;
-                }
-                _ => return Ok(()),
-            }
+            _ => return Ok(()),
         }
     }
+}
+
+fn choose_computer_environment(path: Option<&Path>) -> Result<()> {
+    let c = editing_config(path)?;
+    crate::ui::clear_notes();
+    if !c.activity_mode.is_chaos() {
+        return crate::ui::show(
+            "Computer environment",
+            "This goal-driven project runs directly in its project folder. Private computers are currently available for No goals, only chaos sessions; choose that mode in a new directory to use one.",
+        );
+    }
+    if c.state_dir.join("state.json").exists() {
+        return crate::ui::show(
+            "Computer environment",
+            "This saved conversation runs directly on this computer. Start a new session folder to choose a private computer; existing history and files stay here.",
+        );
+    }
+    crate::ui::notice("Choose where the model's tools run.\n\nPrivate computer: a separate Linux installation with its own desktop. Chuggin checks Podman and prepares everything automatically, using 4 CPUs, 4 GiB RAM and public web access. It does not share your home, project files, credentials or desktop. Podman must be installed separately; any setup problem will show specific instructions.\n\nThis computer: commands and file tools run directly in your project folder with your user account's access. No private desktop or container is created.".into());
+    match crate::menu::select(
+        "Where should this session run?",
+        &[
+            "Private computer (Podman) · recommended".into(),
+            "This computer · direct access".into(),
+        ],
+        0,
+    )? {
+        Some(0) => {
+            save_execution(path, crate::sandbox::Settings::private())?;
+            prepare_computer_interactive(path)?;
+        }
+        Some(1) => {
+            save_execution(path, crate::sandbox::Settings::Host)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn advanced_computer_settings(path: Option<&Path>) -> Result<()> {
+    loop {
+        let c = editing_config(path)?;
+        crate::ui::clear_notes();
+        crate::ui::notice("Optional controls for this private computer. Normal setup and startup are automatic. Resource changes apply at the next setup/start. GPU passthrough and a hard disk quota are not enabled.".into());
+        let can_switch = !c.state_dir.join("state.json").exists()
+            && !c.state_dir.join("computer/ready.json").exists();
+        let mut options = vec![
+            "Computer resource limits".into(),
+            "Check setup and start computer".into(),
+        ];
+        if can_switch {
+            options.push("Use this computer instead".into());
+        }
+        options.push("Back".into());
+        match crate::menu::select("Advanced computer settings", &options, 0)? {
+            Some(0) => {
+                let crate::sandbox::Settings::Podman {
+                    memory_mb,
+                    cpus,
+                    internet,
+                } = c.execution
+                else {
+                    unreachable!()
+                };
+                let memory = number("Computer memory limit (MiB)", memory_mb, 512, 1_048_576)?;
+                let processors = number("Computer CPU limit", cpus, 1, 1024)?;
+                let network = crate::menu::select(
+                    "Computer Internet access",
+                    &[
+                        "Public web through isolated HTTP/HTTPS proxy".into(),
+                        "Disabled".into(),
+                    ],
+                    usize::from(!internet),
+                )?
+                .map(|n| n == 0)
+                .unwrap_or(internet);
+                save_execution(
+                    path,
+                    crate::sandbox::Settings::Podman {
+                        memory_mb: memory,
+                        cpus: processors,
+                        internet: network,
+                    },
+                )?;
+                crate::ui::show(
+                    "Computer limits saved",
+                    "Limits apply when you next prepare/start the computer. GPU access is not enabled in this first version. The desktop uses software rendering. Container storage shares host disk space; it is not a hard per-computer disk quota.",
+                )?;
+            }
+            Some(1) => {
+                prepare_computer_interactive(path)?;
+            }
+            Some(2) if can_switch => {
+                anyhow::ensure!(
+                    !c.state_dir.join("state.json").exists()
+                        && !c.state_dir.join("computer/ready.json").exists(),
+                    "This environment already contains state. Use a new session folder to choose another computer; existing data is retained."
+                );
+                save_execution(path, crate::sandbox::Settings::Host)?;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+pub fn view_private_desktop(path: Option<&Path>) -> Result<()> {
+    let c = editing_config(path)?;
+    anyhow::ensure!(
+        c.execution.is_private(),
+        "This session runs directly on this computer; there is no private desktop."
+    );
+    if (!crate::sandbox::installed() || !c.state_dir.join("computer/ready.json").exists())
+        && !prepare_computer_interactive(path)?
+    {
+        return Ok(());
+    }
+    let url = crate::ui::busy("Opening private desktop", move || {
+        crate::sandbox::ready(&c)?;
+        crate::sandbox_network::desktop(&crate::sandbox::target(&c)?)
+    })?;
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(&url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    crate::ui::clear_notes();
+    crate::ui::show(
+        "Private desktop",
+        &format!(
+            "Opening the private desktop in your browser. If it does not open, use this local address:\n\n{url}\n\nClosing the browser does not stop or pause the model. Keep Chuggin open while using the viewer. Open desktop is on the home screen; F4 opens it from the observation view."
+        ),
+    )
 }
 fn save_execution(path: Option<&Path>, execution: crate::sandbox::Settings) -> Result<()> {
     execution.validate()?;
@@ -654,6 +687,12 @@ fn save_execution(path: Option<&Path>, execution: crate::sandbox::Settings) -> R
 }
 fn prepare_computer_interactive(path: Option<&Path>) -> Result<bool> {
     loop {
+        if !crate::sandbox::installed() {
+            podman_instructions()?;
+            if !crate::sandbox::installed() {
+                return Ok(false);
+            }
+        }
         let c = editing_config(path)?;
         anyhow::ensure!(
             c.execution.is_private(),
@@ -668,10 +707,8 @@ fn prepare_computer_interactive(path: Option<&Path>) -> Result<bool> {
         );
         match result {
             Ok(()) => {
-                crate::ui::show(
-                    "Private computer ready",
-                    "The isolated Linux installation is ready. CPU, memory and process limits were checked inside it. No model has been started. View private desktop opens its screen in your browser.",
-                )?;
+                crate::ui::clear_notes();
+                crate::ui::notice("Private computer ready. Resource limits checked. Open desktop is on the home screen; F4 opens it from the observation view.".into());
                 return Ok(true);
             }
             Err(error) => {
@@ -711,70 +748,10 @@ fn copy_command(text: &str) -> Result<()> {
     };
     crate::ui::show(title, &format!("{text}\n\n{notice}"))
 }
-fn podman_instructions(path: Option<&Path>) -> Result<()> {
+fn podman_instructions() -> Result<()> {
     loop {
         if crate::sandbox::installed() {
-            let report = crate::ui::busy(
-                "Checking Podman prerequisites",
-                crate::sandbox::prerequisite_report,
-            );
-            crate::ui::clear_notes();
-            match report {
-                Ok(text) => {
-                    crate::ui::notice(text);
-                    if editing_config(path)?.execution.is_private() {
-                        match crate::menu::select(
-                            "Podman checks passed",
-                            &[
-                                "Set up private computer (recommended)".into(),
-                                "Check again".into(),
-                                "Back".into(),
-                            ],
-                            0,
-                        )? {
-                            Some(0) => {
-                                prepare_computer_interactive(path)?;
-                                return Ok(());
-                            }
-                            Some(1) => continue,
-                            _ => return Ok(()),
-                        }
-                    } else {
-                        return crate::ui::show(
-                            "Podman checks passed",
-                            "Rootless containers and cgroup v2 are available. Choose Use a private Linux computer in Computer environment to create its desktop.",
-                        );
-                    }
-                }
-                Err(e) => {
-                    crate::ui::notice(crate::sandbox::setup_error(&e));
-                    let commands = crate::sandbox::repair_commands(&format!("{e:#}"));
-                    match crate::menu::select(
-                        "Podman prerequisite check failed",
-                        &[
-                            "Check again".into(),
-                            if commands.is_some() {
-                                "Copy suggested commands".into()
-                            } else {
-                                "Copy diagnostic command".into()
-                            },
-                            "Back".into(),
-                        ],
-                        0,
-                    )? {
-                        Some(0) => continue,
-                        Some(1) => {
-                            copy_command(
-                                commands
-                                    .as_deref()
-                                    .unwrap_or("podman --remote=false info --debug"),
-                            )?;
-                            continue;
-                        }
-                        _ => return Ok(()),
-                    }
-                }
-            }
+            return Ok(());
         }
         crate::ui::clear_notes();
         crate::ui::notice(crate::sandbox::missing_help());
@@ -807,30 +784,7 @@ pub fn ensure_computer_interactive(path: &Path) -> Result<bool> {
         return Ok(true);
     }
     if !crate::sandbox::installed() || !c.state_dir.join("computer/ready.json").exists() {
-        if !crate::sandbox::installed() {
-            podman_instructions(Some(path))?;
-            return Ok(false);
-        }
-        crate::ui::clear_notes();
-        crate::ui::notice(
-            "This session uses a private Linux computer. Podman is installed, but its desktop has not been created yet. Chuggin can set it up and verify resource limits automatically. Setup downloads/builds a desktop image; inference starts only after setup succeeds.".into(),
-        );
-        return match crate::menu::select(
-            "Set up private computer",
-            &[
-                "Set up now (recommended)".into(),
-                "Computer options".into(),
-                "Back".into(),
-            ],
-            0,
-        )? {
-            Some(0) => prepare_computer_interactive(Some(path)),
-            Some(1) => {
-                computer_environment(Some(path))?;
-                Ok(false)
-            }
-            _ => Ok(false),
-        };
+        return prepare_computer_interactive(Some(path));
     }
     Ok(true)
 }

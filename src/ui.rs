@@ -233,6 +233,7 @@ fn splash(
                     "Settings" => "Common settings for this project",
                     "More project settings" => "Chat, helpers, tools and command review",
                     "Global settings" => "Shared connections and defaults",
+                    "Open desktop" => "View the private computer in your browser",
                     "Quit" => "Return to your shell",
                     _ => descriptions.get(i).copied().unwrap_or(""),
                 })
@@ -1706,7 +1707,7 @@ fn dashboard_footer(
     pausing: bool,
     width: u16,
 ) -> (Paragraph<'static>, u16) {
-    let controls = if d.tab == 5 {
+    let mut controls = if d.tab == 5 {
         "Enter send · Esc cancel · Ctrl+N new chat · F2 tool details · Tab views".into()
     } else if d.finished.is_some() {
         "R resume work  ·  N nudge  ·  Enter / Q return home".into()
@@ -1736,6 +1737,9 @@ fn dashboard_footer(
     } else {
         "P pause · Ctrl+C finish cycle · N nudge · 1–6 views · ? help".into()
     };
+    if c.execution.is_private() {
+        controls.push_str(" · F4 desktop");
+    }
     let (lines, minimum_height) = if let Some(reason) = &d.finished {
         (
             vec![
@@ -2295,7 +2299,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     if d.help {
         let area = a.inner(Margin::new(2, 1));
         f.render_widget(Clear, area);
-        f.render_widget(p("P              Pause / continue current cycle\nT              Retry provider now; queue while paused\nCtrl+C / Q     Finish cycle, then stop\nCtrl+C again   Force stop immediately\nR              Cancel stop / resume saved run\nN              Add / manage a temporary nudge\n1–6 / Tab      Live, model, checks, goal, settings, chat\n↑↓ / wheel     Scroll a few lines\nPgUp / PgDn    Scroll a page\nHome / End     Oldest / latest output\nF              Follow live output\nE              Expand / collapse command output\n/              Search current view\nEsc            Clear search / close help\n\nPause waits for the current operation; the run timer holds.\nStarted commands may finish. Full logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.").block(panel("Keyboard guide · ? / Esc closes")),area);
+        f.render_widget(p("P              Pause / continue current cycle\nT              Retry provider now; queue while paused\nCtrl+C / Q     Finish cycle, then stop\nCtrl+C again   Force stop immediately\nR              Cancel stop / resume saved run\nN              Add / manage a temporary nudge\n1–6 / Tab      Live, model, checks, goal, settings, chat\n↑↓ / wheel     Scroll a few lines\nPgUp / PgDn    Scroll a page\nHome / End     Oldest / latest output\nF              Follow live output\nE              Expand / collapse command output\nF4             Open private desktop (private computer)\n/              Search current view\nEsc            Clear search / close help\n\nPause waits for the current operation; the run timer holds.\nStarted commands may finish. Full logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.").block(panel("Keyboard guide · ? / Esc closes")),area);
     }
 }
 
@@ -2437,6 +2441,15 @@ fn dashboard_session(
             }
             draw(|f| render_dashboard(f, &mut d, &config, stop.load(Ordering::SeqCst)))?;
             if let Some(e) = input()? {
+                if pressed(&e).is_some_and(|k| k.code == KeyCode::F(4))
+                    && config.execution.is_private()
+                {
+                    if let Err(error) = crate::setup::view_private_desktop(Some(path)) {
+                        clear_notes();
+                        show("Could not open private desktop", &format!("{error:#}"))?;
+                    }
+                    continue;
+                }
                 if let Input::Mouse(m) = e {
                     match m.kind {
                         MouseEventKind::ScrollUp => d.back(3),

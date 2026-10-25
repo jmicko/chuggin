@@ -84,7 +84,12 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
         } else {
             None
         };
-        let items = vec![
+        let effective = project.as_ref().and_then(|p| runner::load(p).ok());
+        let private = effective
+            .as_ref()
+            .or(preview.as_ref())
+            .is_some_and(|c| c.execution.is_private());
+        let mut items = vec![
             if project.is_some() {
                 "Resume project"
             } else {
@@ -108,9 +113,11 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             "Chat with this project".into(),
             "More project settings".into(),
             "Global settings".into(),
-            "Quit".into(),
         ];
-        let effective = project.as_ref().and_then(|p| runner::load(p).ok());
+        if private {
+            items.push("Open desktop".into());
+        }
+        items.push("Quit".into());
         let root = effective
             .as_ref()
             .map(|c| c.repo.clone())
@@ -209,11 +216,12 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                     setup::more_project_settings(project.as_deref())?;
                 }
                 8 => setup::settings_menu()?,
+                9 if private => setup::view_private_desktop(project.as_deref())?,
                 _ => {}
             }
             Ok(())
         })();
-        if choice == 9 {
+        if items[choice] == "Quit" {
             return Ok(());
         }
         if let Err(e) = action {

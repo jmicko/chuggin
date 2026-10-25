@@ -209,25 +209,6 @@ fn info() -> Result<Value> {
     Ok(v)
 }
 
-pub fn prerequisite_report() -> Result<String> {
-    let v = info()?;
-    let controllers = v["host"]["cgroupControllers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    Ok(format!(
-        "Podman {}\n✓ Rootless containers enabled\n✓ Linux cgroup v2 available\nSession manager: {}\nReported controllers: {}\n\nChuggin configures CPU, memory and process limits itself and verifies them inside the new computer. Controllers can become available when a limited container starts. You do not need to configure resource limits manually.\n\nNext: choose Set up private computer. Chuggin will download/build the desktop, create its isolated installation, and check that it works. This does not start the model.",
-        v["version"]["Version"].as_str().unwrap_or("detected"),
-        v["host"]["cgroupManager"].as_str().unwrap_or("unknown"),
-        controllers
-    ))
-}
-
 pub fn repair_commands(error: &str) -> Option<String> {
     let e = error.to_lowercase();
     let release = fs::read_to_string("/etc/os-release").unwrap_or_default();
@@ -794,7 +775,7 @@ pub fn ready(c: &crate::runner::Config) -> Result<()> {
     let t = target(c)?;
     ensure!(
         t.state.join("computer/ready.json").exists(),
-        "Prepare the private computer in Settings → More project settings → Computer environment before starting"
+        "The private computer is not set up yet. Open Chuggin and choose Resume project or Open desktop to set it up automatically."
     );
     info()?;
     let staged: Value = fs::read(t.runtime.join("version.json"))
