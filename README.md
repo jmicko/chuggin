@@ -28,7 +28,7 @@ cargo install --path . --locked
 ~~~
 
 This installs one Rust executable into Cargo's bin directory (normally
-~/.cargo/bin). Make sure that directory is on PATH. No Python runtime is used.
+~/.cargo/bin). Make sure that directory is on PATH. Chuggin itself needs no Python runtime.
 
 ## Start
 
@@ -169,7 +169,9 @@ tool instructions rather than a request to act chaotically.
 The saved mode identifier is `type2`; older `chaos` identifiers remain readable.
 Mode identifiers are omitted from model-facing startup, resume, helper, and
 diagnostic messages. Use a neutral workspace directory name for an experiment:
-paths and local configuration remain discoverable through ordinary computer access.
+paths and local configuration remain discoverable when using the host computer.
+The private-computer option below keeps Chuggin's configuration outside the
+model's filesystem.
 
 Every response boundary schedules another opportunity to generate, using the
 saved conversation. Text-only responses, silence, and no file changes do not end
@@ -188,6 +190,60 @@ file hashes detect changes independently of Git. Hash records are not file backu
 The model can use Git through shell commands if it chooses. Mode is fixed
 for a saved session to avoid silently mixing its history with goal-driven
 instructions; start in a new directory to choose another mode.
+
+### Private Linux computer (Podman)
+
+New unassigned sessions ask which computer to use. **Use a private Linux
+computer (Podman)** gives the model its own persistent Debian installation,
+starting in `/root`, with an Xfce desktop. It can use system directories and
+install applications such as GIMP or Blender. Host project files are not imported.
+Existing host sessions retain their environment; start a new session directory
+to use the private computer.
+
+Podman is a separate, user-installed prerequisite. If it is absent, Chuggin
+shows installation instructions for your OS and **Check again**. It installs
+nothing and never falls back to running model commands on the host. This backend
+currently requires Linux, rootless Podman, and working cgroup v2 resource limits.
+For example, Debian, Ubuntu and Linux Mint use `sudo apt install podman`;
+[Podman's installation guide](https://podman.io/docs/installation) covers other systems
+and rootless prerequisites. The macOS/Windows CLI alone is insufficient.
+
+In **More project settings → Computer environment**, choose **Prepare or start
+private computer** to explicitly download/build its desktop image. Build output
+is saved in the session's `computer/build.log`. **View private desktop** opens a
+local, token-protected noVNC viewer in your browser. The model has
+`capture_screenshot` and `desktop_action` tools for its private display; inspecting
+pixels requires a vision-capable inference model. Neither the human desktop nor
+its display socket is shared. Initial rendering is software-only, with no GPU
+passthrough. The desktop image uses distribution packages, including websockify;
+their own runtime dependencies are confined to the computer.
+
+Shell, file, image and desktop tools execute inside the container, including
+tools used by Chat, MCP, and investigation helpers. Only a read-only copy of the
+Rust tool executable/libraries and a dedicated proxy socket directory are mounted.
+Host home directories, project/config files, provider credentials, container
+management sockets and devices are not shared. External harnesses' **own** shell
+or file tools remain the responsibility of those harnesses.
+
+The container has no direct network connection. Optional public-web access goes
+through an HTTP/HTTPS proxy that rejects loopback, LAN, link-local and other
+nonpublic destinations before connecting. Inference and Brave credentials remain
+in the host controller. Applications that cannot use an HTTP proxy may not have
+Internet access. **Computer resource limits** controls CPU, memory and public-web
+access; start/prepare applies the settings and verifies enforcement before tools
+are allowed. Defaults are 4 CPUs, 4 GiB RAM and 512 processes. Container storage
+shares your host disk; this version has no hard disk quota. Containers share the
+host kernel and do not provide a VM's separate-kernel isolation.
+
+The private installation and its files survive restarts. Pausing the model does
+not suspend its desktop or already-started applications. Use **Shut down private
+computer · keep its files** to stop it after finishing the loop and commands;
+resume/prepare starts it again. Conversation history and file-hash observations
+stay outside the container; these records are not backups of its contents.
+
+The initial implementation is covered by tool-routing, isolation-policy and
+missing-dependency tests. A real desktop run still needs verification on a host
+with Podman installed.
 
 ### Sampling profiles
 

@@ -9,7 +9,7 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
@@ -17,6 +17,7 @@ use std::{
 
 #[derive(Clone)]
 struct Managed {
+    sandbox: Option<crate::sandbox::Target>,
     handle: String,
     actor: String,
     id: String,
@@ -126,6 +127,13 @@ pub fn manage(id: &str, action: &str, args: &Value) -> Result<Value> {
                     *m.exited.lock().unwrap() = Some(status);
                 } else {
                     *m.stopped.lock().unwrap() = Some(reason.into());
+                    if let Some(target) = &m.sandbox
+                        && let Err(e) = crate::sandbox::stop_job(target, &m.id)
+                    {
+                        *m.descendant_cleanup.lock().unwrap() = Some(format!(
+                            "Private command cleanup could not be confirmed: {e:#}"
+                        ));
+                    }
                     #[cfg(unix)]
                     unsafe {
                         libc::kill(-(child.id() as i32), libc::SIGKILL);
@@ -272,6 +280,7 @@ fn read_incremental_output(log: &Path, offset: u64, running: bool) -> Result<Val
     )
 }
 pub struct Session {
+    sandbox: Option<crate::sandbox::Target>,
     pub id: String,
     pub log: PathBuf,
     pub argv: Vec<String>,
@@ -291,16 +300,34 @@ pub struct Session {
 }
 impl Session {
     pub fn start(root: &Path, c: &Check, log: &Path, id: &str) -> Result<Self> {
-        crate::dev_tools::validate_argv(&c.argv)?;
+        let sandbox = crate::sandbox::for_root(root);
+        if sandbox.is_none() {
+            crate::dev_tools::validate_argv(&c.argv)?;
+        }
         let file = fs::File::create(log)?;
-        let mut cmd = Command::new(&c.argv[0]);
+        let mut cmd = crate::sandbox::command(root, &c.argv, id)?;
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+            if sandbox.is_some() {
+                // Only the local Podman client writes this host log. Bound a
+                // runaway private program's host-side diagnostic storage too.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        let limit = libc::rlimit {
+                            rlim_cur: 128 * 1024 * 1024,
+                            rlim_max: 128 * 1024 * 1024,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
         }
         let mut child = cmd
-            .args(&c.argv[1..])
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(file.try_clone()?)
@@ -341,6 +368,7 @@ impl Session {
             registry.remove(index);
         }
         let managed = Managed {
+            sandbox: sandbox.clone(),
             handle: crate::operator::id(),
             actor: events::actor(),
             id: id.into(),
@@ -365,6 +393,18 @@ impl Session {
                 let mut child = monitored.lock().unwrap();
                 let status = child.try_wait();
                 if let Ok(Some(status)) = status {
+                    if let Some(target) = &managed.sandbox {
+                        if let Err(e) = crate::sandbox::stop_job(target, &managed.id) {
+                            *managed.descendant_cleanup.lock().unwrap() = Some(format!(
+                                "Private command cleanup could not be confirmed: {e:#}"
+                            ));
+                        } else if !status.success()
+                            && fs::metadata(&managed.log)
+                                .is_ok_and(|m| m.len() >= 128 * 1024 * 1024)
+                        {
+                            *managed.stopped.lock().unwrap() = Some("Private command exceeded the 128 MiB host log limit; its process group was stopped.".into());
+                        }
+                    }
                     #[cfg(unix)]
                     unsafe {
                         if libc::kill(-(pid as i32), 0) == 0 {
@@ -385,6 +425,7 @@ impl Session {
             }
         });
         let session = Self {
+            sandbox,
             pid,
             exited,
             id: id.into(),
@@ -431,6 +472,13 @@ impl Session {
         self.next_review = Instant::now() + Duration::from_secs(seconds.clamp(1, 900));
     }
     fn cleanup(&mut self) {
+        if let Some(target) = &self.sandbox
+            && let Err(e) = crate::sandbox::stop_job(target, &self.id)
+        {
+            *self.descendant_cleanup.lock().unwrap() = Some(format!(
+                "Private command cleanup could not be confirmed: {e:#}"
+            ));
+        }
         let mut child = self.child.lock().unwrap();
         if self.exited.lock().unwrap().is_none() {
             #[cfg(unix)]
@@ -589,7 +637,7 @@ impl Session {
                 .or_else(|| observed_exit.map(|status| status.success()))
         };
         Ok(
-            json!({"pid":self.pid,"command_id":self.id,"argv":self.argv,"mode":*self.mode.lock().unwrap(),"purpose":*self.purpose.lock().unwrap(),"running":running,"elapsed_seconds":self.started.elapsed().as_secs(),"next_review_seconds":self.next_review.saturating_duration_since(Instant::now()).as_secs(),"watchdog_reviews":self.reviews,"log_bytes":fs::metadata(&self.log)?.len(),"next_output_offset":fs::metadata(&self.log)?.len(),"seconds_since_output":fs::metadata(&self.log)?.modified().ok().and_then(|t|t.elapsed().ok()).map(|d|d.as_secs()),"processes":process_observations(self.pid),"exit_code":exit_code,"passed":passed,"timed_out":false,"stop_reason":stopped,"descendant_cleanup_reason":descendant_cleanup,"output_tail":self.tail()?,"log_id":log_id,"instruction":"Commands stay owned by the controller across turns, cycles and soft stops. Use command_status with wait_ms up to 60000 and the existing command_id for fresh output or completion. Use read_command_log with log_id for older/full output. Finite work must finish before editing its workspace; deliberate background apps can remain open. A running command is not a passing check. If stop_reason or descendant_cleanup_reason is present, Chuggin performed the recorded cleanup; do not mistake it for an unexplained application crash. Launch apps/servers directly with mode=background, without shell &."}),
+            json!({"pid":self.pid,"command_id":self.id,"argv":self.argv,"mode":*self.mode.lock().unwrap(),"purpose":*self.purpose.lock().unwrap(),"running":running,"elapsed_seconds":self.started.elapsed().as_secs(),"next_review_seconds":self.next_review.saturating_duration_since(Instant::now()).as_secs(),"watchdog_reviews":self.reviews,"log_bytes":fs::metadata(&self.log)?.len(),"next_output_offset":fs::metadata(&self.log)?.len(),"seconds_since_output":fs::metadata(&self.log)?.modified().ok().and_then(|t|t.elapsed().ok()).map(|d|d.as_secs()),"processes":if self.sandbox.is_some(){Vec::<Value>::new()}else{process_observations(self.pid)},"exit_code":exit_code,"passed":passed,"timed_out":false,"stop_reason":stopped,"descendant_cleanup_reason":descendant_cleanup,"output_tail":self.tail()?,"log_id":log_id,"instruction":"Commands stay owned by the controller across turns, cycles and soft stops. Use command_status with wait_ms up to 60000 and the existing command_id for fresh output or completion. Use read_command_log with log_id for older/full output. Finite work must finish before editing its workspace; deliberate background apps can remain open. A running command is not a passing check. If stop_reason or descendant_cleanup_reason is present, Chuggin performed the recorded cleanup; do not mistake it for an unexplained application crash. Launch apps/servers directly with mode=background, without shell &."}),
         )
     }
     fn persist(&self) -> Result<()> {

@@ -2348,6 +2348,9 @@ fn dashboard_session(
     start: bool,
     chat: bool,
 ) -> Result<bool> {
+    if !crate::setup::ensure_computer_interactive(path)? {
+        return Ok(false);
+    }
     let mut config = runner::load(path)?;
     // Identity setup can prompt, so complete it on the thread that owns the terminal.
     if !config.activity_mode.is_chaos() {
@@ -3167,7 +3170,7 @@ mod tests {
         assert_eq!(e.value, "héllo\nworld");
     }
     fn config() -> runner::Config {
-        runner::Config {activity_mode:crate::activity::Mode::Goal,sampling:crate::sampling::Settings::default(),setup_sampling:crate::sampling::Settings::default(),chat_sampling:crate::sampling::Settings::default(),reasoning:crate::reasoning::Setting::Default,setup_model:String::new(),setup_reasoning:crate::reasoning::Setting::Default,chat_reasoning:crate::reasoning::Setting::Default,helpers:crate::agents::Settings::default(),chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
+        runner::Config {execution:crate::sandbox::Settings::default(),activity_mode:crate::activity::Mode::Goal,sampling:crate::sampling::Settings::default(),setup_sampling:crate::sampling::Settings::default(),chat_sampling:crate::sampling::Settings::default(),reasoning:crate::reasoning::Setting::Default,setup_model:String::new(),setup_reasoning:crate::reasoning::Setting::Default,chat_reasoning:crate::reasoning::Setting::Default,helpers:crate::agents::Settings::default(),chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
     }
     fn screen_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();

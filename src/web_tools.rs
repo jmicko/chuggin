@@ -194,7 +194,7 @@ fn search_error(status: u16, payload: Option<&Value>, credential: &str) -> Strin
     )
 }
 
-fn public(ip: IpAddr) -> bool {
+pub(crate) fn public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(a) => {
             !a.is_private()

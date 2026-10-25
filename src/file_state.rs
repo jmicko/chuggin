@@ -162,10 +162,13 @@ pub fn tree(root: &Path, state: &Path) -> Result<String> {
                 .is_ok_and(|p| files.contains_key(p.to_string_lossy().as_ref()))
     });
     drop(cache);
+    record(&state, files)
+}
+pub fn record(state: &Path, files: BTreeMap<String, String>) -> Result<String> {
     let manifest = Manifest { files };
     let bytes = serde_json::to_vec(&manifest)?;
     let id = format!("files-{:x}", Sha256::digest(&bytes));
-    let path = manifest_path(&state, &id)?;
+    let path = manifest_path(state, &id)?;
     if !path.exists() {
         crate::setup::save(&path, &manifest)?;
     }

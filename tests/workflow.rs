@@ -840,6 +840,221 @@ fn chaos_accepts_silent_responses_across_intervals_and_cold_resume() {
 }
 
 #[test]
+fn goal_recovers_repeated_empty_responses_without_losing_or_replaying_work() {
+    let server = Server::custom(false, false, None, |_, n| match n {
+        0 => (
+            String::new(),
+            json!([task_tool("Refine the saved material"),
+            {"function":{"name":"write_file","arguments":{"path":"value.txt","content":"preserved edit"}}}]),
+        ),
+        1..=3 => (String::new(), json!([])),
+        4 => (
+            String::new(),
+            json!([{"function":{"name":"read_file","arguments":{"path":"value.txt"}}}]),
+        ),
+        _ => (
+            "Recovered with the saved material intact.".into(),
+            json!([]),
+        ),
+    });
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path(), &server.url, true);
+    run_cycles_bounded(root.path(), 2);
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/value.txt")).unwrap(),
+        "preserved edit"
+    );
+    // The streak and current task survive a cold restart.
+    run_cycles_bounded(root.path(), 1);
+    assert!(
+        root.path()
+            .join("state/cycle-000003/conversation-before-refresh-0.json")
+            .exists()
+    );
+    let saved = state(root.path());
+    assert_eq!(saved["current_task"]["title"], "Refine the saved material");
+    run_cycles_bounded(root.path(), 1);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert!(
+        !requests[4]["messages"]
+            .to_string()
+            .contains("The provider ended its last response")
+    );
+    assert!(
+        requests[4]["messages"]
+            .to_string()
+            .contains("Refine the saved material")
+    );
+    let archived: Value = serde_json::from_slice(
+        &fs::read(
+            root.path()
+                .join("state/cycle-000003/conversation-before-refresh-0.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        archived["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+            .filter(|c| c["function"]["name"] == "write_file")
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/value.txt")).unwrap(),
+        "preserved edit"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn private_tools_and_commands_never_fall_back_to_the_host() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let canary = root.path().join("host-private.txt");
+    let marker = root.path().join("must-not-be-created");
+    fs::write(&canary, "HOST_SECRET_MUST_STAY_OUTSIDE").unwrap();
+    let read_path = canary.clone();
+    let command_marker = marker.clone();
+    let server = Server::custom(false, false, None, move |_, n| match n {
+        0 => (
+            String::new(),
+            json!([
+                {"function":{"name":"read_file","arguments":{"path":read_path}}},
+                {"function":{"name":"write_file","arguments":{"path":read_path,"content":"private write"}}}
+            ]),
+        ),
+        1 => (
+            String::new(),
+            json!([{"function":{"name":"run_command","arguments":{
+            "argv":["sh","-c",format!("touch {}",command_marker.display())],"timeout_seconds":1}}}]),
+        ),
+        2 => (
+            String::new(),
+            json!([
+                {"function":{"name":"capture_screenshot","arguments":{}}},
+                {"function":{"name":"view_image","arguments":{"path":"secret.png","image_id":null}}},
+                {"function":{"name":"desktop_action","arguments":{"action":"click","x":5,"y":5}}}
+            ]),
+        ),
+        _ => ("Observed the private computer.".into(), json!([])),
+    });
+    let path = chaos_fixture(root.path(), &server.url);
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+        .save(root.path().join("repo/secret.png"))
+        .unwrap();
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["execution"] = json!({"kind":"podman","memory_mb":4096,"cpus":4,"internet":false});
+    fs::write(&path, config.to_string()).unwrap();
+    let repo = fs::canonicalize(root.path().join("repo")).unwrap();
+    let hash = format!("{:x}", Sha256::digest(repo.as_os_str().as_encoded_bytes()));
+    let name = format!("chuggin-{}", &hash[..24]);
+    let computer = root.path().join("state/computer");
+    let runtime = computer.join("tool-runtime");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::create_dir_all(computer.join("channel")).unwrap();
+    fs::write(runtime.join("loader"), "").unwrap();
+    fs::write(
+        runtime.join("version.json"),
+        json!({"version":env!("CARGO_PKG_VERSION")}).to_string(),
+    )
+    .unwrap();
+    fs::write(computer.join("ready.json"), "{}").unwrap();
+    let inspect = json!([{"Config":{"Labels":{"io.chuggin.session":name}},
+        "HostConfig":{"Privileged":false,"NetworkMode":"none","SecurityOpt":["no-new-privileges"]},
+        "Mounts":[{"Source":runtime,"Destination":"/opt/session-runtime","RW":false},
+            {"Source":computer.join("channel"),"Destination":"/run/public-web","RW":false}]}]);
+    let inspect_path = root.path().join("inspect.json");
+    fs::write(&inspect_path, inspect.to_string()).unwrap();
+    let png = root.path().join("desktop.png");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+        .save(&png)
+        .unwrap();
+    let bin = root.path().join("fake-bin");
+    fs::create_dir(&bin).unwrap();
+    let calls = root.path().join("podman-calls.log");
+    let q = |p: &Path| shell_words::quote(p.to_str().unwrap()).into_owned();
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> {calls}
+case "$2" in
+  --version) echo 'podman version TEST';;
+  info) echo '{{"host":{{"security":{{"rootless":true}},"cgroupVersion":"v2"}}}}';;
+  inspect) cat {inspect};;
+  diff) echo '{{"added":[],"changed":[],"deleted":[]}}';;
+  start|update) exit 0;;
+  exec)
+    case " $* " in
+      *' guest-command '*) echo 'private command only'; exit 0;;
+      *' import '*) cat {png}; exit 0;;
+      *' cat -- secret.png '*) cat {png}; exit 0;;
+    esac
+    request=$(cat)
+    case "$request" in
+      *'"name":"resource_limits"'*) echo '{{"ok":true,"result":{{"memory":"4294967296","cpu":"400000 100000","pids":"512"}}}}';;
+      *'"name":"observe"'*) echo '{{"ok":true,"result":{{"files":{{}},"cache":{{}}}}}}';;
+      *'"name":"read_file"'*) echo '{{"ok":true,"result":{{"text":"private-only text","version":"private"}}}}';;
+      *'"name":"write_file"'*) echo '{{"ok":true,"result":{{"changed":true,"version":"private"}}}}';;
+      *) echo '{{"ok":true,"result":{{"performed":true}}}}';;
+    esac;;
+  *) exit 19;;
+esac
+"#,
+        calls = q(&calls),
+        inspect = q(&inspect_path),
+        png = q(&png)
+    );
+    fs::write(bin.join("podman"), script).unwrap();
+    fs::set_permissions(bin.join("podman"), fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    run_cycles_with_environment(root.path(), 1, &[("PATH", &environment)]);
+    assert_eq!(
+        fs::read_to_string(&canary).unwrap(),
+        "HOST_SECRET_MUST_STAY_OUTSIDE"
+    );
+    assert!(!marker.exists());
+    assert!(!repo.join(".git").exists());
+    let requests = server.requests.lock().unwrap();
+    let context = requests.last().unwrap()["messages"].to_string();
+    assert!(context.contains("private-only text"));
+    assert!(!context.contains("HOST_SECRET_MUST_STAY_OUTSIDE"));
+    assert!(
+        requests[0]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("/root")
+    );
+    assert!(
+        requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["function"]["name"] == "desktop_action")
+    );
+    let calls = fs::read_to_string(calls).unwrap();
+    assert!(calls.contains("guest-command"));
+    assert!(calls.contains("import -window root"));
+    let images: Vec<_> = fs::read_dir(computer.parent().unwrap().join("images"))
+        .unwrap()
+        .flatten()
+        .filter(|p| p.path().extension().is_some_and(|e| e == "png"))
+        .collect();
+    assert_eq!(images.len(), 2);
+    for entry in images {
+        assert_eq!(
+            image::image_dimensions(entry.path()).unwrap(),
+            (2, 2),
+            "Even image_id:null must read the private image, never the host's different image"
+        );
+    }
+}
+
+#[test]
 fn chaos_can_close_a_self_selected_task_without_claiming_validation() {
     let server = Server::custom(false, false, None, |_, n| match n {
         0 => (
@@ -2494,6 +2709,9 @@ mod terminal_ui {
     }
     impl TerminalProcess {
         fn start(root: &Path) -> Self {
+            Self::start_with_environment(root, &[])
+        }
+        fn start_with_environment(root: &Path, environment: &[(&str, &str)]) -> Self {
             let (mut master, mut slave) = (0, 0);
             let size = libc::winsize {
                 ws_row: 36,
@@ -2522,6 +2740,7 @@ mod terminal_ui {
             );
             let original = unsafe { term.assume_init() }.c_lflag;
             let mut cmd = command(root);
+            cmd.envs(environment.iter().copied());
             cmd.env("TERM", "xterm-256color")
                 .stdin(slave.try_clone().unwrap())
                 .stdout(slave.try_clone().unwrap())
@@ -4093,7 +4312,7 @@ mod terminal_ui {
         .unwrap();
         fs::write(
             root.path().join(".chuggin/project-draft-settings.json"),
-            json!({"model":"fake"}).to_string(),
+            json!({"model":"fake","execution":{"kind":"host"}}).to_string(),
         )
         .unwrap();
         fs::write(root.path().join("observation.txt"), "Existing material").unwrap();
@@ -4135,6 +4354,62 @@ mod terminal_ui {
                 .join(".chuggin/project-draft-settings.json")
                 .exists()
         );
+    }
+
+    #[test]
+    fn private_computer_setup_explains_missing_podman_and_never_runs_on_host() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        let defaults = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(defaults.parent().unwrap()).unwrap();
+        fs::write(
+            &defaults,
+            json!({"model":"fake","ollama_url":server.url}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".chuggin/project-draft-settings.json"),
+            json!({"model":"fake","activity_mode":"type2"}).to_string(),
+        )
+        .unwrap();
+        let bin = root.path().join("fake-bin");
+        fs::create_dir(&bin).unwrap();
+        let log = root.path().join("podman.log");
+        fs::write(
+            bin.join("podman"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 127\n",
+                shell_words::quote(log.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("podman"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let mut ui = TerminalProcess::start_with_environment(root.path(), &[("PATH", &path)]);
+        ui.wait("Set up this project");
+        ui.send(b"\r");
+        ui.wait("Use a private Linux computer");
+        ui.send(b"\r");
+        ui.wait("Podman not installed");
+        ui.wait("Chuggin has installed nothing");
+        ui.send(b"\x1b");
+        ui.wait("Resume project");
+        let config: Value =
+            serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
+        assert_eq!(config["execution"]["kind"], "podman");
+        ui.send(b"\r");
+        ui.wait("Prepare or start private computer");
+        ui.send(b"\x1b");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert!(!root.path().join(".git").exists());
+        assert!(!root.path().join(".chuggin/state.json").exists());
+        for call in fs::read_to_string(log).unwrap().lines() {
+            assert_eq!(call, "--remote=false --version");
+        }
     }
 
     #[test]

@@ -29,6 +29,8 @@ pub fn validate_token_limits(context: u32, output: u32) -> Result<()> {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub execution: crate::sandbox::Settings,
+    #[serde(default)]
     pub active_hours: crate::schedule::Schedule,
     #[serde(default)]
     pub activity_mode: crate::activity::Mode,
@@ -77,6 +79,9 @@ impl Config {
         !self.activity_mode.is_chaos() && self.allow_goal_completion
     }
     pub(crate) fn tree(&self, root: &Path) -> Result<String> {
+        if self.execution.is_private() {
+            return crate::sandbox::tree(self);
+        }
         if self.activity_mode.is_chaos() {
             crate::file_state::tree(root, &self.state_dir)
         } else {
@@ -139,6 +144,20 @@ impl Config {
         let root = fs::canonicalize(&self.repo)?;
         Ok(root)
     }
+    pub(crate) fn work_prompt(&self) -> &'static str {
+        if self.execution.is_private() {
+            crate::prompts::COMPUTER_WORK
+        } else {
+            crate::prompts::work(self.activity_mode)
+        }
+    }
+    pub(crate) fn model_workspace(&self) -> PathBuf {
+        if self.execution.is_private() {
+            PathBuf::from("/root")
+        } else {
+            self.repo.clone()
+        }
+    }
 }
 pub fn default_command_review() -> u64 {
     120
@@ -188,6 +207,7 @@ struct State {
     schema_version: u32,
     run_id: String,
     activity_mode: crate::activity::Mode,
+    execution: crate::sandbox::Settings,
     goal: String,
     repo: PathBuf,
     cycle: u64,
@@ -243,6 +263,7 @@ struct Conversation {
     note: RepairNote,
     context_pressure: bool,
     response_errors: u32,
+    empty_response_streak: u32,
     prompt_version: String,
     observed_tree: String,
     reread: std::collections::BTreeSet<String>,
@@ -552,6 +573,11 @@ fn load_value_with_settings(
         }
     }
     let mut c: Config = serde_json::from_value(merged)?;
+    c.execution.validate()?;
+    anyhow::ensure!(
+        !c.execution.is_private() || c.activity_mode.is_chaos(),
+        "Private computers currently use the continuous, unassigned mode"
+    );
     let parent = fs::canonicalize(
         path.parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -1211,6 +1237,10 @@ fn prepare_legacy_state(c: &Config) -> Result<State> {
         let mut s: State = serde_json::from_slice(&bytes)?;
         ensure_activity_mode(c, &s)?;
         anyhow::ensure!(
+            s.execution.is_private() == c.execution.is_private(),
+            "Computer environment is fixed for a saved conversation. Start a new session folder to choose another environment."
+        );
+        anyhow::ensure!(
             s.schema_version <= 3,
             "This state needs a newer Chuggin version"
         );
@@ -1333,6 +1363,7 @@ fn prepare_legacy_state(c: &Config) -> Result<State> {
             schema_version: 3,
             run_id: id,
             activity_mode: c.activity_mode,
+            execution: c.execution.clone(),
             goal: c.goal.clone(),
             repo: fs::canonicalize(&c.repo)?,
             working_ref,
@@ -1365,7 +1396,11 @@ fn checkpoint(c: &Config, s: &mut State, message: &str) -> Result<bool> {
 }
 fn workspace_event(s: &State) {
     crate::events::send(crate::events::Event::Workspace {
-        path: s.working_workspace.display().to_string(),
+        path: if s.execution.is_private() {
+            "/root".into()
+        } else {
+            s.working_workspace.display().to_string()
+        },
         branch: s.working_branch.clone(),
         head: s.branch_head.clone(),
         recovery: s.working_ref.clone(),
@@ -1373,6 +1408,10 @@ fn workspace_event(s: &State) {
     });
 }
 fn ensure_activity_mode(c: &Config, s: &State) -> Result<()> {
+    anyhow::ensure!(
+        s.execution.is_private() == c.execution.is_private(),
+        "Computer environment is fixed for a saved conversation. Start in a new session folder to choose another environment."
+    );
     anyhow::ensure!(
         s.activity_mode == c.activity_mode,
         "This saved conversation uses {}. Start {} in a separate project folder to keep its history distinct.",
@@ -1418,6 +1457,7 @@ fn prepare_state(c: &Config) -> Result<State> {
                 .as_nanos()
                 .to_string(),
             activity_mode: c.activity_mode,
+            execution: c.execution.clone(),
             goal: c.goal.clone(),
             repo: fs::canonicalize(&c.repo)?,
             working_workspace: fs::canonicalize(&c.repo)?,
@@ -1451,7 +1491,7 @@ fn save_conversation(c: &Config, session: &Conversation) -> Result<()> {
     save(&c.state_dir.join("conversation.json"), session)
 }
 fn activity_context(c: &Config, s: &State) -> Value {
-    let mut context = json!({"workspace":s.working_workspace,"configured_checks":c.checks,"instruction":crate::prompts::orient(c.activity_mode)});
+    let mut context = json!({"workspace":c.model_workspace(),"configured_checks":c.checks,"instruction":crate::prompts::orient(c.activity_mode)});
     if !c.activity_mode.is_chaos() {
         context["main_goal"] = json!(if s.goal.is_empty() { &c.goal } else { &s.goal });
     }
@@ -1459,7 +1499,7 @@ fn activity_context(c: &Config, s: &State) -> Value {
 }
 fn resumed_context(c: &Config, state: &State) -> Value {
     if c.activity_mode.is_chaos() {
-        json!({"role":"user","content":json!({"workspace":state.working_workspace,"instruction":"This is the same self-directed conversation without an assigned project goal. Existing files, observations, and any activity records are retained. Inspect current files before editing. Conversation and tool history are saved automatically. File observation identifiers describe file state; they are not recoverable file backups. There is no automatic version control or commit on task completion. Recording tasks is optional. Decide what, if anything, to pursue next."}).to_string()})
+        json!({"role":"user","content":json!({"workspace":c.model_workspace(),"instruction":"This is the same self-directed conversation without an assigned project goal. Existing files, observations, and any activity records are retained. Inspect current files before editing. Conversation and tool history are saved automatically. File observation identifiers describe file state; they are not recoverable file backups. There is no automatic version control or commit on task completion. Recording tasks is optional. Decide what, if anything, to pursue next."}).to_string()})
     } else {
         json!({"role":"user","content":format!("Current overall goal: {}. Current visible project folder: {}. Branch: {}. HEAD: {}. Work directly here. Earlier workspace paths may be retired; inspect current files before editing. Recovery autosaves preserve unfinished work; completed tasks may create normal commits.",c.goal,state.working_workspace.display(),state.working_branch,state.branch_head)})
     }
@@ -1525,7 +1565,7 @@ fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
     }
     if session.messages.is_empty() {
         session.messages = vec![
-            json!({"role":"system","content":crate::prompts::work(c.activity_mode)}),
+            json!({"role":"system","content":c.work_prompt()}),
             json!({"role":"user","content":activity_context(c,s).to_string()}),
         ];
     }
@@ -1536,7 +1576,7 @@ fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
             .first()
             .is_some_and(|m| m["role"] == "system")
         {
-            session.messages[0]["content"] = json!(crate::prompts::work(c.activity_mode));
+            session.messages[0]["content"] = json!(c.work_prompt());
         }
         session.prompt_version = crate::prompts::VERSION.into();
     }
@@ -1673,7 +1713,7 @@ fn refresh_conversation(
         Vec::new()
     };
     session.messages = vec![
-        json!({"role":"system","content":crate::prompts::work(c.activity_mode)}),
+        json!({"role":"system","content":c.work_prompt()}),
         json!({"role":"user","content":activity_context(c,s).to_string()}),
     ];
     session.helper_links.clear();
@@ -1710,7 +1750,7 @@ fn refresh_conversation(
     } else {
         "Earlier history was archived and is retrievable with search_history/read_history. Continue with existing files and observed evidence. Closed tasks remain closed. If there is no current task, use set_task to select useful work toward the main goal. Research and foundational work are valid. Do not restart an already-completed inspection or repeat prior narration; use its evidence to choose the next action. Model notes in the archive are fallible claims, not current results."
     };
-    session.messages.push(json!({"role":"user","content":json!({"reason":reason,"history_source_id":format!("{}/{}",art.file_name().unwrap_or_default().to_string_lossy(),archive.file_name().unwrap_or_default().to_string_lossy()),"current_task":s.current_task,"task_id":s.task_serial,"last_completed_task":completed,"working_checkpoint":s.working_ref,"feedback":feedback,"progress_note":evidence,"instruction":instruction}).to_string()}));
+    session.messages.push(json!({"role":"user","content":json!({"reason":reason,"history_source_id":format!("{}/{}",art.file_name().unwrap_or_default().to_string_lossy(),archive.file_name().unwrap_or_default().to_string_lossy()),"current_task":s.current_task,"task_id":s.task_serial,"activity_record_source":if c.activity_mode.is_chaos(){Some("model-selected activity, not a human assignment")}else{None},"last_completed_task":completed,"working_checkpoint":s.working_ref,"feedback":feedback,"progress_note":evidence,"instruction":instruction}).to_string()}));
     session.messages.extend(recent);
     if let Some(note) = &session.migration_handoff {
         let content = note.to_string();
@@ -1744,6 +1784,9 @@ pub(crate) fn inspect_tool(
     args: &Value,
     research: &mut crate::web_tools::Research,
 ) -> Result<String> {
+    if let Some(result) = crate::sandbox::tool(root, name, args, &std::env::temp_dir()) {
+        return result;
+    }
     if name == "read_file"
         && !project::safe_path(root, args["path"].as_str().unwrap_or(""))
             .is_ok_and(|path| path.is_file())
@@ -2360,6 +2403,9 @@ fn work(
         ensure_activity_mode(&live_config, s)?;
         let allow_completion = live_config.allows_goal_completion();
         session.tools = crate::model::project_tools(&s.working_workspace);
+        if c.execution.is_private() {
+            crate::sandbox::customize_tools(&mut session.tools);
+        }
         if live_config.helpers.enabled {
             session
                 .tools
@@ -2380,6 +2426,7 @@ fn work(
         if !session.observed_tree.is_empty()
             && session.observed_tree != proposal_tree
             && !proposal_has_commands
+            && !c.execution.is_private()
         {
             session.prose_watch.progress();
             session.thinking_watch.progress();
@@ -2460,6 +2507,33 @@ fn work(
             )
             .into());
         }
+        if calls.is_empty()
+            && response_prose.trim().is_empty()
+            && response_thinking.trim().is_empty()
+            && !c.activity_mode.is_chaos()
+        {
+            session.empty_response_streak += 1;
+            crate::events::log(format!(
+                "Provider returned an empty response ({} consecutive); recovering the current conversation without replaying actions.",
+                session.empty_response_streak
+            ));
+            if session.empty_response_streak >= 3 {
+                refresh_conversation(
+                    c,
+                    s,
+                    session,
+                    art,
+                    "Repeated empty provider responses; archived the unproductive conversation",
+                    false,
+                )?;
+                session.empty_response_streak = 0;
+            } else {
+                session.messages.push(json!({"role":"user","content":"The provider ended its last response without text or actions. Continue the current task using the available tools and current files, or report concrete findings. No action was executed or replayed for that response."}));
+            }
+            save_conversation(c, session)?;
+            break;
+        }
+        session.empty_response_streak = 0;
         if calls.is_empty() {
             observe_prose(session, art, &response_prose, false, false)?;
             observe_prose(session, art, &response_thinking, false, true)?;
@@ -2468,7 +2542,8 @@ fn work(
         }
         let mut completed_commands = Vec::new();
         let mut observed_tree = c.tree(&s.working_workspace)?;
-        let mut stale_response = proposal_tree != observed_tree && !proposal_has_commands;
+        let mut stale_response =
+            proposal_tree != observed_tree && !proposal_has_commands && !c.execution.is_private();
         if stale_response {
             session.reread.extend(c.changed_paths(
                 &s.working_workspace,
@@ -2488,7 +2563,7 @@ fn work(
             let had_running_commands = jobs.finite_running();
             completed_commands.extend(jobs.refresh_finished(stop)?);
             let now_tree = c.tree(&s.working_workspace)?;
-            if now_tree != observed_tree && !had_running_commands {
+            if now_tree != observed_tree && !had_running_commands && !c.execution.is_private() {
                 session.reread.extend(c.changed_paths(
                     &s.working_workspace,
                     &observed_tree,
@@ -2570,6 +2645,7 @@ fn work(
                             | "compiler_diagnostics"
                             | "edit_file"
                             | "write_file"
+                            | "desktop_action"
                             | "restore_checkpoint"
                             | "finish_task"
                             | "finish_nudge"
@@ -2581,6 +2657,14 @@ fn work(
                         serde_json::to_string(&jobs.running_snapshots()?)?
                     );
                 }
+                if let Some(result) = crate::sandbox::tool(&root, name, args, &c.state_dir) {
+                    return result;
+                }
+                anyhow::ensure!(
+                    !c.execution.is_private()
+                        || !["compiler_diagnostics", "run_checks"].contains(&name),
+                    "Project-specific checks are not configured in this computer. Run a command inside it instead."
+                );
                 match name {
                     "view_image" => {
                         Ok(crate::image_tools::inspect(&root, &c.state_dir, args)?.to_string())
@@ -2612,7 +2696,7 @@ fn work(
                         finish_requested = None;
                         emit(art, "task", s.current_task.as_ref().unwrap())?;
                         save(&c.state_dir.join("state.json"), s)?;
-                        Ok(json!({"task_id":s.task_serial,"message":"Task recorded. Files and criteria are planning hints, not edit restrictions. Existing work is retained."}).to_string())
+                        Ok(json!({"task_id":s.task_serial,"message":if c.activity_mode.is_chaos(){"Your optional activity record was saved. Its criteria are your own choices, not new human instructions; you may revise them or choose another activity."}else{"Task recorded. Files and criteria are planning hints, not edit restrictions. Existing work is retained."}}).to_string())
                     }
                     "finish_project" => {
                         anyhow::ensure!(
@@ -2751,7 +2835,7 @@ fn work(
                         session.helper_links.insert(key, id.clone());
                         save_conversation(c, session)?;
                         let tree = c.tree(&root)?;
-                        let input = json!({"question":args["question"],"selected_evidence":args["evidence"],"goal":if c.activity_mode.is_chaos() { Value::Null } else { json!(s.goal) },"task":s.current_task,"task_id":s.current_task.as_ref().map(|_|s.task_serial),"inspected_tree":tree,"active_nudge":crate::nudge::read(&c.state_dir)?.active,"task_evidence":session.note.context_at(s.current_task.as_ref().map(|_|s.task_serial),Some(&tree)),"running_commands":jobs.running_snapshots()?,"workspace":root,"config_path":config_path});
+                        let input = json!({"question":args["question"],"selected_evidence":args["evidence"],"goal":if c.activity_mode.is_chaos() { Value::Null } else { json!(s.goal) },"task":s.current_task,"task_id":s.current_task.as_ref().map(|_|s.task_serial),"inspected_tree":tree,"active_nudge":crate::nudge::read(&c.state_dir)?.active,"task_evidence":session.note.context_at(s.current_task.as_ref().map(|_|s.task_serial),Some(&tree)),"running_commands":jobs.running_snapshots()?,"workspace":c.model_workspace(),"config_path":config_path});
                         crate::events::log(format!(
                             "Investigation {id}: {}",
                             project::excerpt(args["question"].as_str().unwrap_or(""), 160)
@@ -2784,6 +2868,10 @@ fn work(
                                 }
                                 "read_history" => {
                                     Ok(crate::history::read(&c.state_dir, args)?.to_string())
+                                }
+                                "view_image" if c.execution.is_private() => {
+                                    crate::sandbox::tool(&root, "view_image", args, &c.state_dir)
+                                        .unwrap()
                                 }
                                 "view_image" => {
                                     Ok(crate::image_tools::inspect(&root, &c.state_dir, args)?
@@ -3130,6 +3218,8 @@ pub fn run_controlled_with_commands(
     controls.bind_stop(stop.clone());
     controls.configure(path);
     let c = load(path)?;
+    crate::sandbox::register(&c)?;
+    crate::sandbox::ready(&c)?;
     if !c.activity_mode.is_chaos() {
         crate::setup::ensure_git_identity(&c.repo)?;
     }

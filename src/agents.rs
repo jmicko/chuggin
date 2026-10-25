@@ -141,12 +141,16 @@ struct Job {
 }
 impl Job {
     fn create(id: &str, input: Value, model: String, url: String, max_calls: u32) -> Self {
+        let mut visible = input.clone();
+        if let Some(value) = visible.as_object_mut() {
+            value.remove("config_path");
+        }
         Self {
             schema: 1,
             id: id.into(),
             messages: vec![
                 json!({"role":"system","content":PROMPT}),
-                json!({"role":"user","content":input.to_string()}),
+                json!({"role":"user","content":visible.to_string()}),
             ],
             input,
             model,

@@ -43,6 +43,18 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().into())
 }
 pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
+    if crate::sandbox_guest::active() {
+        anyhow::ensure!(
+            !relative.is_empty() && !relative.contains('\0'),
+            "Invalid path"
+        );
+        let path = Path::new(relative);
+        return Ok(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        });
+    }
     let path = Path::new(relative);
     anyhow::ensure!(!relative.is_empty(), "Empty path");
     for c in path.components() {

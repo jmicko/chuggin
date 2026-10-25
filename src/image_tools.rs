@@ -252,6 +252,18 @@ pub fn inspect(root: &Path, art: &Path, args: &Value) -> Result<Value> {
     snapshot(&path, art, source)
 }
 
+pub fn import_bytes(art: &Path, bytes: &[u8], source: Value) -> Result<Value> {
+    ensure!(
+        bytes.len() as u64 <= MAX_IMAGE_BYTES,
+        "Image exceeds byte limit"
+    );
+    fs::create_dir_all(art)?;
+    let mut file = tempfile::NamedTempFile::new_in(art)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    snapshot(file.path(), art, source)
+}
+
 #[derive(Debug)]
 struct Window {
     id: String,

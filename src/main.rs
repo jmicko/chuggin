@@ -37,6 +37,9 @@ mod responses;
 mod run_control;
 mod runner;
 mod sampling;
+mod sandbox;
+mod sandbox_guest;
+mod sandbox_network;
 mod schedule;
 mod search;
 mod setup;
@@ -70,6 +73,15 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    Guest,
+    #[command(name = "guest-command", hide = true)]
+    GuestExec {
+        #[arg(long)]
+        id: String,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
     /// Expose project tools to an external AI application over local MCP.
     Mcp {
         #[arg(long)]
@@ -122,6 +134,12 @@ enum Command {
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Command::Guest)) {
+        return sandbox_guest::serve();
+    }
+    if let Some(Command::GuestExec { id, argv }) = &cli.command {
+        return sandbox_guest::command(id, argv);
+    }
     // Background engines and MCP must never emit terminal controls on protocol stdout.
     let _title = if matches!(
         cli.command,
@@ -159,6 +177,7 @@ fn main() -> Result<()> {
         events::log("Stop requested: finishing this loop, then saving. In the dashboard, press R to resume; Ctrl-C again stops immediately.".into());
     })?;
     match cli.command {
+        Some(Command::Guest | Command::GuestExec { .. }) => unreachable!(),
         Some(Command::Mcp { project }) => {
             events::protocol_output();
             let path = if project.is_dir() {

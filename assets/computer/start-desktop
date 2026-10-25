@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+mkdir -p /run/session-jobs /run/desktop
+chmod 700 /run/session-jobs /run/desktop
+export XDG_RUNTIME_DIR=/run/desktop
+if [ -S /run/public-web/public-web.sock ]; then
+    socat TCP-LISTEN:3128,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/public-web/public-web.sock &
+    export http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128
+    export HTTP_PROXY="$http_proxy" HTTPS_PROXY="$https_proxy"
+    printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$http_proxy" "$https_proxy" > /etc/apt/apt.conf.d/90-private-network
+    printf 'export http_proxy=%s https_proxy=%s HTTP_PROXY=%s HTTPS_PROXY=%s\n' "$http_proxy" "$https_proxy" "$http_proxy" "$https_proxy" > /etc/profile.d/network.sh
+fi
+Xvfb :1 -screen 0 1440x900x24 -nolisten tcp &
+until xdpyinfo -display :1 >/dev/null 2>&1; do sleep 0.2; done
+x11vnc -display :1 -forever -shared -localhost -nopw -rfbport 5900 -quiet &
+websockify --web /usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900 &
+exec dbus-run-session -- xfce4-session

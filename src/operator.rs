@@ -74,6 +74,8 @@ impl Controller {
             "Review the one-time project upgrade from Resume project first"
         );
         let locks = runner::lock_project(&c)?;
+        crate::sandbox::ready(&c)?;
+        crate::sandbox::register(&c)?;
         let controls = Arc::new(RunControl::default());
         controls.configure(&path);
         controls.owns_project.store(true, Ordering::SeqCst);
@@ -188,6 +190,7 @@ impl Controller {
             "Unknown resume mode"
         );
         let config = self.config()?;
+        crate::sandbox::ready(&config)?;
         let report = config.state_dir.join("goal-completion.json");
         if reopen && !config.activity_mode.is_chaos() && report.exists() {
             fs::remove_file(report)?;
@@ -613,6 +616,16 @@ impl Controller {
     }
     fn execute(self: &Arc<Self>, session: &str, name: &str, args: &Value) -> Result<Value> {
         let c = self.config()?;
+        ensure!(
+            !c.execution.is_private() || !["compiler_diagnostics", "run_checks"].contains(&name),
+            "Project-specific checks are not configured in this computer. Run a command inside it instead."
+        );
+        if !["write_file", "edit_file", "desktop_action"].contains(&name)
+            && let Some(result) = crate::sandbox::tool(&c.repo, name, args, &c.state_dir)
+        {
+            let text = result?;
+            return Ok(serde_json::from_str(&text).unwrap_or(json!(text)));
+        }
         match name {
             "view_image" => crate::image_tools::inspect(&c.repo, &c.state_dir, args),
             "capture_screenshot" => crate::image_tools::capture(&c.repo, &c.state_dir, args),
@@ -797,8 +810,8 @@ impl Controller {
             "project_diff" => Ok(
                 json!({"diff":project::excerpt(&project::git(&c.repo,&["diff","HEAD","--"] )?,20000),"status":project::git(&c.repo,&["status","--short"])?}),
             ),
-            "edit_file" | "write_file" | "run_command" | "run_checks" | "save_checkpoint"
-            | "commit_changes" | "restore_checkpoint" => {
+            "desktop_action" | "edit_file" | "write_file" | "run_command" | "run_checks"
+            | "save_checkpoint" | "commit_changes" | "restore_checkpoint" => {
                 ensure!(
                     !c.activity_mode.is_chaos()
                         || !["save_checkpoint", "commit_changes", "restore_checkpoint"]
@@ -811,6 +824,10 @@ impl Controller {
                     lease["granted"] == true,
                     "Editing access is pending. Call begin_edit until granted, then retry with a new operation ID. No action executed."
                 );
+                if let Some(result) = crate::sandbox::tool(&c.repo, name, args, &c.state_dir) {
+                    return Ok(serde_json::from_str(&result?)
+                        .unwrap_or_else(|_| json!("Operation completed")));
+                }
                 if name == "restore_checkpoint" {
                     ensure!(
                         args["confirmed"] == true,
@@ -1153,6 +1170,9 @@ pub fn schemas() -> Value {
 
 pub fn schemas_for(c: &runner::Config) -> Value {
     let mut tools = schemas();
+    if c.execution.is_private() {
+        crate::sandbox::customize_tools(&mut tools);
+    }
     if c.activity_mode.is_chaos() {
         tools.as_array_mut().unwrap().retain(|t| {
             ![
