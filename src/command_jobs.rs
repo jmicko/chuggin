@@ -277,6 +277,11 @@ impl Job {
         } else {
             json!(self.root)
         };
+        if crate::sandbox::for_root(&self.root).is_some() {
+            // The local Podman client's PID is meaningless in the guest's PID namespace.
+            v["pid"] = Value::Null;
+            v["process_namespace"] = json!("private_computer; use command_id for process control");
+        }
         v["lifecycle_instruction"] = json!(if self.running() {
             "This process remains owned by the controller across model turns, cycles and soft stops. Use its existing command_id for status, input or targeted stop; do not launch a duplicate. Finite work must finish before editing its workspace or relying on its validation. A background command is an intentionally open application/server, not completed validation. Pausing the loop does not close it. Ending the controller closes owned live commands and records why."
         } else if self

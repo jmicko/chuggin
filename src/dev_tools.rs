@@ -13,12 +13,42 @@ use std::{
     path::Path,
 };
 
+pub const COMMAND_HELP: &str = "Provide exactly one of script (a shell program) or argv (an executable and literal arguments). Use script for pipelines, redirection or multiline commands. Returns a command_id while unfinished; command_status waits for output, command_input supplies stdin, and stop_command ends it. Finite work must finish before conflicting edits. Use mode=background with a reason for intentionally open apps or servers. timeout_seconds requests watchdog review, not automatic termination. Read full output with read_command_log.";
+
+pub fn command_argv(args: &Value) -> Result<Vec<String>> {
+    let script = args.get("script").filter(|v| !v.is_null());
+    let argv = args.get("argv").filter(|v| !v.is_null());
+    anyhow::ensure!(
+        !(script.is_some() && argv.is_some()),
+        "Supply exactly one of script or argv. No command was started."
+    );
+    let command = if let Some(script) = script {
+        let text = script
+            .as_str()
+            .context("script must be a shell program string")?;
+        anyhow::ensure!(!text.trim().is_empty(), "script must not be empty");
+        vec!["/bin/sh".into(), "-c".into(), text.to_owned()]
+    } else {
+        let raw = argv.context(
+            "Supply script as a string, or argv as an array of strings. No command was started.",
+        )?;
+        let decoded = if let Some(encoded) = raw.as_str() {
+            serde_json::from_str(encoded).context("Invalid argv JSON. Pass argv as a real array, for example [\"ls\",\"-la\"], or put shell text directly in script. No command was started.")?
+        } else {
+            raw.clone()
+        };
+        serde_json::from_value(decoded).context("argv must be an array of strings, for example [\"ls\",\"-la\"]. Use script for shell syntax. No command was started.")?
+    };
+    validate_argv(&command)?;
+    Ok(command)
+}
+
 pub fn schemas() -> Vec<Value> {
     vec![
         json!({"type":"function","function":{"name":"command_status","description":"Inspect an existing command, or wait up to 60 seconds for completion or new output. Use next_output_offset and log_id from the previous reply as output_offset and output_log_id to receive only new output. A changed log (for the next check in a batch) restarts the cursor automatically. Read older/full output with read_command_log. Do not start duplicate commands; polls are not new tests.","parameters":{"type":"object","properties":{"command_id":{"type":"string"},"wait_ms":{"type":"integer","minimum":0,"maximum":60000},"output_offset":{"type":"integer","minimum":0},"output_log_id":{"type":"string"}},"required":["command_id"]}}}),
         json!({"type":"function","function":{"name":"command_input","description":"Send text to an existing command stdin, optionally closing stdin. No implicit newline; include it when needed.","parameters":{"type":"object","properties":{"command_id":{"type":"string"},"text":{"type":"string"},"close_stdin":{"type":"boolean"}},"required":["command_id"]}}}),
         json!({"type":"function","function":{"name":"stop_command","description":"Terminate this managed command and its descendants by command_id when evidence establishes it should stop, including closing an application you launched after inspecting it. Use this instead of broad pkill/killall or process-name matching, which can stop the harness or unrelated work. Provide an explanation; preserve files for repair.","parameters":{"type":"object","properties":{"command_id":{"type":"string"},"reason":{"type":"string"}},"required":["command_id","reason"]}}}),
-        json!({"type":"function","function":{"name":"run_command","description":"Run an executable with argv in the visible project folder. Returns promptly with a command_id if unfinished; use command_status, command_input or stop_command for that process. Sessions remain owned across model turns, cycles, pauses and soft stops. mode=finite is the default for builds, tests, scripts and file mutations; this work must finish before new workspace writes or validation. mode=background is for an intentionally open app/server needed for the task, requires reason, and allows further development while it runs. Never relabel a build/test/script mutation as background to bypass waiting. Launch apps/servers directly, without shell &: Chuggin cleans up descendants when their parent exits. No implicit shell; explicitly use [\"sh\",\"-c\",\"command | other-command\"] for shell syntax. timeout_seconds requests watchdog review, not automatic termination. A running command is not passing validation. Read full output with read_command_log. Do not commit, reset Git, modify Chuggin state or operate outside the project.","parameters":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"mode":{"type":"string","enum":["finite","background"],"default":"finite"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":86400},"reason":{"type":"string","description":"Purpose and expected evidence. Required for mode=background: explain the intentionally open app/server and why it should stay running."}},"required":["argv"]}}}),
+        json!({"type":"function","function":{"name":"run_command","description":format!("Execute in the project folder. {}", COMMAND_HELP),"parameters":{"type":"object","properties":{"script":{"type":"string","description":"Shell program as one string, executed with /bin/sh -c. Supports pipes, redirection and newlines."},"argv":{"type":"array","items":{"type":"string"},"description":"Executable and literal arguments, for example [\"ls\",\"-la\"]. Pass the array directly, rather than a JSON-encoded string."},"mode":{"type":"string","enum":["finite","background"],"default":"finite"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":86400},"reason":{"type":"string","description":"Purpose of the command. Required for an intentionally open background app/server."}}}}}),
         json!({"type":"function","function":{"name":"compiler_diagnostics","description":"Run cargo check --all-targets and group Rust errors/warnings with source locations, snippets and compiler suggestions. Use after compiler failure rather than guessing APIs. This does not run tests or replace run_checks. Full raw output is available through log_id.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"read_command_log","description":"Read an earlier command/diagnostics log, including prior cycles, in bounded byte chunks. Use the complete log_id and next_offset returned by tools; do not repeat the same offset.","parameters":{"type":"object","properties":{"log_id":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["log_id"]}}}),
     ]
@@ -90,14 +120,7 @@ pub fn log_guidance(path: &str) -> Option<String> {
 pub fn run(root: &Path, art: &Path, id: &str, args: &Value, stop: &AtomicBool) -> Result<Value> {
     // Some models encode the array twice. Decode only valid JSON, never shell text.
     let normalized = args["argv"].is_string();
-    let raw = if let Some(text) = args["argv"].as_str() {
-        serde_json::from_str(text)
-            .context("argv must be a JSON array of strings, not a shell command")?
-    } else {
-        args["argv"].clone()
-    };
-    let argv: Vec<String> =
-        serde_json::from_value(raw).context("argv must be an array of strings")?;
+    let argv = command_argv(args)?;
     anyhow::ensure!(
         !argv.is_empty() && !argv[0].is_empty() && argv.len() <= 128,
         "Supply an executable and at most 127 arguments"
@@ -330,6 +353,37 @@ pub(crate) fn summarize(root: &Path, raw: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_scripts_handle_multiline_shell_syntax_without_guessing_malformed_argv() {
+        let root = tempfile::tempdir().unwrap();
+        let art = tempfile::tempdir().unwrap();
+        let result = run(
+            root.path(),
+            art.path(),
+            "script",
+            &json!({"script":"printf '%s\\n' 'x y' | tr 'a-z' 'A-Z' > result.txt\nprintf done"}),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result["passed"], true);
+        assert_eq!(
+            fs::read_to_string(root.path().join("result.txt")).unwrap(),
+            "X Y\n"
+        );
+        let error = command_argv(&json!({"argv":"[\"sh\",\"-c\",\"touch must-not-run"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Invalid argv JSON"));
+        assert!(error.contains("No command was started"));
+        assert!(!root.path().join("must-not-run").exists());
+        assert!(command_argv(&json!({"script":"echo safe","argv":["echo","other"]})).is_err());
+        assert!(command_argv(&json!({"script":" \n "})).is_err());
+        assert!(command_argv(&json!({"script":"bad\0argument"})).is_err());
+        assert_eq!(
+            command_argv(&json!({"argv":"[\"echo\",\"hello\"]"})).unwrap(),
+            vec!["echo", "hello"]
+        );
+    }
     #[test]
     fn shell_operators_require_an_explicit_shell_but_literal_text_remains_valid() {
         let argv = |items: &[&str]| {

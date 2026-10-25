@@ -240,7 +240,9 @@ or file tools remain the responsibility of those harnesses.
 The container has no direct network connection. Optional public-web access goes
 through an HTTP/HTTPS proxy that rejects loopback, LAN, link-local and other
 nonpublic destinations before connecting. Inference and Brave credentials remain
-in the host controller. Applications that cannot use an HTTP proxy may not have
+in the host controller. Container-local services bypass the proxy through
+`NO_PROXY=localhost,127.0.0.1,::1`, so applications can test their own local servers.
+This does not expose the host's loopback interface. Applications that cannot use an HTTP proxy may not have
 Internet access. **Computer resource limits** controls CPU, memory and public-web
 access; start/prepare applies the settings and verifies enforcement before tools
 are allowed. Defaults are 4 CPUs, 4 GiB RAM and 512 processes. Container storage
@@ -252,6 +254,9 @@ not suspend its desktop or already-started applications. Use **Shut down private
 computer · keep its files** to stop it after finishing the loop and commands;
 resume/prepare starts it again. Conversation history and file-hash observations
 stay outside the container; these records are not backups of its contents.
+New installations reuse a desktop image identified by its embedded build assets;
+application-only updates do not rebuild that image. Existing installations keep
+their own files and image.
 
 Alongside tool-routing, isolation-policy and missing-dependency tests, a real
 rootless Podman integration test exercises setup, private file edits, screenshots,
@@ -704,11 +709,14 @@ It stops when the run is paused.
 
 ## Execution, compiler diagnostics, and symbols
 
-The working agent can use **run_command** with an executable and argument array,
-for example `["cargo", "test", "unicode"]` or `["cargo", "fmt"]`. Commands run
-in the persistent workspace, with no implicit shell.
+The working agent supplies exactly one **run_command** input: `argv`, an executable
+and literal argument array such as `["cargo", "test", "unicode"]`, or `script`, a
+shell program string for pipelines, redirection and multiline commands. `script`
+explicitly runs `/bin/sh -c`; `argv` has no implicit shell. Commands run in the
+persistent workspace, or inside the private Linux computer when configured.
 If the model supplies a valid JSON-encoded argument array, Chuggin decodes it and
-reports `arguments_normalized: true`. Arbitrary command strings are not interpreted.
+reports `arguments_normalized: true`. Malformed arrays are rejected without
+execution, with instructions to supply a real array or the explicit `script` field.
 Starting with **0.8.0**, commands return within about one second. If unfinished,
 they return `running: true` and a `command_id`. **command_status** inspects or waits
 briefly for that same process; **command_input** sends stdin text (including an

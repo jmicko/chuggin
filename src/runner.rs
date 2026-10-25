@@ -248,6 +248,22 @@ pub(crate) struct Task {
     #[serde(default)]
     out_of_scope: Vec<String>,
 }
+impl Task {
+    fn parse(args: &Value) -> Result<Self> {
+        for field in ["acceptance", "files", "out_of_scope"] {
+            if let Some(value) = args.get(field) {
+                anyhow::ensure!(
+                    value
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(Value::is_string)),
+                    "set_task.{field} must be an array of strings, for example [\"one item\",\"another item\"]. No task was changed."
+                );
+            }
+        }
+        serde_json::from_value(args.clone())
+            .context("set_task requires string title and objective fields")
+    }
+}
 #[derive(Serialize, Deserialize)]
 struct CompletedTask {
     id: u64,
@@ -1856,16 +1872,20 @@ fn recover_commands(
     ));
     let mut research = crate::web_tools::Research::default();
     let assessment =
-        crate::stall_diagnostic::diagnose(m, input, art, id, |name, args| match name {
-            "read_command_log" => Ok(crate::dev_tools::read_log(art, args)?.to_string()),
-            "read_progress_note" => {
-                let offset = match args.get("offset") {
-                    Some(v) => usize::try_from(v.as_u64().context("offset must be nonnegative")?)?,
-                    None => 0,
-                };
-                Ok(session.note.page(offset)?.to_string())
+        crate::stall_diagnostic::diagnose(m, c.activity_mode, input, art, id, |name, args| {
+            match name {
+                "read_command_log" => Ok(crate::dev_tools::read_log(art, args)?.to_string()),
+                "read_progress_note" => {
+                    let offset = match args.get("offset") {
+                        Some(v) => {
+                            usize::try_from(v.as_u64().context("offset must be nonnegative")?)?
+                        }
+                        None => 0,
+                    };
+                    Ok(session.note.page(offset)?.to_string())
+                }
+                _ => inspect_tool(&s.working_workspace, name, args, &mut research),
             }
-            _ => inspect_tool(&s.working_workspace, name, args, &mut research),
         });
     let mut productive = false;
     let feedback = match assessment {
@@ -2676,7 +2696,7 @@ fn work(
                         Ok(requested.to_string())
                     }
                     "set_task" => {
-                        let task: Task = serde_json::from_value(args.clone())?;
+                        let task = Task::parse(args)?;
                         anyhow::ensure!(!task.title.trim().is_empty(), "Task needs a title");
                         if s.current_task.as_ref().is_none_or(|current| {
                             current.title != task.title || current.objective != task.objective
@@ -2922,12 +2942,7 @@ fn work(
                                 timeout_seconds: 120,
                             }]
                         } else {
-                            let raw = if let Some(text) = args["argv"].as_str() {
-                                serde_json::from_str(text)?
-                            } else {
-                                args["argv"].clone()
-                            };
-                            let argv: Vec<String> = serde_json::from_value(raw)?;
+                            let argv = crate::dev_tools::command_argv(args)?;
                             anyhow::ensure!(
                                 !argv.is_empty()
                                     && argv.len() <= 128
@@ -3789,6 +3804,16 @@ pub fn run_controlled_with_commands(
 #[cfg(test)]
 mod conversation_tests {
     use super::*;
+    #[test]
+    fn malformed_task_lists_return_field_specific_repair_instructions() {
+        let error=Task::parse(&json!({"title":"An activity","objective":"Investigate a question","acceptance":"one outcome"})).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("set_task.acceptance must be an array of strings")
+        );
+        assert!(Task::parse(&json!({"title":"An activity","objective":"Investigate a question","acceptance":["one outcome"]})).is_ok());
+    }
 
     fn chaos_config(root: &Path) -> Config {
         serde_json::from_value(json!({
@@ -4454,15 +4479,17 @@ mod stall_replay_tests {
         m.trace_to(&art);
         let mut research = crate::web_tools::Research::default();
         let report =
-            crate::stall_diagnostic::diagnose(&m, input, &art, 1, |name, args| match name {
-                "read_command_log" => {
-                    Ok(crate::dev_tools::read_log(&source_art, args)?.to_string())
+            crate::stall_diagnostic::diagnose(&m, c.activity_mode, input, &art, 1, |name, args| {
+                match name {
+                    "read_command_log" => {
+                        Ok(crate::dev_tools::read_log(&source_art, args)?.to_string())
+                    }
+                    "read_progress_note" => Ok(session
+                        .note
+                        .page(args["offset"].as_u64().unwrap_or(0) as usize)?
+                        .to_string()),
+                    _ => inspect_tool(&s.working_workspace, name, args, &mut research),
                 }
-                "read_progress_note" => Ok(session
-                    .note
-                    .page(args["offset"].as_u64().unwrap_or(0) as usize)?
-                    .to_string()),
-                _ => inspect_tool(&s.working_workspace, name, args, &mut research),
             })
             .unwrap();
         fs::write(

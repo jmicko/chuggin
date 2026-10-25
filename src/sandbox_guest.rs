@@ -83,7 +83,7 @@ pub fn serve() -> Result<()> {
 fn path(args: &Value) -> Result<PathBuf> {
     crate::project::safe_path(
         Path::new("/root"),
-        args["path"].as_str().context("Missing path")?,
+        args["path"].as_str().context("path must be a separate string argument naming a file inside this computer. No file was changed.")?,
     )
 }
 fn call(name: &str, args: &Value) -> Result<Value> {

@@ -926,7 +926,7 @@ impl Controller {
                         c.checks.clone()
                     } else {
                         vec![crate::project::Check {
-                            argv: serde_json::from_value(args["argv"].clone())?,
+                            argv: crate::dev_tools::command_argv(args)?,
                             timeout_seconds: c.command_review_seconds,
                         }]
                     };

@@ -4565,6 +4565,39 @@ mod terminal_ui {
             )
             .unwrap();
         }
+        let server = tool(
+            "run_command",
+            json!({"script":"python3 -m http.server 18799 --bind 127.0.0.1","mode":"background","reason":"Check container-local HTTP connectivity"}),
+        );
+        assert_eq!(server["status"], "complete", "{server}");
+        assert!(
+            server["result"]["pid"].is_null(),
+            "A host PID must not be advertised as a private-computer PID"
+        );
+        let local = tool(
+            "run_command",
+            json!({"script":"curl --retry 3 --retry-connrefused --retry-delay 1 --max-time 5 -fsS http://127.0.0.1:18799/"}),
+        );
+        assert_eq!(local["status"], "complete", "{local}");
+        let mut local = local["result"].clone();
+        for _ in 0..10 {
+            if local["running"] != true {
+                break;
+            }
+            local = tool(
+                "command_status",
+                json!({"command_id":local["command_id"],"wait_ms":1000}),
+            )["result"]
+                .clone();
+        }
+        assert_eq!(local["passed"], true, "{local}");
+        assert_eq!(
+            tool(
+                "stop_command",
+                json!({"command_id":server["result"]["command_id"],"reason":"Local HTTP test finished"})
+            )["status"],
+            "complete"
+        );
         let web = Command::new("podman")
             .args([
                 "--remote=false",
@@ -4573,6 +4606,8 @@ mod terminal_ui {
                 "curl",
                 "--max-time",
                 "10",
+                "--noproxy",
+                "",
                 "--proxy",
                 "http://127.0.0.1:3128",
                 "-s",
@@ -4603,6 +4638,39 @@ mod terminal_ui {
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
+    }
+
+    #[test]
+    #[ignore = "Manual live-run fixture preparation; requires a marked disposable directory and cached desktop image"]
+    fn prepare_live_private_fixture_without_starting_inference() {
+        let root = std::path::PathBuf::from(
+            std::env::var("CHUGGIN_LIVE_FIXTURE").expect("Set CHUGGIN_LIVE_FIXTURE"),
+        );
+        let root = fs::canonicalize(root).unwrap();
+        assert!(root.starts_with(std::env::temp_dir()));
+        assert_eq!(
+            fs::read_to_string(root.join(".live-fixture")).unwrap(),
+            "disposable private computer\n"
+        );
+        let mut ui = TerminalProcess::start(&root);
+        ui.wait("Resume project");
+        ui.send(b"jjjjjjj\r");
+        ui.wait("More project settings");
+        ui.send(b"jjjjjjjjjj\r");
+        ui.wait("Computer environment");
+        ui.send(b"j\r");
+        ui.wait("Private computer ready");
+        ui.send(b"\r");
+        ui.wait("Computer environment");
+        ui.send(b"\x1b");
+        ui.wait("More project settings");
+        ui.send(b"\x1b");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        assert!(root.join(".chuggin/computer/ready.json").exists());
+        assert!(!root.join(".chuggin/state.json").exists());
+        eprintln!("Prepared live fixture: {}", root.display());
     }
 
     #[test]

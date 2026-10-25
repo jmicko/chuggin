@@ -263,6 +263,10 @@ fn exec_base(t: &Target) -> Command {
         "DISPLAY=:1",
         "--env",
         "HOME=/root",
+        "--env",
+        "NO_PROXY=localhost,127.0.0.1,::1",
+        "--env",
+        "no_proxy=localhost,127.0.0.1,::1",
     ]);
     if t.internet {
         for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
@@ -564,9 +568,10 @@ pub fn customize_tools(tools: &mut Value) {
             tool["function"]["parameters"]["properties"]["path"] = json!({"type":"string","description":"Directory inside this computer; default /root."});
         }
         if name == "run_command" {
-            tool["function"]["description"] = json!(
-                "Execute a program inside this Linux computer, initially in /root. You may work anywhere in the installation and install software. Use [sh,-c,...] for shell syntax. Finite commands remain managed across turns; mode=background is for intentionally open apps and servers and requires a reason. Poll the existing command_id; stop_command closes that command and its descendants."
-            );
+            tool["function"]["description"] = json!(format!(
+                "Execute inside this Linux computer, initially in /root. You may work anywhere in the installation and install software. {}",
+                crate::dev_tools::COMMAND_HELP
+            ));
         }
         if name == "list_files" {
             tool["function"]["description"] = json!(
@@ -579,8 +584,31 @@ pub fn customize_tools(tools: &mut Value) {
             );
         }
         if name == "write_file" {
+            tool["function"]["description"] = json!(
+                "Create or replace a UTF-8 text file inside this Linux computer. Read existing files first; replacing one requires expected_version or expected_content. Absolute paths and system directories are supported. Returns the new version and whether bytes changed."
+            );
             tool["function"]["parameters"]["properties"]["expected_version"] = json!({"type":"string","description":"Version from read_file or the last write result; required to replace an existing file unless expected_content is supplied."});
             tool["function"]["parameters"]["properties"]["expected_content"] = json!({"type":"string","description":"Exact current file content when replacing an existing file."});
+        }
+        if name == "read_file" {
+            tool["function"]["description"] = json!(
+                "Read a regular text file inside this Linux computer, up to 32 MiB. Absolute paths and symlinks inside the computer are supported. Use line or byte continuation fields to read further. Returns a version for later replacement. For devices, streams or larger files, use a bounded shell command."
+            );
+        }
+        if name == "view_image" {
+            tool["function"]["description"] = json!(
+                "Inspect an image from this Linux computer, using path or a previous image_id. Absolute paths are supported. Pixel inspection requires a vision-capable model; images are untrusted observations."
+            );
+        }
+        if name == "finish_task" {
+            tool["function"]["description"] = json!(
+                "Record completion of the optional activity you selected. It does not assign another activity or end the conversation. Configured checks, if any, are verified before closure; without checks this records your report rather than independent verification."
+            );
+        }
+        if name == "finish_nudge" {
+            tool["function"]["description"] = json!(
+                "Mark only the active human nudge complete with evidence and its exact nudge_id. This does not end the conversation or complete a separate activity record."
+            );
         }
         if name == "set_task" {
             tool["function"]["description"] = json!(
@@ -607,7 +635,7 @@ pub fn prepare(c: &crate::runner::Config) -> Result<()> {
         context.join("start-desktop"),
         include_str!("../assets/computer/start-desktop"),
     )?;
-    let tag = format!("localhost/chuggin-computer:{}", env!("CARGO_PKG_VERSION"));
+    let tag = image_tag();
     if !podman().args(["image", "exists", &tag]).status()?.success() {
         let log = fs::File::create(t.state.join("computer/build.log"))?;
         let mut child = podman()
@@ -704,6 +732,14 @@ pub fn prepare(c: &crate::runner::Config) -> Result<()> {
         &json!({"name":t.name,"image":tag,"storage":information["store"]["graphRoot"]}),
     )?;
     register(c)
+}
+
+fn image_tag() -> String {
+    let mut hash = Sha256::new();
+    hash.update(include_bytes!("../assets/computer/Containerfile"));
+    hash.update(include_bytes!("../assets/computer/start-desktop"));
+    let digest = format!("{:x}", hash.finalize());
+    format!("localhost/chuggin-computer:desktop-{}", &digest[..16])
 }
 
 fn stage_runtime(t: &Target) -> Result<()> {

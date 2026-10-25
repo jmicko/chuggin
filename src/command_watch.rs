@@ -123,9 +123,10 @@ impl CommandWatch {
             return;
         }
         let mut args = args.clone();
-        if let Some(encoded) = args["argv"].as_str()
-            && let Ok(argv) = serde_json::from_str::<Vec<String>>(encoded)
+        if name == "run_command"
+            && let Ok(argv) = crate::dev_tools::command_argv(&args)
         {
+            args.as_object_mut().unwrap().remove("script");
             args["argv"] = json!(argv);
         }
         let reason = args
