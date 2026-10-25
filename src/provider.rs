@@ -76,6 +76,8 @@ pub fn classify(status: u16, message: &str, retry_after: Option<Duration>) -> Op
             "Provider authentication or access needs attention"
         } else if limited {
             "Provider usage or rate limit reached"
+        } else if text.contains("admission_paused") {
+            "Inference server is paused"
         } else {
             "Provider temporarily unavailable"
         },
@@ -109,6 +111,12 @@ mod tests {
         assert!(classify(401, "", None).is_some());
         assert!(classify(400, "invalid tool schema", None).is_none());
         assert!(classify(503, "", None).is_some());
+        assert_eq!(
+            classify(503, r#"{"error":"admission_paused"}"#, None)
+                .unwrap()
+                .reason,
+            "Inference server is paused"
+        );
     }
     #[test]
     fn retry_headers_and_fallback_delays() {

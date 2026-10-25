@@ -102,7 +102,15 @@ impl ActionWatch {
             .unwrap_or_else(|| result["result"].clone());
         let unchanged_edit = matches!(name, "edit_file" | "write_file")
             && (result["ok"] == false || output["changed"] == false);
+        let repeated_message = name == "send_message" && output["changed"] == false;
+        let notebook_read =
+            name == "notebook" && (args["action"] != "write" || output["changed"] == false);
+        let browser_read = name == "browser"
+            && matches!(args["action"].as_str(), Some("read" | "tabs" | "status"));
         let watch = unchanged_edit
+            || repeated_message
+            || notebook_read
+            || browser_read
             || matches!(
                 name,
                 "read_file"
@@ -116,6 +124,10 @@ impl ActionWatch {
                     | "list_files"
                     | "project_map"
                     | "lookup_symbol"
+                    | "read_messages"
+                    | "computer_info"
+                    | "application_command"
+                    | "inspect_document"
             )
             || (name == "finish_task"
                 && (output["completion_recorded"] == false || result["ok"] == false));
@@ -143,7 +155,29 @@ impl ActionWatch {
         } else {
             args
         };
-        let fingerprint = hash(serde_json::json!([name, fingerprint_args, result]).to_string());
+        let mut observed = result.clone();
+        if name == "browser" || matches!(name, "read_messages" | "send_message") {
+            let mut normalized = output.clone();
+            if let Some(fields) = normalized.as_object_mut() {
+                if name == "browser" {
+                    fields.remove("snapshot_id");
+                    if let Some(elements) = fields.get_mut("elements").and_then(Value::as_array_mut)
+                    {
+                        for element in elements {
+                            if let Some(e) = element.as_object_mut() {
+                                e.remove("id");
+                            }
+                        }
+                    }
+                } else {
+                    fields.remove("user_presence");
+                    fields.remove("snapshot_revision");
+                    fields.remove("replayed_fetch");
+                }
+            }
+            observed["result"] = normalized;
+        }
+        let fingerprint = hash(serde_json::json!([name, fingerprint_args, observed]).to_string());
 
         // Older saved conversations have only `recent` and `warned_pattern`.
         // Their existing evidence remains useful even before coverage is rebuilt.
@@ -445,6 +479,46 @@ fn read_observation(args: &Value, output: &Value) -> Option<ReadObservation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_browser_snapshot_ids_do_not_disguise_identical_page_reads() {
+        let mut watch = ActionWatch::default();
+        let mut intervened = false;
+        for i in 0..50 {
+            let output = serde_json::json!({"ok":true,"result":{"snapshot_id":format!("fresh-{i}"),"tab_id":"tab-1","content":{"text":"Unchanged page"},"elements":[{"id":format!("fresh-{i}.e1"),"label":"Same control"}]}});
+            intervened |= watch
+                .observe(
+                    "browser",
+                    &serde_json::json!({"action":"read","tab_id":"tab-1"}),
+                    &output,
+                )
+                .is_some();
+        }
+        assert!(intervened);
+        assert_eq!(watch.known_actions.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_messages_and_empty_mail_polls_are_observations_not_progress() {
+        for name in ["send_message", "read_messages", "notebook"] {
+            let mut watch = ActionWatch::default();
+            let mut intervened = false;
+            for i in 0..50 {
+                let result = if name == "notebook" {
+                    serde_json::json!({"ok":true,"result":{"changed":false,"note":{"id":"note-1","version":"unchanged"}}})
+                } else {
+                    serde_json::json!({"ok":true,"result":{"changed":false,"messages":[],"snapshot_revision":i,"replayed_fetch":i%2==0,"user_presence":{"idle_minutes":i}}})
+                };
+                intervened |= watch
+                    .observe(
+                        name,
+                        &serde_json::json!({"action":"read","body":"Hello again"}),
+                        &result,
+                    )
+                    .is_some();
+            }
+            assert!(intervened, "{name}");
+        }
+    }
     use serde_json::json;
 
     fn lines(path: &str, total: u64, start: u64, count: u64, revision: u64) -> Value {

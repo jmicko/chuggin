@@ -48,7 +48,8 @@ splash screen, in-place settings and goal drafting, and a live run dashboard.
 The dashboard shows the current task and stage, model output as it arrives,
 tool actions, check output, recovery messages, and recent outcomes.
 
-- **1–6 / Tab:** switch between live activity, model output, checks, the goal, local settings, and chat.
+- **1–7 / Tab:** switch between live activity, model output, checks, the goal, local settings, the assistant, and messages.
+- **M:** open direct messages with the looping model. The status row shows new messages and your availability.
 - **Arrow keys / mouse wheel / Page Up / Page Down:** scroll without pausing work.
   Scrolling back to the bottom automatically resumes following live output.
 - **Home:** oldest retained output. **End / F:** follow live output again.
@@ -339,7 +340,7 @@ with main work. Separate-provider parallel jobs are not enabled by this feature.
 Helper traffic passes through the same provider recovery and quota handling as
 other requests. It does not bypass Groq waits or silently switch providers.
 
-The default allowance is 12 model responses per investigation, adjustable in
+The default allowance is 20 model responses per investigation, adjustable in
 Settings. Reaching it preserves available findings and returns control to the
 main model. Pause and stop apply at safe operation boundaries. The live view
 shows investigation activity; inputs, tool evidence, and results persist under
@@ -414,9 +415,66 @@ wake a sleeping computer. Closing the last viewer unexpectedly requests a pause
 after a one-minute reconnect grace period and the current operation. Reconnecting
 does not silently clear that manual pause.
 
+## Messages and availability
+
+**Messages with the loop** on Home, **M**, or tab **7 Messages** opens a mailbox
+with the autonomous model itself. Tab **6 Assistant** remains a separate
+interactive assistant. Sending mail never resumes work or replaces a goal or
+nudge. The loop sees a count notification at the next request boundary and must
+call `read_messages` to fetch bodies. It can reply or initiate mail with
+`send_message`; it does not have to wait for you to answer.
+
+Messages and read receipts survive restarts outside the private computer.
+**Enter** sends, **Alt+Enter** inserts a newline, **Ctrl+R** selects a message to
+reply to, **F2** loads older messages, and **F3** returns to the latest page.
+Receipts mean fetched by the model or displayed in an active, focused Messages
+view, rather than agreement or understanding. A background or away terminal
+does not silently read mail. Exact and lightly reformatted duplicate model
+messages return `already_sent`, including after restarting; changed facts and
+new human input allow a new message. This is conservative text matching, not
+semantic paraphrase detection. There is no arbitrary cap on unanswered mail.
+
+Availability uses host computer idle time, with **Away after five minutes** by
+default. Private desktop activity, generation, and commands do not make the
+human active. **F5** in Messages or **Global settings → Presence** changes the
+threshold or selects Automatic, Active, Away, or Busy. Unsupported or stale OS
+idle information is shown as Unknown. This checks idle/lock status only; it does
+not collect keys, window titles, clipboard contents, or screenshots. Availability
+is advisory and never pauses the loop or guarantees a response.
+
+## General computer tools and notes
+
+The private Linux computer provides tools for more than editing source files:
+
+- `computer_info` inventories installed applications and capabilities, with actual
+  resource limits. `application_command` resolves an application to literal argv
+  for the existing managed command tool; it does not launch it by itself.
+- `browser` controls visible private Chromium and returns page text and numbered
+  controls, so it works with text-only models. It supports navigation, forms,
+  clicks, keyboard input, dialogs, and download inspection. Controls are tied to
+  a page snapshot; stale or already-attempted actions require a fresh read.
+  Pages and downloads remain untrusted observations. The same public-web proxy
+  and container isolation apply. Cross-origin frames need separate navigation.
+- `inspect_document` extracts paginated PDF, office, or text content, PDF page
+  renders, image dimensions, and audio/video metadata. Format limitations and
+  continuation fields are reported. A spreadsheet shared-string preview is not
+  a complete workbook reader.
+- `notebook` stores optional titled, tagged notes outside the computer. Notes
+  have stable IDs, search, paginated reads, retained revisions, and version
+  checks before replacement. They are not goals or automatically injected into
+  context. The model chooses whether to use them.
+
+Fresh private computers include Chromium, Poppler and FFmpeg. Existing
+installations retain their files and packages; missing tools give an explicit
+installation command to run **inside the private computer**. Updating Chuggin
+does not change a running computer. Browser page interaction may continue while
+an unrelated finite command runs; ordinary file mutations still follow the
+command ownership rules. The separate assistant must acquire editing ownership
+before controlling the browser, so it cannot race the loop.
+
 ## Project chat
 
-Open **Chat with this project** from Home, or tab **6 Chat** during a run.
+Open **Project assistant** from Home, or tab **6 Assistant** during a run.
 Opening Chat does not start the loop. Ask about progress, request an edit, change
 the overall goal, or set a temporary nudge. The chat model can inspect files,
 search saved history, use configured web tools, run commands and checks, save or

@@ -188,7 +188,7 @@ pub fn compact_descriptions(tools: &Value) -> Value {
                 for (key, child) in object {
                     compact(
                         child,
-                        if key == "function" { 120 } else { 80 },
+                        if key == "function" { 32 } else { 80 },
                         parameters || key == "parameters",
                     );
                 }

@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -296,6 +297,11 @@ struct Conversation {
     migration_handoff: Option<Value>,
     helper_links: std::collections::BTreeMap<String, String>,
     last_context_usage: Option<crate::context_usage::Usage>,
+    mailbox_notice: Option<String>,
+    #[serde(default)]
+    mailbox_links: BTreeMap<String, String>,
+    #[serde(default)]
+    mailbox_error: Option<String>,
 }
 
 /// Compact evidence accompanies the transcript and survives conversation handoffs.
@@ -1603,6 +1609,7 @@ fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
         .note
         .select_task(s.current_task.as_ref().map(|_| s.task_serial));
     repair_helper_results(c, &mut session)?;
+    repair_mailbox_results(c, &mut session)?;
     repair_pending_tools(&mut session.messages);
     // Upgrade existing transcripts before making the first provider request.
     // A human's file changes invalidate the old repetition evidence.
@@ -1619,6 +1626,62 @@ fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
     }
     save_conversation(c, &session)?;
     Ok(session)
+}
+fn repair_mailbox_results(c: &Config, session: &mut Conversation) -> Result<()> {
+    let Some(parent) = session
+        .messages
+        .iter()
+        .rposition(|m| m["role"] == "assistant")
+    else {
+        return Ok(());
+    };
+    let calls = session.messages[parent]["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut claimed = std::collections::BTreeSet::new();
+    for (index, call) in calls.iter().enumerate() {
+        let name = call["function"]["name"].as_str().unwrap_or("");
+        if let Some((position, _)) =
+            session
+                .messages
+                .iter()
+                .enumerate()
+                .skip(parent + 1)
+                .find(|(position, m)| {
+                    !claimed.contains(position)
+                        && m["role"] == "tool"
+                        && if call.get("id").is_some() {
+                            m.get("tool_call_id") == call.get("id")
+                        } else {
+                            m["tool_name"] == name
+                        }
+                })
+        {
+            claimed.insert(position);
+            continue;
+        }
+        if !matches!(name, "read_messages" | "send_message") {
+            continue;
+        }
+        let Some(operation) = session.mailbox_links.get(&format!("{parent}-{index}")) else {
+            continue;
+        };
+        if let Some(result) = crate::messenger::recover_model_tool(
+            &c.state_dir,
+            name,
+            &call["function"]["arguments"],
+            operation,
+        )? {
+            let mut reply = json!({"role":"tool","tool_name":name,"content":json!({"ok":true,"result":result.to_string(),"recovered":true}).to_string()});
+            if let Some(id) = call.get("id") {
+                reply["tool_call_id"] = id.clone();
+            }
+            claimed.insert(session.messages.len());
+            session.messages.push(reply);
+        }
+    }
+    Ok(())
 }
 fn repair_helper_results(c: &Config, session: &mut Conversation) -> Result<()> {
     let Some(index) = session
@@ -1734,6 +1797,7 @@ fn refresh_conversation(
     ];
     session.helper_links.clear();
     session.nudge_revision = None;
+    session.mailbox_notice = None;
     session.delivered_nudge_id = None;
     if factual_only {
         session.feedback_narration_archived = true;
@@ -1988,6 +2052,33 @@ fn sync_nudge(c: &Config, session: &mut Conversation) -> Result<()> {
             .messages
             .push(json!({"role":"user","content":content.to_string()}));
     }
+    save_conversation(c, session)
+}
+
+fn sync_mailbox(c: &Config, session: &mut Conversation) -> Result<()> {
+    let state = match crate::communication::status(&c.state_dir) {
+        Ok(value) => {
+            session.mailbox_error = None;
+            value
+        }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            if session.mailbox_error.as_deref() != Some(&detail) {
+                crate::events::log(format!(
+                    "Mailbox notification unavailable: {detail}. Work can continue; Messages shows the error."
+                ));
+            }
+            session.mailbox_error = Some(detail);
+            return Ok(());
+        }
+    };
+    let mailbox = &state["mailbox"];
+    let signature = json!([mailbox["revision"], state["user_presence"]["status"]]).to_string();
+    if session.mailbox_notice.as_ref() == Some(&signature) {
+        return Ok(());
+    }
+    session.mailbox_notice = Some(signature);
+    session.messages.push(json!({"role":"user","content":json!({"mailbox_notice":{"unread_from_user":mailbox["unread_to_model"],"unread_for_user":mailbox["unread_to_human"],"latest_message_id":mailbox["latest_id"],"user_presence":state["user_presence"]["status"],"message_bodies":"Retrieve explicitly with read_messages. Presence does not imply the human has read or will answer."}}).to_string()}));
     save_conversation(c, session)
 }
 
@@ -2419,6 +2510,7 @@ fn work(
         }
         sync_operator(c, s, session)?;
         sync_nudge(c, session)?;
+        sync_mailbox(c, session)?;
         let live_config = load(config_path)?;
         ensure_activity_mode(&live_config, s)?;
         let allow_completion = live_config.allows_goal_completion();
@@ -2523,7 +2615,20 @@ fn work(
         // Only the pending response needs a delivery link. Context fitting may
         // change message indices, so never reuse an old response's positional key.
         session.helper_links.clear();
+        session.mailbox_links.clear();
         session.messages.push(response);
+        let parent = session.messages.len() - 1;
+        for (index, call) in calls.iter().enumerate() {
+            if matches!(
+                call["function"]["name"].as_str(),
+                Some("read_messages" | "send_message")
+            ) {
+                session.mailbox_links.insert(
+                    format!("{parent}-{index}"),
+                    format!("mailbox-{}", crate::operator::id()),
+                );
+            }
+        }
         save_conversation(c, session)?;
         m.pause_point();
         if m.controls.stopped_while_held() {
@@ -2678,6 +2783,27 @@ fn work(
                     "Project-specific checks are not configured in this computer. Run a command inside it instead."
                 );
                 match name {
+                    "read_messages" | "send_message" => {
+                        let operation = session
+                            .mailbox_links
+                            .get(&format!("{parent}-{index}"))
+                            .context("Missing persisted mailbox delivery operation")?;
+                        let result =
+                            crate::communication::model_tool(&c.state_dir, name, args, operation)?;
+                        if result["changed"] == true {
+                            session.prose_watch.progress();
+                            session.thinking_watch.progress();
+                        }
+                        Ok(result.to_string())
+                    }
+                    "notebook" => {
+                        let result = crate::notebook::call(&c.state_dir, name, args)?;
+                        if result["changed"] == true {
+                            session.prose_watch.progress();
+                            session.thinking_watch.progress();
+                        }
+                        Ok(result.to_string())
+                    }
                     "view_image" => {
                         Ok(crate::image_tools::inspect(&root, &c.state_dir, args)?.to_string())
                     }
@@ -3804,6 +3930,81 @@ pub fn run_controlled_with_commands(
 #[cfg(test)]
 mod conversation_tests {
     use super::*;
+    #[test]
+    fn interrupted_mail_fetch_is_recovered_into_context_without_consuming_new_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = chaos_config(dir.path());
+        fs::create_dir_all(&c.state_dir).unwrap();
+        let state = State {
+            activity_mode: c.activity_mode,
+            working_workspace: dir.path().into(),
+            ..State::default()
+        };
+        let mut session = load_conversation(&c, &state).unwrap();
+        crate::messenger::human_send(&c.state_dir, "First saved letter", None).unwrap();
+        let parent = session.messages.len();
+        session.messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":"fetch","function":{"name":"read_messages","arguments":{}}}]}));
+        session
+            .mailbox_links
+            .insert(format!("{parent}-0"), "persisted-fetch".into());
+        save_conversation(&c, &session).unwrap();
+        crate::communication::model_tool(
+            &c.state_dir,
+            "read_messages",
+            &json!({}),
+            "persisted-fetch",
+        )
+        .unwrap();
+        crate::messenger::human_send(&c.state_dir, "Later unread letter", None).unwrap();
+        let resumed = load_conversation(&c, &state).unwrap();
+        let prompt = serde_json::to_string(&resumed.messages).unwrap();
+        assert!(prompt.contains("First saved letter"));
+        assert!(!prompt.contains("Later unread letter"));
+        assert_eq!(
+            crate::messenger::status(&c.state_dir)
+                .unwrap()
+                .unread_to_model,
+            1
+        );
+        let resumed_again = load_conversation(&c, &state).unwrap();
+        assert_eq!(resumed_again.messages, resumed.messages);
+    }
+    #[test]
+    fn mailbox_notifications_preserve_bodies_for_explicit_fetch_and_do_not_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = chaos_config(dir.path());
+        fs::create_dir_all(&c.state_dir).unwrap();
+        let s = State {
+            activity_mode: c.activity_mode,
+            working_workspace: dir.path().into(),
+            ..State::default()
+        };
+        let mut conversation = load_conversation(&c, &s).unwrap();
+        crate::messenger::human_send(&c.state_dir, "SECRET_MAILBOX_BODY", None).unwrap();
+        sync_mailbox(&c, &mut conversation).unwrap();
+        let prompt = serde_json::to_string(&conversation.messages).unwrap();
+        assert!(prompt.contains("unread_from_user"));
+        assert!(!prompt.contains("SECRET_MAILBOX_BODY"));
+        let count = conversation.messages.len();
+        sync_mailbox(&c, &mut conversation).unwrap();
+        assert_eq!(conversation.messages.len(), count);
+        let fetched = crate::communication::model_tool(
+            &c.state_dir,
+            "read_messages",
+            &json!({}),
+            "test-read",
+        )
+        .unwrap();
+        assert!(fetched.to_string().contains("SECRET_MAILBOX_BODY"));
+        sync_mailbox(&c, &mut conversation).unwrap();
+        let notice: Value = serde_json::from_str(
+            conversation.messages.last().unwrap()["content"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(notice["mailbox_notice"]["unread_from_user"], 0);
+    }
     #[test]
     fn malformed_task_lists_return_field_specific_repair_instructions() {
         let error=Task::parse(&json!({"title":"An activity","objective":"Investigate a question","acceptance":"one outcome"})).err().unwrap();

@@ -1391,6 +1391,14 @@ pub fn tools() -> Value {
         .as_array_mut()
         .unwrap()
         .extend(crate::tool_requests::schemas());
+    tools
+        .as_array_mut()
+        .unwrap()
+        .extend(crate::messenger::schemas());
+    tools
+        .as_array_mut()
+        .unwrap()
+        .extend(crate::notebook::schemas());
     tools.as_array_mut().unwrap().push(crate::symbols::schema());
     tools.as_array_mut().unwrap().push(crate::search::schema());
     tools

@@ -110,9 +110,10 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             "Project model".into(),
             "Settings".into(),
             "Run duration".into(),
-            "Chat with this project".into(),
+            "Project assistant".into(),
             "More project settings".into(),
             "Global settings".into(),
+            "Messages with the loop".into(),
         ];
         if private {
             items.push("Open desktop".into());
@@ -216,7 +217,17 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                     setup::more_project_settings(project.as_deref())?;
                 }
                 8 => setup::settings_menu()?,
-                9 if private => setup::view_private_desktop(project.as_deref())?,
+                9 => {
+                    if let Some(path) = project.as_ref() {
+                        crate::ui::messages_home(path, stop.clone(), running.clone())?;
+                    } else {
+                        crate::ui::show(
+                            "Messages",
+                            "Set up this project before leaving a message for its model.",
+                        )?;
+                    }
+                }
+                10 if private => setup::view_private_desktop(project.as_deref())?,
                 _ => {}
             }
             Ok(())

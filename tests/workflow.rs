@@ -2773,7 +2773,10 @@ mod terminal_ui {
             }
         }
         fn wait(&mut self, text: &str) {
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            self.wait_for(text, Duration::from_secs(20));
+        }
+        fn wait_for(&mut self, text: &str, timeout: Duration) {
+            let deadline = std::time::Instant::now() + timeout;
             loop {
                 self.read();
                 if self.parser.screen().contents().contains(text) {
@@ -3773,7 +3776,7 @@ mod terminal_ui {
             });
             ui.wait("Hello from project chat");
             assert!(!root.path().join("state/state.json").exists());
-            ui.send(b"\t");
+            ui.send(b"\t\t");
             ui.wait("Run saved");
             ui.send(b"\r");
             ui.wait("Resume project");
@@ -4490,7 +4493,7 @@ mod terminal_ui {
         ui.wait("Resume project");
         ui.send(b"jjjjjj\r");
         ui.wait("PROJECT CHAT");
-        ui.send(b"\t\x1b[H");
+        ui.send(b"\t\t\x1b[H");
         ui.wait("Earlier thinking saved only in the wire trace");
         assert_eq!(
             server.requests.lock().unwrap().len(),
@@ -4498,6 +4501,35 @@ mod terminal_ui {
             "Viewing saved history must not start inference or replay tools"
         );
         ui.send(b"q");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+    }
+
+    #[test]
+    fn mailbox_home_sends_and_reopens_without_starting_inference() {
+        let server = Server::custom(false, false, None, |_, _| {
+            ("No request should reach me".into(), json!([]))
+        });
+        let root = tempfile::tempdir().unwrap();
+        chaos_fixture(root.path(), &server.url);
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"jjjjjjjjj\r");
+        ui.wait("MESSAGES WITH THE LOOP");
+        ui.send(b"Hello durable mailbox\r");
+        ui.wait("waiting for model");
+        assert!(server.requests.lock().unwrap().is_empty());
+        ui.send(b"\tq");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"jjjjjjjjj\r");
+        ui.wait("Hello durable mailbox");
+        assert!(server.requests.lock().unwrap().is_empty());
+        ui.send(b"\tq");
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
@@ -4555,7 +4587,7 @@ mod terminal_ui {
         ui.send(b"jjjjjjjjjj\r");
         ui.wait("Where should this session run?");
         ui.send(b"\r");
-        ui.wait("More project settings");
+        ui.wait_for("More project settings", Duration::from_secs(600));
         assert!(server.requests.lock().unwrap().is_empty());
         assert!(root.path().join("state/computer/ready.json").exists());
         ui.send(b"\x1b");
@@ -4628,6 +4660,105 @@ mod terminal_ui {
         assert_ne!(hidden["status"], "complete", "{hidden}");
         assert!(!hidden.to_string().contains("PRIVATE_HOST_CANARY"));
         assert!(!repo.join("probe.txt").exists());
+        let info = tool("computer_info", json!({}));
+        assert_eq!(info["status"], "complete", "{info}");
+        for capability in ["browser", "pdf_text", "media_metadata"] {
+            assert_eq!(info["result"]["capabilities"][capability], true, "{info}");
+        }
+        let application = info["result"]["applications"]
+            .as_array()
+            .unwrap()
+            .first()
+            .unwrap()["id"]
+            .clone();
+        let app = tool("application_command", json!({"application_id":application}));
+        assert_eq!(app["status"], "complete", "{app}");
+        assert_eq!(app["result"]["launched"], false);
+        assert!(
+            !app["result"]["run_command"]["argv"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let doc = tool(
+            "inspect_document",
+            json!({"path":"/root/probe.txt","limit":6}),
+        );
+        assert_eq!(doc["status"], "complete", "{doc}");
+        assert_eq!(doc["result"]["content"]["text"], "Inside");
+        let fixture = r#"<!doctype html><title>Browser fixture</title><h1>Private browser fixture</h1><label>Name <input aria-label="Name"></label><button onclick="document.querySelector('output').textContent='Count '+(++window.count)">Count</button><select aria-label="Colour"><option value="red">Red</option><option value="blue">Blue</option></select><output>Count 0</output><script>window.count=0</script>"#;
+        assert_eq!(
+            tool(
+                "write_file",
+                json!({"path":"/root/browser-fixture.html","content":fixture})
+            )["status"],
+            "complete"
+        );
+        let opened = tool(
+            "browser",
+            json!({"action":"open","url":"file:///root/browser-fixture.html"}),
+        );
+        assert_eq!(opened["status"], "complete", "{opened}");
+        let tab = opened["result"]["tab_id"].clone();
+        let mut page = opened["result"].clone();
+        for _ in 0..15 {
+            if page["content"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Private browser fixture")
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+            let read = tool("browser", json!({"action":"read","tab_id":tab}));
+            assert_eq!(read["status"], "complete", "{read}");
+            page = read["result"].clone();
+        }
+        assert!(
+            page.to_string().contains("Private browser fixture"),
+            "{page}"
+        );
+        let element = |page: &Value, label: &str| {
+            page["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == label)
+                .unwrap_or_else(|| panic!("Missing {label}: {page}"))
+                .clone()
+        };
+        let name = element(&page, "Name");
+        let args = json!({"action":"type","tab_id":tab,"snapshot_id":page["snapshot_id"],"element_id":name["id"],"text":"Hello 🌱"});
+        let typed = tool("browser", args.clone());
+        assert_eq!(typed["status"], "complete", "{typed}");
+        assert_eq!(
+            tool("browser", args)["status"],
+            "failed",
+            "Consumed refs must not repeat typing"
+        );
+        page = typed["result"].clone();
+        assert_eq!(element(&page, "Name")["value"], "Hello 🌱");
+        let count = element(&page, "Count");
+        let clicked = tool(
+            "browser",
+            json!({"action":"click","tab_id":tab,"snapshot_id":page["snapshot_id"],"element_id":count["id"]}),
+        );
+        assert_eq!(clicked["status"], "complete", "{clicked}");
+        page = clicked["result"].clone();
+        assert!(
+            page["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Count 1"),
+            "{page}"
+        );
+        let colour = element(&page, "Colour");
+        let selected = tool(
+            "browser",
+            json!({"action":"select","tab_id":tab,"snapshot_id":page["snapshot_id"],"element_id":colour["id"],"value":"blue"}),
+        );
+        assert_eq!(selected["status"], "complete", "{selected}");
+        assert_eq!(element(&selected["result"], "Colour")["value"], "blue");
         assert!(
             Command::new("podman")
                 .args([
@@ -4752,15 +4883,9 @@ mod terminal_ui {
         ui.send(b"jjjjjjj\r");
         ui.wait("More project settings");
         ui.send(b"jjjjjjjjjj\r");
-        ui.wait("Computer environment");
-        ui.send(b"j\r");
-        ui.wait("Advanced computer settings");
-        ui.send(b"j\r");
-        ui.wait("Advanced computer settings");
-        ui.send(b"\x1b");
-        ui.wait("Computer environment");
-        ui.send(b"\x1b");
-        ui.wait("More project settings");
+        ui.wait("Where should this session run?");
+        ui.send(b"\r");
+        ui.wait_for("More project settings", Duration::from_secs(600));
         ui.send(b"\x1b");
         ui.wait("Resume project");
         ui.send(b"q");

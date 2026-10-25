@@ -1,4 +1,5 @@
 //! Full-screen observation and shared interactive surfaces.
+mod messages;
 use crate::{
     events::{self, Event},
     runner,
@@ -6,8 +7,9 @@ use crate::{
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event as Input, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event as Input, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
     },
     execute,
 };
@@ -39,7 +41,12 @@ pub fn active() -> bool {
 }
 pub fn restore() {
     if ACTIVE.swap(false, Ordering::SeqCst) {
-        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            DisableFocusChange
+        );
         ratatui::restore();
     }
 }
@@ -56,7 +63,12 @@ impl Screen {
         ACTIVE.store(true, Ordering::SeqCst);
         TERMINAL.with(|t| *t.borrow_mut() = Some(terminal));
         let guard = Self;
-        execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+        execute!(
+            io::stdout(),
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            EnableFocusChange
+        )?;
         Ok(guard)
     }
 }
@@ -219,26 +231,33 @@ fn splash(
         "Defaults for projects without overrides",
         "Return to your shell",
     ];
+    let compact_menu = items.len() * 2 > columns[0].height.saturating_sub(2) as usize;
     let entries: Vec<ListItem> = items
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            ListItem::new(vec![
-                Line::from(item.clone()).bold(),
-                Line::from(match item.as_str() {
-                    "Set up this project" => "Define a goal and start this project",
-                    "Run duration" => "Finish the current cycle when time is up",
-                    "Chat with this project" => "Discuss the project and control its loop",
-                    "Tool requests" => "Review missing capabilities suggested by models",
-                    "Settings" => "Common settings for this project",
-                    "More project settings" => "Chat, helpers, tools and command review",
-                    "Global settings" => "Shared connections and defaults",
-                    "Open desktop" => "View the private computer in your browser",
-                    "Quit" => "Return to your shell",
-                    _ => descriptions.get(i).copied().unwrap_or(""),
-                })
-                .fg(MUTED),
-            ])
+            let mut lines = vec![Line::from(item.clone()).bold()];
+            if !compact_menu || i == selected {
+                lines.push(
+                    Line::from(match item.as_str() {
+                        "Set up this project" => "Define a goal and start this project",
+                        "Run duration" => "Finish the current cycle when time is up",
+                        "Project assistant" | "Chat with this project" => {
+                            "A separate assistant for questions and controls"
+                        }
+                        "Messages with the loop" => "Send and read messages with the working model",
+                        "Tool requests" => "Review missing capabilities suggested by models",
+                        "Settings" => "Common settings for this project",
+                        "More project settings" => "Chat, helpers, tools and command review",
+                        "Global settings" => "Shared connections and defaults",
+                        "Open desktop" => "View the private computer in your browser",
+                        "Quit" => "Return to your shell",
+                        _ => descriptions.get(i).copied().unwrap_or(""),
+                    })
+                    .fg(MUTED),
+                );
+            }
+            ListItem::new(lines)
         })
         .collect();
     let mut state = ListState::default().with_selected(Some(selected));
@@ -250,18 +269,24 @@ fn splash(
         columns[0],
         &mut state,
     );
-    let detail = vec![
+    let mut detail = vec![
         Line::from("PROJECT").fg(CYAN).bold(),
         Line::from(project.to_owned()),
         Line::from(""),
         Line::from("MODEL").fg(CYAN).bold(),
         Line::from(model.to_owned()),
         Line::from(""),
-        Line::from(status.to_owned()).fg(MUTED),
+    ];
+    detail.extend(
+        status
+            .lines()
+            .map(|line| Line::from(line.to_owned()).fg(MUTED)),
+    );
+    detail.extend([
         Line::from(""),
         Line::from("Fresh context. Persistent progress.").fg(ACCENT),
         Line::from(format!("v{} · Rust", env!("CARGO_PKG_VERSION"))).fg(MUTED),
-    ];
+    ]);
     f.render_widget(p(Text::from(detail)).block(panel("Workspace")), columns[1]);
     f.render_widget(
         Paragraph::new("↑ ↓  navigate     Enter  select     Esc / q  quit")
@@ -937,6 +962,10 @@ struct Dashboard {
     commit_pending: Option<String>,
     controls: Arc<crate::run_control::RunControl>,
     chat: ChatPanel,
+    messages: messages::MessagesPanel,
+    focused: bool,
+    last_human_input: Option<Instant>,
+    mailbox_button: Option<Rect>,
     entries: VecDeque<Entry>,
     phase: String,
     task: String,
@@ -1001,6 +1030,10 @@ impl Dashboard {
             commit_pending: None,
             controls: Arc::default(),
             chat: ChatPanel::default(),
+            messages: messages::MessagesPanel::default(),
+            focused: false,
+            last_human_input: None,
+            mailbox_button: None,
             entries: VecDeque::new(),
             phase: "Ready".into(),
             task: if config.activity_mode.is_chaos() {
@@ -1823,6 +1856,8 @@ fn dashboard_footer(
 ) -> (Paragraph<'static>, u16) {
     let mut controls = if d.tab == 5 {
         "Enter send · Esc cancel · Ctrl+N new chat · F2 tool details · Tab views".into()
+    } else if d.tab == 6 {
+        "Enter send · Alt+Enter newline · F2 older · F3 latest · F5 availability · Tab views".into()
     } else if d.finished.is_some() {
         "R resume work  ·  N nudge  ·  Enter / Q return home".into()
     } else if paused {
@@ -1849,7 +1884,7 @@ fn dashboard_footer(
             )
         )
     } else {
-        "P pause · Ctrl+C finish cycle · N nudge · 1–6 views · ? help".into()
+        "P pause · Ctrl+C finish cycle · N nudge · M messages · 1–7 views · ? help".into()
     };
     if c.execution.is_private() {
         controls.push_str(" · F4 desktop");
@@ -1931,6 +1966,45 @@ fn dashboard_footer(
     (paragraph, height)
 }
 
+fn dashboard_tabs(chaos: bool, selected: usize, width: usize) -> Vec<Line<'static>> {
+    let labels = [
+        "1 Live",
+        "2 Model",
+        "3 Checks",
+        if chaos { "4 Session" } else { "4 Goal" },
+        "5 Settings",
+        "6 Assistant",
+        "7 Messages",
+    ];
+    let mut rows = Vec::new();
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for (index, label) in labels.into_iter().enumerate() {
+        let len = label.len() + if spans.is_empty() { 0 } else { 3 };
+        if !spans.is_empty() && used + len > width {
+            rows.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::styled(" │ ", Style::default().fg(MUTED)));
+            used += 3;
+        }
+        spans.push(Span::styled(
+            label,
+            if index == selected {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default().fg(MUTED)
+            },
+        ));
+        used += label.len();
+    }
+    if !spans.is_empty() {
+        rows.push(Line::from(spans));
+    }
+    rows
+}
+
 fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stopping: bool) {
     base(f);
     let a = f.area().inner(Margin::new(1, 0));
@@ -1968,6 +2042,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         Constraint::Length(2),
         Constraint::Length(3),
         Constraint::Length(if d.nudges.active.is_some() { 5 } else { 3 }),
+        Constraint::Length(1),
         Constraint::Min(4),
         Constraint::Length(2),
         Constraint::Length(footer_height),
@@ -2078,34 +2153,35 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         ))),
         r[2],
     );
+    let presence = crate::communication::presence();
+    let inbox = d.messages.status.as_ref();
+    let incoming = inbox.map(|s| s.unread_to_human).unwrap_or(0);
+    let outgoing = inbox.map(|s| s.unread_to_model).unwrap_or(0);
+    d.mailbox_button = Some(r[3]);
+    f.render_widget(
+        Paragraph::new(format!(
+            " M Messages · {incoming} new · You: {} · To model: {outgoing} unread",
+            presence.status.label()
+        ))
+        .fg(if incoming > 0 { GOLD } else { MUTED }),
+        r[3],
+    );
     let body = Layout::horizontal(if wide {
         vec![Constraint::Min(40), Constraint::Length(29)]
     } else {
         vec![Constraint::Percentage(100), Constraint::Length(0)]
     })
     .spacing(if wide { 1 } else { 0 })
-    .split(r[3]);
-    let log = Layout::vertical([Constraint::Length(1), Constraint::Min(2)]).split(body[0]);
-    f.render_widget(
-        Tabs::new(vec![
-            "1 Live",
-            "2 Model",
-            "3 Checks",
-            if c.activity_mode.is_chaos() {
-                "4 Session"
-            } else {
-                "4 Goal"
-            },
-            "5 Settings",
-            "6 Chat",
-        ])
-        .select(d.tab)
-        .style(Style::default().fg(MUTED))
-        .highlight_style(Style::default().fg(ACCENT).bold())
-        .divider(" │ "),
-        log[0],
-    );
-    let label = if d.finished.is_some() && !d.searching && d.filter.is_empty() {
+    .split(r[4]);
+    let tabs = dashboard_tabs(c.activity_mode.is_chaos(), d.tab, body[0].width as usize);
+    let log = Layout::vertical([Constraint::Length(tabs.len() as u16), Constraint::Min(2)])
+        .split(body[0]);
+    f.render_widget(Paragraph::new(tabs), log[0]);
+    let label = if d.tab == 6 {
+        "Messenger · direct messages with the loop".into()
+    } else if d.tab == 5 {
+        "Assistant · a separate conversation".into()
+    } else if d.finished.is_some() && !d.searching && d.filter.is_empty() {
         "Saved output · scroll to review".into()
     } else if d.searching {
         format!("Search: {}▏", d.filter)
@@ -2132,12 +2208,20 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     let inner = block.inner(log[1]);
     f.render_widget(block, log[1]);
     let show_activity = d.tab <= 2 && d.finished.is_none() && inner.height >= 2;
+    let composer_height = if d.tab == 6 {
+        (d.messages
+            .composer(inner.width.saturating_sub(4) as usize, 6)
+            .len()
+            + 2)
+        .clamp(3, 6)
+        .min(inner.height.saturating_sub(2) as usize) as u16
+    } else if d.tab == 5 {
+        3
+    } else {
+        u16::from(show_activity)
+    };
     let output = Rect {
-        height: inner.height.saturating_sub(if d.tab == 5 {
-            3
-        } else {
-            u16::from(show_activity)
-        }),
+        height: inner.height.saturating_sub(composer_height),
         ..inner
     };
     if d.tab == 5 {
@@ -2145,6 +2229,22 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             p(format!("› {}▏", d.chat.draft))
                 .fg(CYAN)
                 .block(panel("Message · Enter sends · Tab changes view")),
+            Rect::new(
+                inner.x,
+                inner.y + output.height,
+                inner.width,
+                inner.height - output.height,
+            ),
+        );
+    }
+    if d.tab == 6 {
+        f.render_widget(
+            Paragraph::new(d.messages.composer(
+                inner.width.saturating_sub(4) as usize,
+                composer_height.saturating_sub(2) as usize,
+            ))
+            .fg(CYAN)
+            .block(panel(&d.messages.composer_title())),
             Rect::new(
                 inner.x,
                 inner.y + output.height,
@@ -2163,6 +2263,8 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         settings_lines(d, c)
     } else if d.tab == 5 {
         d.chat.lines(inner.width.saturating_sub(1) as usize)
+    } else if d.tab == 6 {
+        d.messages.lines(inner.width.saturating_sub(1) as usize)
     } else {
         d.lines(inner.width.saturating_sub(1) as usize, if c.activity_mode.is_chaos() { "No goals, only chaos\n\nNo objective is assigned. The model may use tools, select its own activities, or generate text without a task. Responses continue in the same saved conversation. Repeated-phrase recovery stays enabled.\n\nYou retain pause, stop, schedule and timer controls. Sampling changes apply to the next request." } else { &c.goal })
     };
@@ -2180,6 +2282,11 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         d.scroll = d.total_rows.saturating_sub(d.rows);
     } else {
         d.scroll = d.scroll.min(d.total_rows.saturating_sub(d.rows));
+    }
+    if d.tab == 6 {
+        d.messages.viewport(d.scroll, d.rows);
+    } else {
+        d.messages.visible.clear();
     }
     f.render_widget(
         Paragraph::new(Text::from(
@@ -2388,11 +2495,11 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             provider_label
         )
     };
-    f.render_widget(Paragraph::new(health).fg(MUTED), r[4]);
-    if r[4].height > 1 && d.resources.total_gib > 0. {
+    f.render_widget(Paragraph::new(health).fg(MUTED), r[5]);
+    if r[5].height > 1 && d.resources.total_gib > 0. {
         let bars = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .spacing(2)
-            .split(Rect::new(r[4].x, r[4].y + 1, r[4].width, 1));
+            .split(Rect::new(r[5].x, r[5].y + 1, r[5].width, 1));
         f.render_widget(
             LineGauge::default()
                 .filled_style(Style::default().fg(CYAN))
@@ -2410,7 +2517,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
             bars[1],
         );
     }
-    f.render_widget(footer, r[5]);
+    f.render_widget(footer, r[6]);
     if let Some(draft) = &d.nudge_edit {
         let area = Rect::new(
             a.x + 2,
@@ -2424,7 +2531,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     if d.help {
         let area = a.inner(Margin::new(2, 1));
         f.render_widget(Clear, area);
-        f.render_widget(p("P              Pause / continue current cycle\nT              Retry provider now; queue while paused\nCtrl+C / Q     Finish cycle, then stop\nCtrl+C again   Force stop immediately\nR              Cancel stop / resume saved run\nN              Add / manage a temporary nudge\n1–6 / Tab      Live, model, checks, goal, settings, chat\n↑↓ / wheel     Scroll a few lines\nPgUp / PgDn    Scroll a page\nHome / End     Oldest / latest output\nF              Follow live output\nE              Expand / collapse command output\nF4 / Alt+D     Open private desktop; or click the top button\n/              Search current view\nEsc            Clear search / close help\n\nPause waits for the current operation; the run timer holds.\nStarted commands may finish. Full logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.").block(panel("Keyboard guide · ? / Esc closes")),area);
+        f.render_widget(p("P              Pause / continue current cycle\nT              Retry provider now; queue while paused\nCtrl+C / Q     Finish cycle, then stop\nCtrl+C again   Force stop immediately\nR              Cancel stop / resume saved run\nN              Add / manage a temporary nudge\n1–7 / Tab      Observation, settings, assistant, messages\nM              Direct messages with the looping model\n↑↓ / wheel     Scroll a few lines\nPgUp / PgDn    Scroll a page\nHome / End     Oldest / latest output\nF              Follow live output\nE              Expand / collapse command output\nF4 / Alt+D     Open private desktop; or click the top button\n/              Search current view\nEsc            Clear search / close help\n\nPause waits for the current operation; the run timer holds.\nStarted commands may finish. Full logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.").block(panel("Keyboard guide · ? / Esc closes")),area);
     }
 }
 
@@ -2448,11 +2555,15 @@ fn desktop_requested(event: &Input, area: Option<Rect>) -> bool {
 }
 
 pub fn dashboard(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
-    dashboard_with_recovery(path, stop, running, true, false)
+    dashboard_with_recovery(path, stop, running, true, 0)
 }
 
 pub fn chat_home(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
-    dashboard_with_recovery(path, stop, running, false, true)
+    dashboard_with_recovery(path, stop, running, false, 5)
+}
+
+pub fn messages_home(path: &Path, stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
+    dashboard_with_recovery(path, stop, running, false, 6)
 }
 
 fn dashboard_with_recovery(
@@ -2460,10 +2571,10 @@ fn dashboard_with_recovery(
     stop: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     mut start: bool,
-    chat: bool,
+    initial_tab: usize,
 ) -> Result<()> {
     loop {
-        match dashboard_session(path, stop.clone(), running.clone(), start, chat) {
+        match dashboard_session(path, stop.clone(), running.clone(), start, initial_tab) {
             Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(error) => {
@@ -2503,9 +2614,9 @@ fn dashboard_session(
     stop: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     start: bool,
-    chat: bool,
+    initial_tab: usize,
 ) -> Result<bool> {
-    if (start || chat) && !crate::setup::ensure_computer_interactive(path)? {
+    if (start || initial_tab == 5) && !crate::setup::ensure_computer_interactive(path)? {
         return Ok(false);
     }
     let mut config = runner::load(path)?;
@@ -2520,9 +2631,7 @@ fn dashboard_session(
     }
     let rx = events::subscribe();
     crate::engine::foreground(Some(client.clone()));
-    if chat {
-        d.tab = 5;
-    }
+    d.tab = initial_tab;
     let mut cursor = d.history_sequence;
     let mut sent_stop = false;
     let result = (|| -> Result<bool> {
@@ -2583,8 +2692,33 @@ fn dashboard_session(
             if d.tab == 5 || d.chat.session.is_some() {
                 d.chat.poll(&client, &config)?;
             }
+            d.messages.poll(&config.state_dir, false);
             draw(|f| render_dashboard(f, &mut d, &config, stop.load(Ordering::SeqCst)))?;
+            if d.tab == 6 && !d.help && d.nudge_edit.is_none() {
+                d.messages.acknowledge(
+                    &config.state_dir,
+                    d.focused,
+                    d.last_human_input
+                        .is_some_and(|t| t.elapsed() < Duration::from_secs(30)),
+                    crate::communication::presence().status,
+                );
+            }
             if let Some(e) = input()? {
+                match e {
+                    Input::FocusGained => {
+                        d.focused = true;
+                        continue;
+                    }
+                    Input::FocusLost => {
+                        d.focused = false;
+                        continue;
+                    }
+                    Input::Key(_) | Input::Mouse(_) | Input::Paste(_) => {
+                        d.last_human_input = Some(Instant::now());
+                        d.focused = true;
+                    }
+                    _ => {}
+                }
                 if desktop_requested(&e, d.desktop_button) && config.execution.is_private() {
                     if let Err(error) = crate::setup::view_private_desktop(Some(path)) {
                         clear_notes();
@@ -2593,10 +2727,35 @@ fn dashboard_session(
                     continue;
                 }
                 if let Input::Mouse(m) = e {
+                    if m.kind == MouseEventKind::Down(event::MouseButton::Left)
+                        && d.mailbox_button
+                            .is_some_and(|a| a.contains(Position::new(m.column, m.row)))
+                    {
+                        d.tab = 6;
+                        d.follow = true;
+                        continue;
+                    }
                     match m.kind {
                         MouseEventKind::ScrollUp => d.back(3),
                         MouseEventKind::ScrollDown => d.forward(3),
                         _ => {}
+                    }
+                }
+                if d.tab == 6 && d.nudge_edit.is_none() && !d.help {
+                    if let Input::Paste(value) = &e {
+                        d.messages.append(value);
+                        continue;
+                    }
+                    if let Some(k) = pressed(&e)
+                        && d.messages.key(k, &config.state_dir)?
+                    {
+                        if k.code == KeyCode::F(2) {
+                            d.follow = false;
+                            d.scroll = 0;
+                        } else if matches!(k.code, KeyCode::Enter | KeyCode::F(3)) {
+                            d.follow = true;
+                        }
+                        continue;
                     }
                 }
                 if let Input::Paste(value) = &e
@@ -2857,6 +3016,11 @@ fn dashboard_session(
                             d.controls.resume();
                         }
                         KeyCode::Char('?') => d.help = true,
+                        KeyCode::Char('m' | 'M') => {
+                            d.tab = 6;
+                            d.follow = true;
+                            d.scroll = 0;
+                        }
                         KeyCode::Char('e' | 'E') if matches!(d.tab, 0 | 2) => {
                             d.expanded_commands = !d.expanded_commands;
                         }
@@ -2870,16 +3034,16 @@ fn dashboard_session(
                         }
                         KeyCode::End | KeyCode::Char('f') => d.follow = true,
                         KeyCode::BackTab => {
-                            d.tab = (d.tab + 5) % 6;
+                            d.tab = (d.tab + 6) % 7;
                             d.follow = !matches!(d.tab, 3 | 4);
                             d.scroll = 0;
                         }
                         KeyCode::Tab => {
-                            d.tab = (d.tab + 1) % 6;
+                            d.tab = (d.tab + 1) % 7;
                             d.follow = !matches!(d.tab, 3 | 4);
                             d.scroll = 0;
                         }
-                        KeyCode::Char(c @ '1'..='6') => {
+                        KeyCode::Char(c @ '1'..='7') => {
                             d.tab = (c as u8 - b'1') as usize;
                             d.follow = !matches!(d.tab, 3 | 4);
                             d.scroll = 0;
@@ -2991,6 +3155,58 @@ pub fn busy<T: Send + 'static>(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    #[test]
+    fn home_keeps_messages_desktop_and_quit_visible_with_a_full_menu() {
+        let items = [
+            "Resume project",
+            "Session mode",
+            "Progress",
+            "Project model",
+            "Settings",
+            "Run duration",
+            "Chat with this project",
+            "More project settings",
+            "Global settings",
+            "Messages with the loop",
+            "Open desktop",
+            "Quit",
+        ]
+        .map(str::to_owned);
+        for (width, height) in [(110, 36), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| {
+                    splash(
+                        f,
+                        &items,
+                        0,
+                        "/test/workspace",
+                        "model",
+                        "First status line\nSecond status line",
+                    )
+                })
+                .unwrap();
+            let text = screen_text(&terminal);
+            assert!(text.contains("Messages with the loop"), "{text}");
+            assert!(text.contains("Open desktop"), "{text}");
+            assert!(text.contains("Quit"), "{text}");
+            assert!(!text.contains("lineSecond"), "{text}");
+        }
+    }
+    #[test]
+    fn all_seven_tabs_remain_visible_when_wrapped_and_initial_focus_is_unknown() {
+        for width in [42, 60, 80, 110] {
+            let text = dashboard_tabs(true, 6, width)
+                .into_iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("6 Assistant"));
+            assert!(text.contains("7 Messages"));
+            assert!(text.lines().all(|l| l.chars().count() <= width));
+        }
+        assert!(!Dashboard::new(&config()).focused);
+    }
     #[test]
     fn private_desktop_action_is_visible_and_clickable_in_live_and_paused_views() {
         let mut c = config();
@@ -4074,8 +4290,10 @@ impl ChatPanel {
         let mut lines = vec![
             Line::from("PROJECT CHAT").fg(ACCENT).bold(),
             Line::from("Ask about progress, guide the loop, or work directly."),
-            Line::from("Separate conversation; use a nudge to send direction to the loop.")
-                .fg(MUTED),
+            Line::from(
+                "Separate assistant. Tab 7 messages the loop; a nudge sets a temporary priority.",
+            )
+            .fg(MUTED),
             Line::from(""),
         ];
         for message in &self.history {

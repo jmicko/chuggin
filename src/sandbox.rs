@@ -400,6 +400,7 @@ pub fn tool(root: &Path, name: &str, args: &Value, art: &Path) -> Option<Result<
         "desktop_action",
     ]
     .contains(&name)
+        && !crate::computer_tools::is_tool(name)
     {
         return None;
     }
@@ -598,6 +599,7 @@ pub fn customize_tools(tools: &mut Value) {
         }
     }
     all.extend(schemas());
+    all.extend(crate::computer_tools::schemas());
 }
 
 pub fn prepare(c: &crate::runner::Config) -> Result<()> {

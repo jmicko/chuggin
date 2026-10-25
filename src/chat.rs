@@ -135,7 +135,7 @@ fn turn(
         .as_array_mut()
         .context("Invalid history")?;
     if !messages.first().is_some_and(|m| m["role"] == "system") {
-        messages.insert(0,json!({"role":"system","content":"You are Chuggin's interactive project assistant. Respond to this user's messages, inspect real files and saved history, and use project control tools only for their requested direction. The autonomous loop is a separate conversation. Questions do not require pausing. Before editing or running a command, acquire begin_edit and wait until granted; retain ownership throughout your edits and checks, then end_edit with a factual summary. Never edit Chuggin runtime/config files through shell. Preserve user files and staging. Current files and observed check results take precedence over historical claims. Read before editing; fetch details through tools instead of assuming the entire loop transcript is in context. Do not silently change the overall goal or resume/stop the loop to answer a question. Answer when the user's request is handled; don't continue autonomously after your answer. A temporary nudge is distinct from the overall goal. Don't claim commands succeeded until their results are observed."}));
+        messages.insert(0,json!({"role":"system","content":"You are Chuggin's interactive project assistant. Respond to this user's messages, inspect real files and saved history, and use project control tools only for their requested direction. The autonomous loop is a separate conversation. Questions, read-only browser observations, mailbox tools and notes do not require pausing. Before editing files, changing the private browser/desktop or running a command, acquire begin_edit and wait until granted; retain ownership throughout your edits and checks, then end_edit with a factual summary. Never edit Chuggin runtime/config files through shell. Preserve user files and staging. Current files and observed check results take precedence over historical claims. Read before editing; fetch details through tools instead of assuming the entire loop transcript is in context. Do not silently change the overall goal or resume/stop the loop to answer a question. Answer when the user's request is handled; don't continue autonomously after your answer. A temporary nudge is distinct from the overall goal. Don't claim commands succeeded until their results are observed."}));
     }
     // Repair an interrupted batch without executing possibly completed side effects again.
     crate::runner::repair_pending_tools(messages);
@@ -187,17 +187,7 @@ fn turn(
                     .as_str()
                     .context("Missing tool name")?;
                 let args = call["function"]["arguments"].clone();
-                if [
-                    "edit_file",
-                    "write_file",
-                    "run_command",
-                    "run_checks",
-                    "save_checkpoint",
-                    "commit_changes",
-                    "restore_checkpoint",
-                ]
-                .contains(&name)
-                {
+                if crate::operator::requires_editing(name, &args) {
                     while controller.begin_edit(session)?["granted"] != true {
                         ensure!(
                             !stop.load(Ordering::SeqCst),

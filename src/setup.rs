@@ -13,6 +13,7 @@ use std::{
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub presence: crate::presence::Settings,
     pub helpers: crate::agents::Settings,
     pub active_hours: crate::schedule::Schedule,
     pub ollama_url: String,
@@ -33,6 +34,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            presence: crate::presence::Settings::default(),
             helpers: crate::agents::Settings::default(),
             active_hours: crate::schedule::Schedule::Always,
             ollama_url: "http://localhost:11434".into(),
@@ -1827,6 +1829,7 @@ pub fn settings_menu() -> Result<()> {
             format!("Default setup thinking    {}", s.setup_reasoning.label()),
             format!("Default chat thinking     {}", s.chat_reasoning.label()),
             "Sampling defaults…".into(),
+            "Presence · automatic away status".into(),
             "Back".into(),
         ];
         let Some(index) =
@@ -1999,9 +2002,70 @@ pub fn settings_menu() -> Result<()> {
                 default_sampling_menu()?;
                 continue;
             }
+            16 => {
+                presence_menu()?;
+                continue;
+            }
             _ => return Ok(()),
         }
         save(&settings_path()?, &s)?;
+    }
+}
+
+pub fn presence_menu() -> Result<()> {
+    loop {
+        let mut settings = settings()?;
+        let current = crate::presence::snapshot(&settings.presence);
+        crate::ui::clear_notes();
+        crate::ui::notice(format!(
+            "Your status: {}\n{}\n\nAutomatic status uses this computer's desktop idle time, not activity inside the model's private computer. It does not read keystrokes, window contents or clipboard data. Presence is separate from read receipts and never pauses the loop.",
+            current.status.label(),
+            current.detail
+        ));
+        match crate::menu::select(
+            "Presence · global",
+            &[
+                format!("Status · {}", settings.presence.mode.label()),
+                format!(
+                    "Automatically away after · {} minutes",
+                    settings.presence.away_after_minutes
+                ),
+                "Back".into(),
+            ],
+            0,
+        )? {
+            Some(0) => {
+                use crate::presence::Mode;
+                let modes = [Mode::Automatic, Mode::Active, Mode::Away, Mode::Busy];
+                let options = modes
+                    .iter()
+                    .map(|m| m.label().to_owned())
+                    .collect::<Vec<_>>();
+                if let Some(i) = crate::menu::select(
+                    "Your availability",
+                    &options,
+                    modes
+                        .iter()
+                        .position(|m| *m == settings.presence.mode)
+                        .unwrap_or(0),
+                )? {
+                    settings.presence.mode = modes[i];
+                } else {
+                    continue;
+                }
+            }
+            Some(1) => {
+                settings.presence.away_after_minutes = number(
+                    "Minutes without input before Away",
+                    settings.presence.away_after_minutes,
+                    1,
+                    1440,
+                )?
+            }
+            _ => return Ok(()),
+        }
+        settings.presence.validate()?;
+        save(&settings_path()?, &settings)?;
     }
 }
 

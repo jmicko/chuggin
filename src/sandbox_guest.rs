@@ -87,6 +87,9 @@ fn path(args: &Value) -> Result<PathBuf> {
     )
 }
 fn call(name: &str, args: &Value) -> Result<Value> {
+    if crate::computer_tools::is_tool(name) {
+        return crate::computer_tools::call(name, args);
+    }
     match name {
         "ping" => Ok(json!({"protocol":1})),
         "resource_limits" => Ok(json!({

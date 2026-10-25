@@ -1,6 +1,6 @@
 FROM docker.io/library/debian:stable-slim
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps dbus-x11 xfce4-session xfce4-panel xfdesktop4 xfwm4 xfce4-terminal thunar xvfb x11-utils x11vnc novnc websockify imagemagick xdotool wmctrl mesa-utils libgl1-mesa-dri socat && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps dbus-x11 xfce4-session xfce4-panel xfdesktop4 xfwm4 xfce4-terminal thunar xvfb x11-utils x11vnc novnc websockify imagemagick xdotool wmctrl mesa-utils libgl1-mesa-dri socat chromium file poppler-utils unzip ffmpeg && rm -rf /var/lib/apt/lists/*
 COPY start-desktop /usr/local/bin/start-desktop
 RUN chmod 755 /usr/local/bin/start-desktop
 WORKDIR /root

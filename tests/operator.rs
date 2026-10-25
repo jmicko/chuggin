@@ -211,6 +211,107 @@ fn unprepared_private_computer_allows_status_and_model_settings_without_starting
     assert_ne!(read["status"], "complete", "{read}");
     assert!(!f.dir.path().join(".chuggin/state.json").exists());
 }
+
+#[test]
+fn private_computer_tools_require_readiness_but_host_notes_and_mail_do_not() {
+    let f = Fixture::with_computer("http://127.0.0.1:9", 8192, true, true);
+    let session = f.session();
+    for (name, args) in [
+        ("computer_info", json!({})),
+        (
+            "application_command",
+            json!({"application_id":"example.desktop"}),
+        ),
+        ("inspect_document", json!({"path":"/etc/os-release"})),
+        ("browser", json!({"action":"status"})),
+        (
+            "browser",
+            json!({"action":"open","url":"https://example.invalid"}),
+        ),
+    ] {
+        let result = f.call(&session, name, args);
+        assert_eq!(result["status"], "failed", "{name}: {result}");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("private"),
+            "{result}"
+        );
+    }
+    let note = f.call(
+        &session,
+        "notebook",
+        json!({"action":"write","title":"Question","body":"What should I explore?"}),
+    );
+    assert_eq!(note["status"], "complete", "{note}");
+    let read = f.call_id(
+        &session,
+        "notebook",
+        json!({"action":"read","id":note["result"]["note"]["id"]}),
+        "read-note",
+    );
+    assert_eq!(read["result"]["body"], "What should I explore?", "{read}");
+    assert!(
+        !f.dir
+            .path()
+            .join(format!(
+                ".chuggin/operator/operations/{session}-read-note.json"
+            ))
+            .exists()
+    );
+    let mail = f.call(
+        &session,
+        "message_loop",
+        json!({"body":"Let me know what interests you."}),
+    );
+    assert_eq!(mail["status"], "complete", "{mail}");
+    assert_eq!(
+        f.call(&session, "messenger_status", json!({}))["result"]["mailbox"]["unread_to_model"],
+        1
+    );
+    let status = f.rpc(json!({"action":"status"}));
+    assert!(status["editing"].is_null(), "{status}");
+    assert_eq!(status["running"], false);
+    assert!(!f.dir.path().join(".chuggin/computer/ready.json").exists());
+    assert!(!f.dir.path().join(".chuggin/state.json").exists());
+}
+
+#[test]
+fn messenger_operator_delivery_retries_preserve_original_arguments_and_session_scope() {
+    let f = Fixture::new("http://127.0.0.1:9");
+    let a = f.session();
+    let b = f.session();
+    let args = json!({"body":"A message that is only delivered once"});
+    let first = f.call_id(&a, "message_loop", args.clone(), "same-message");
+    assert_eq!(first["status"], "complete", "{first}");
+    let message_id = first["result"]["message"]["id"].clone();
+    let operation = f.dir.path().join(format!(
+        ".chuggin/operator/operations/{a}-same-message.json"
+    ));
+    let saved: Value = serde_json::from_slice(&fs::read(&operation).unwrap()).unwrap();
+    assert_eq!(saved["arguments"], args);
+    assert_eq!(
+        f.call_id(&a, "message_loop", args.clone(), "same-message")["result"]["message"]["id"],
+        message_id
+    );
+    // Simulate the mailbox delivery surviving while the operator result has not
+    // yet been saved. The stable mailbox operation must still prevent replay.
+    fs::remove_file(operation).unwrap();
+    let replay = f.call_id(&a, "message_loop", args.clone(), "same-message");
+    assert_eq!(replay["result"]["message"]["id"], message_id, "{replay}");
+    assert_eq!(replay["result"]["changed"], false);
+    let separate = f.call_id(&b, "message_loop", args, "same-message");
+    assert_ne!(
+        separate["result"]["message"]["id"], message_id,
+        "{separate}"
+    );
+    let history = f.call(&a, "read_messenger", json!({"limit":20}));
+    assert_eq!(history["result"]["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(history["result"]["status"]["unread_to_model"], 2);
+    assert!(f.rpc(json!({"action":"status"}))["editing"].is_null());
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Ok(mut s) = UnixStream::connect(&self.socket) {
@@ -706,6 +807,109 @@ fn answer() -> Value {
 fn tool(name: &str, args: Value) -> Value {
     json!({"role":"assistant","content":"","tool_calls":[{"id":"tool","function":{"name":name,"arguments":args}}]})
 }
+
+#[test]
+fn loop_messenger_fetches_explicitly_and_deduplicates_replies_while_command_runs() {
+    const PRIVATE_BODY: &str = "MAILBOX_PRIVATE_CANARY_8723: Which discovery interests you?";
+    const REPLY: &str = "The document structure interests me; I will investigate it.";
+    fn last_tool(body: &Value, name: &str) -> Value {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|message| {
+                (message["tool_name"] == name)
+                    .then(|| serde_json::from_str(message["content"].as_str().unwrap()).unwrap())
+            })
+            .unwrap_or_else(|| panic!("Missing {name} tool result: {body}"))
+    }
+    let model = Model::new(|body, call| match call {
+        0 => {
+            assert!(!body.to_string().contains(PRIVATE_BODY));
+            assert!(
+                body["messages"].as_array().unwrap().iter().any(|message| {
+                    message["content"]
+                        .as_str()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .is_some_and(|v| v["mailbox_notice"]["unread_from_user"] == 1)
+                }),
+                "The first request should advertise unread counts: {body}"
+            );
+            task_and_tool(
+                "run_command",
+                json!({"argv":["sh","-c","read instruction; printf MAIL_COMMAND_DONE"],"reason":"An unrelated finite command waiting for input"}),
+            )
+        }
+        1 => {
+            assert!(!body.to_string().contains(PRIVATE_BODY));
+            let command = last_tool(body, "run_command");
+            assert_eq!(command["ok"], true, "{command}");
+            assert_eq!(command["result"]["running"], true, "{command}");
+            tool("read_messages", json!({}))
+        }
+        2 => {
+            let fetched = last_tool(body, "read_messages");
+            assert_eq!(fetched["ok"], true, "{fetched}");
+            assert_eq!(fetched["result"]["messages"][0]["body"], PRIVATE_BODY);
+            assert_eq!(fetched["result"]["messages"][0]["id"], 1);
+            tool("send_message", json!({"body":REPLY,"reply_to":1}))
+        }
+        3 => {
+            let sent = last_tool(body, "send_message");
+            assert_eq!(sent["ok"], true, "{sent}");
+            assert_eq!(sent["result"]["status"], "sent", "{sent}");
+            assert_eq!(sent["result"]["changed"], true);
+            tool("send_message", json!({"body":REPLY,"reply_to":1}))
+        }
+        4 => {
+            let repeated = last_tool(body, "send_message");
+            assert_eq!(repeated["ok"], true, "{repeated}");
+            assert_eq!(repeated["result"]["status"], "already_sent", "{repeated}");
+            assert_eq!(repeated["result"]["changed"], false);
+            let command = last_tool(body, "run_command")["result"]["command_id"].clone();
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"release-command","function":{"name":"command_input","arguments":{"command_id":command,"text":"finish\n","close_stdin":true}}},
+                {"id":"collect-command","function":{"name":"command_status","arguments":{"command_id":command,"wait_ms":1000}}},
+                {"id":"finish-mail-task","function":{"name":"finish_task","arguments":{"summary":"Fetched the user's message explicitly, delivered one reply and completed the unrelated command."}}}
+            ]})
+        }
+        _ => panic!("Unexpected extra provider request: {body}"),
+    });
+    let f = Fixture::new(&model.url);
+    let session = f.session();
+    let sent = f.call(&session, "message_loop", json!({"body":PRIVATE_BODY}));
+    assert_eq!(sent["result"]["message"]["id"], 1, "{sent}");
+    assert!(model.requests.lock().unwrap().is_empty());
+    assert_eq!(f.rpc(json!({"action":"status"}))["running"], false);
+    f.rpc(json!({"action":"start","mode":"one_cycle"}));
+    f.wait(|| f.rpc(json!({"action":"status"}))["running"] == false);
+    assert_eq!(model.requests.lock().unwrap().len(), 5);
+    let history = f.call(&session, "read_messenger", json!({"limit":20}));
+    let messages = history["result"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2, "{history}");
+    assert_eq!(messages[0]["body"], PRIVATE_BODY);
+    assert_eq!(messages[0]["sender"], "human");
+    assert!(messages[0]["read_unix"].is_u64());
+    assert_eq!(messages[1]["body"], REPLY);
+    assert_eq!(messages[1]["sender"], "model");
+    assert_eq!(messages[1]["reply_to"], 1);
+    assert!(messages[1]["read_unix"].is_null());
+    let status = f.call(&session, "messenger_status", json!({}));
+    assert_eq!(status["result"]["mailbox"]["unread_to_model"], 0);
+    assert_eq!(status["result"]["mailbox"]["unread_to_human"], 1);
+    assert_eq!(
+        fs::read_to_string(f.dir.path().join("file.txt")).unwrap(),
+        "before\n"
+    );
+    let conversation: Value =
+        serde_json::from_slice(&fs::read(f.dir.path().join(".chuggin/conversation.json")).unwrap())
+            .unwrap();
+    let fetched = last_tool(&conversation, "command_status");
+    assert_eq!(fetched["ok"], true, "{fetched}");
+    assert_eq!(fetched["result"]["running"], false, "{fetched}");
+}
+
 #[test]
 fn controller_is_idle_and_sessions_serialize_versioned_edits_and_deduplicate() {
     let f = Fixture::new("http://127.0.0.1:1");

@@ -601,7 +601,7 @@ impl Controller {
             "Unknown operator tool: {name}"
         );
         let path = self.operation_path(session, operation)?;
-        let mutation = is_mutation(name);
+        let mutation = mutates_with_args(name, &args);
         if mutation {
             let _guard = self.operations.lock().unwrap();
             if path.exists() {
@@ -617,7 +617,7 @@ impl Controller {
                 &json!({"status":"running","name":name,"arguments":args,"session":session,"operation_id":operation}),
             )?;
         }
-        let result = self.execute(session, name, &args);
+        let result = self.execute(session, name, &args, operation);
         let value = match result {
             Ok(v) => json!({"status":"complete","result":v}),
             Err(e) => json!({"status":"failed","error":format!("{e:#}")}),
@@ -632,7 +632,13 @@ impl Controller {
         }
         Ok(value)
     }
-    fn execute(self: &Arc<Self>, session: &str, name: &str, args: &Value) -> Result<Value> {
+    fn execute(
+        self: &Arc<Self>,
+        session: &str,
+        name: &str,
+        args: &Value,
+        operation: &str,
+    ) -> Result<Value> {
         let c = self.config()?;
         if [
             "read_file",
@@ -649,6 +655,7 @@ impl Controller {
             "project_diff",
         ]
         .contains(&name)
+            || crate::computer_tools::is_tool(name)
         {
             self.computer_ready(&c)?;
         }
@@ -656,13 +663,29 @@ impl Controller {
             !c.execution.is_private() || !["compiler_diagnostics", "run_checks"].contains(&name),
             "Project-specific checks are not configured in this computer. Run a command inside it instead."
         );
-        if !["write_file", "edit_file", "desktop_action"].contains(&name)
+        // Private browser actions must pass the same exclusive editing lease as
+        // file/desktop actions before reaching the guest. Read-only observations
+        // can proceed while the loop owns the computer.
+        if !requires_editing(name, args)
             && let Some(result) = crate::sandbox::tool(&c.repo, name, args, &c.state_dir)
         {
             let text = result?;
             return Ok(serde_json::from_str(&text).unwrap_or(json!(text)));
         }
         match name {
+            "messenger_status" => crate::communication::status(&c.state_dir),
+            "read_messenger" => Ok(serde_json::to_value(crate::messenger::human_page(
+                &c.state_dir,
+                args["before_id"].as_u64(),
+                args["limit"].as_u64().unwrap_or(30) as usize,
+            )?)?),
+            "message_loop" => Ok(serde_json::to_value(crate::messenger::human_send_with_id(
+                &c.state_dir,
+                text(args, "body")?,
+                args["reply_to"].as_u64(),
+                &format!("operator:{session}:{operation}"),
+            )?)?),
+            "notebook" => crate::notebook::call(&c.state_dir, name, args),
             "view_image" => crate::image_tools::inspect(&c.repo, &c.state_dir, args),
             "capture_screenshot" => crate::image_tools::capture(&c.repo, &c.state_dir, args),
             "request_tool" => {
@@ -846,8 +869,7 @@ impl Controller {
             "project_diff" => Ok(
                 json!({"diff":project::excerpt(&project::git(&c.repo,&["diff","HEAD","--"] )?,20000),"status":project::git(&c.repo,&["status","--short"])?}),
             ),
-            "desktop_action" | "edit_file" | "write_file" | "run_command" | "run_checks"
-            | "save_checkpoint" | "commit_changes" | "restore_checkpoint" => {
+            name if requires_editing(name, args) => {
                 ensure!(
                     !c.activity_mode.is_chaos()
                         || !["save_checkpoint", "commit_changes", "restore_checkpoint"]
@@ -1125,9 +1147,41 @@ pub fn is_mutation(name: &str) -> bool {
         "lookup_symbol",
         "web_search",
         "read_web_page",
+        "messenger_status",
+        "read_messenger",
+        "computer_info",
+        "application_command",
+        "inspect_document",
     ]
     .contains(&name)
 }
+
+// MCP's schema has one operation_id requirement for a tool with several actions.
+// Runtime bookkeeping can distinguish its read-only and mutating actions.
+fn mutates_with_args(name: &str, args: &Value) -> bool {
+    match name {
+        "browser" => crate::computer_tools::is_mutating(name, args),
+        "notebook" => args["action"] == "write",
+        _ => is_mutation(name),
+    }
+}
+
+/// Actions that share the loop's mutable files/desktop and need its exclusive
+/// editing lease. Mail and notes have separate durable stores and never pause it.
+pub fn requires_editing(name: &str, args: &Value) -> bool {
+    matches!(
+        name,
+        "desktop_action"
+            | "edit_file"
+            | "write_file"
+            | "run_command"
+            | "run_checks"
+            | "save_checkpoint"
+            | "commit_changes"
+            | "restore_checkpoint"
+    ) || crate::computer_tools::is_mutating(name, args)
+}
+
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","properties":properties,"required":required}}})
 }
@@ -1186,7 +1240,7 @@ pub fn schemas() -> Value {
         tool("reopen_nudge","Reopen the most recent finished or cancelled nudge at the user’s request.",json!({}),&[]),
         tool("commit_changes","Commit requested work while preserving human staging. Does not complete the loop task or goal.",json!({"summary":{"type":"string"}}),&["summary"]),
         tool("project_status","Read current loop state, goal, task, nudges, holds and editing owner.",json!({}),&[]),
-        tool("begin_edit","Request exclusive editing for this session. Poll until granted before file edits or native shell tools. Keep it through all background writers.",json!({}),&[]),
+        tool("begin_edit","Request exclusive editing for this session. Poll until granted before file edits, private browser/desktop actions or native shell tools. Read-only browser observations, mailbox tools and notes do not need this lease. Keep it through all background writers.",json!({}),&[]),
         tool("end_edit","Return editing control after all writers finish. Save unfinished work and tell the loop what changed.",json!({"summary":{"type":"string"}}),&["summary"]),
         tool("pause_loop","Pause the loop after its current operation; existing commands can finish.",json!({}),&[]),
         tool("resume_loop","Resume the loop. scheduled respects hours; until_close overrides hours until the next closing; one_cycle runs one cycle now.",json!({"mode":{"type":"string","enum":["scheduled","until_close","one_cycle"]}}),&["mode"]),
@@ -1201,6 +1255,9 @@ pub fn schemas() -> Value {
         tool("project_diff","Read the current diff and Git status without changing staging.",json!({}),&[]),
         tool("save_checkpoint","Save current unfinished work for recovery, without making a normal commit.",json!({"summary":{"type":"string"}}),&["summary"]),
     ]);
+    all.extend(crate::communication::operator_schemas());
+    all.retain(|t| t["function"]["name"] != "notebook");
+    all.extend(crate::notebook::schemas());
     json!(all)
 }
 
@@ -1302,4 +1359,42 @@ fn list_history(c: &runner::Config, args: &Value) -> Result<Value> {
     Ok(
         json!({"artifacts":items,"next_offset":if offset.saturating_add(50)<files.len(){Some(offset+50)}else{None}}),
     )
+}
+
+#[cfg(test)]
+mod action_policy_tests {
+    use super::*;
+
+    #[test]
+    fn browser_mutations_share_desktop_editing_ownership_and_reads_do_not() {
+        for action in [
+            "open", "click", "type", "select", "back", "reload", "scroll", "close",
+        ] {
+            let args = json!({"action":action});
+            assert!(requires_editing("browser", &args), "{action}");
+            assert!(mutates_with_args("browser", &args), "{action}");
+        }
+        assert!(requires_editing(
+            "desktop_action",
+            &json!({"action":"click"})
+        ));
+        for action in ["status", "tabs", "read"] {
+            let args = json!({"action":action});
+            assert!(!requires_editing("browser", &args), "{action}");
+            assert!(!mutates_with_args("browser", &args), "{action}");
+        }
+        for name in ["computer_info", "application_command", "inspect_document"] {
+            assert!(!requires_editing(name, &json!({})), "{name}");
+            assert!(!mutates_with_args(name, &json!({})), "{name}");
+        }
+    }
+
+    #[test]
+    fn only_notebook_writes_are_journaled_and_notes_never_take_workspace_lease() {
+        for action in ["list", "read", "search", "write"] {
+            let args = json!({"action":action});
+            assert_eq!(mutates_with_args("notebook", &args), action == "write");
+            assert!(!requires_editing("notebook", &args));
+        }
+    }
 }
