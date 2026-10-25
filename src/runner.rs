@@ -3505,6 +3505,7 @@ pub fn run_controlled_with_commands(
         }
         crate::events::send(crate::events::Event::ValidationDone {
             passed,
+            pending: checks_pending,
             checkpoint: Some(state.working_ref.clone()),
         });
         let finished = result
@@ -3571,6 +3572,7 @@ pub fn run_controlled_with_commands(
             )?;
             crate::events::send(crate::events::Event::ValidationDone {
                 passed: false,
+                pending: false,
                 checkpoint: None,
             });
         }
@@ -3665,6 +3667,8 @@ pub fn run_controlled_with_commands(
                     "Configured checks passed."
                 } else if c.checks.is_empty() {
                     "No checks configured; no independent validation claimed."
+                } else if checks_pending {
+                    "Validation pending; existing command is still running."
                 } else {
                     "Validation needs attention."
                 },

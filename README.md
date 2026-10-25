@@ -208,6 +208,11 @@ For example, Debian, Ubuntu and Linux Mint use `sudo apt install podman`;
 [Podman's installation guide](https://podman.io/docs/installation) covers other systems
 and rootless prerequisites. The macOS/Windows CLI alone is insufficient.
 
+**Copy install command to clipboard** copies just the command for pasting into
+another terminal with Ctrl+Shift+V. Keep Chuggin open while pasting. Copying runs
+nothing. When a desktop clipboard is unavailable, Chuggin can request clipboard
+access through the terminal and reports that the request is unconfirmed.
+
 In **More project settings → Computer environment**, choose **Prepare or start
 private computer** to explicitly download/build its desktop image. Build output
 is saved in the session's `computer/build.log`. **View private desktop** opens a

@@ -1399,19 +1399,28 @@ impl Dashboard {
                     );
                 }
             }
-            Event::ValidationDone { passed, checkpoint } => {
-                self.last_check = if self.validation_unconfigured {
+            Event::ValidationDone {
+                passed,
+                pending,
+                checkpoint,
+            } => {
+                self.last_check = if self.validation_unconfigured || pending {
                     None
                 } else {
                     Some(passed)
                 };
-                if passed && let Some(reference) = checkpoint {
+                if passed
+                    && !pending
+                    && let Some(reference) = checkpoint
+                {
                     self.last_passing_checkpoint = Some(reference.chars().take(8).collect());
                 }
                 self.push(
                     Kind::Check,
                     if self.validation_unconfigured {
                         "No checks configured · work saved"
+                    } else if pending {
+                        "Validation pending · existing command is still running"
                     } else if passed {
                         "✓ Configured checks passed"
                     } else {
@@ -2828,6 +2837,45 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     #[test]
+    fn pending_validation_clears_failure_status_without_claiming_success() {
+        let mut c = config();
+        c.checks.push(crate::project::Check {
+            argv: vec!["check".into()],
+            timeout_seconds: 5,
+        });
+        let mut d = Dashboard::new(&c);
+        d.last_check = Some(false);
+        d.last_passing_checkpoint = Some("old-pass".into());
+        d.apply(Event::ValidationDone {
+            passed: false,
+            pending: true,
+            checkpoint: Some("unfinished".into()),
+        });
+        assert_eq!(d.last_check, None);
+        assert_eq!(d.last_passing_checkpoint.as_deref(), Some("old-pass"));
+        d.tab = 2;
+        let text = d
+            .lines(100, "")
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Validation pending"));
+        assert!(!text.contains("Validation needs attention"));
+        d.apply(Event::ValidationDone {
+            passed: true,
+            pending: false,
+            checkpoint: Some("new-pass".into()),
+        });
+        assert_eq!(d.last_check, Some(true));
+        d.apply(Event::ValidationDone {
+            passed: false,
+            pending: false,
+            checkpoint: None,
+        });
+        assert_eq!(d.last_check, Some(false));
+    }
+    #[test]
     fn chaos_without_checks_has_neutral_validation_feedback() {
         let mut c = config();
         c.activity_mode = crate::activity::Mode::Chaos;
@@ -2835,6 +2883,7 @@ mod tests {
         c.checks.clear();
         let mut d = Dashboard::new(&c);
         d.apply(Event::ValidationDone {
+            pending: false,
             passed: false,
             checkpoint: Some("abc123".into()),
         });
@@ -3576,6 +3625,7 @@ mod tests {
         d.apply(Event::Cycle(1));
         d.apply(Event::CheckDone(true));
         d.apply(Event::ValidationDone {
+            pending: false,
             passed: true,
             checkpoint: Some("abc12345abcdef".into()),
         });
@@ -3587,6 +3637,7 @@ mod tests {
         d.apply(Event::Phase("Checkpoint".into()));
         d.apply(Event::CheckDone(false));
         d.apply(Event::ValidationDone {
+            pending: false,
             passed: false,
             checkpoint: Some("def98765abcdef".into()),
         });
@@ -3647,6 +3698,7 @@ mod tests {
         d.apply(Event::Cycle(9));
         d.apply(Event::CheckDone(false));
         d.apply(Event::ValidationDone {
+            pending: false,
             passed: false,
             checkpoint: None,
         });
@@ -3666,6 +3718,7 @@ mod tests {
     fn successful_commands_do_not_overwrite_failed_validation() {
         let mut d = Dashboard::new(&config());
         d.apply(Event::ValidationDone {
+            pending: false,
             passed: false,
             checkpoint: None,
         });

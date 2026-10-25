@@ -55,6 +55,8 @@ pub enum Event {
     },
     ValidationDone {
         passed: bool,
+        #[serde(default)]
+        pending: bool,
         checkpoint: Option<String>,
     },
     Outcome {

@@ -101,7 +101,7 @@ pub fn for_root(root: &Path) -> Option<Target> {
     TARGETS.lock().unwrap().get(root).cloned()
 }
 
-pub fn install_help(os: &str, release: &str) -> String {
+pub fn install_command(os: &str, release: &str) -> Option<&'static str> {
     let mut fields = BTreeMap::new();
     for line in release.lines() {
         if let Some((k, v)) = line.split_once('=') {
@@ -137,17 +137,28 @@ pub fn install_help(os: &str, release: &str) -> String {
         } else if family.split_whitespace().any(|s| s == "alpine") {
             "sudo apk add podman"
         } else {
-            "Install Podman using your distribution's package manager."
+            return None;
         }
     } else if os == "macos" {
         "brew install podman"
     } else if os == "windows" {
         "winget install RedHat.Podman"
     } else {
-        "See https://podman.io/docs/installation"
+        return None;
     };
+    Some(command)
+}
+pub fn install_help(os: &str, release: &str) -> String {
+    let command = install_command(os, release)
+        .unwrap_or("See https://podman.io/docs/installation for your operating system.");
     format!(
         "Podman is not installed or could not be started. Chuggin has installed nothing.\n\nRun this yourself if you want to use a private computer:\n\n{command}\n\nThen return here and choose Check again. Package installation may also require your distribution's rootless-container prerequisites.\n\nThis first private-desktop backend runs on Linux. Podman on macOS/Windows additionally needs a Linux VM; installing the CLI alone does not enable this backend.\n\nOfficial instructions: https://podman.io/docs/installation"
+    )
+}
+pub fn current_install_command() -> Option<&'static str> {
+    install_command(
+        std::env::consts::OS,
+        &fs::read_to_string("/etc/os-release").unwrap_or_default(),
     )
 }
 pub fn missing_help() -> String {

@@ -4413,6 +4413,136 @@ mod terminal_ui {
     }
 
     #[test]
+    #[ignore = "Invoked only as a subprocess with its own isolated X server"]
+    fn read_isolated_install_clipboard() {
+        let expected = std::env::var("CHUGGIN_TEST_CLIPBOARD_EXPECTED").unwrap();
+        assert!(!expected.is_empty());
+        let mut clip = arboard::Clipboard::new().unwrap();
+        assert_eq!(clip.get_text().unwrap(), expected);
+    }
+
+    #[test]
+    fn missing_podman_menu_copies_only_the_command_to_an_isolated_clipboard() {
+        use std::os::unix::fs::PermissionsExt;
+        struct ServerProcess(std::process::Child);
+        impl Drop for ServerProcess {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let Ok(child) = Command::new("Xvfb")
+            .args([
+                "-displayfd",
+                "1",
+                "-screen",
+                "0",
+                "800x600x24",
+                "-nolisten",
+                "tcp",
+                "-ac",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            eprintln!("Xvfb unavailable; skipping isolated desktop clipboard test");
+            return;
+        };
+        let mut xvfb = ServerProcess(child);
+        let mut number = String::new();
+        BufReader::new(xvfb.0.stdout.take().unwrap())
+            .read_line(&mut number)
+            .unwrap();
+        assert!(number.trim().parse::<u16>().is_ok());
+        let display = format!(":{}", number.trim());
+        let server = Server::new(false, false);
+        let root = tempfile::tempdir().unwrap();
+        let defaults = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(defaults.parent().unwrap()).unwrap();
+        fs::write(
+            &defaults,
+            json!({"model":"fake","ollama_url":server.url}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".chuggin/project-draft-settings.json"),
+            json!({"model":"fake","activity_mode":"type2"}).to_string(),
+        )
+        .unwrap();
+        let bin = root.path().join("fake-bin");
+        fs::create_dir(&bin).unwrap();
+        let log = root.path().join("podman.log");
+        fs::write(
+            bin.join("podman"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 127\n",
+                shell_words::quote(log.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("podman"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let isolated_runtime = root.path().to_str().unwrap();
+        let mut ui = TerminalProcess::start_with_environment(
+            root.path(),
+            &[
+                ("PATH", &path),
+                ("DISPLAY", &display),
+                ("WAYLAND_DISPLAY", ""),
+                ("XDG_RUNTIME_DIR", isolated_runtime),
+            ],
+        );
+        ui.wait("Set up this project");
+        ui.send(b"\r");
+        ui.wait("Use a private Linux computer");
+        ui.send(b"\r");
+        ui.wait("Copy install command to clipboard");
+        ui.send(b"j\r");
+        ui.wait("Copied to clipboard");
+        ui.wait("been run or installed.");
+        let screen = ui.parser.screen().contents();
+        let expected = screen
+            .lines()
+            .map(|line| line.trim().trim_matches('│').trim())
+            .find(|line| {
+                line.starts_with("sudo ")
+                    || line.starts_with("brew install ")
+                    || line.starts_with("winget install ")
+            })
+            .expect("The exact install command must be visible to the user")
+            .to_owned();
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "terminal_ui::read_isolated_install_clipboard",
+                "--ignored",
+            ])
+            .env("DISPLAY", &display)
+            .env("WAYLAND_DISPLAY", "")
+            .env("XDG_RUNTIME_DIR", isolated_runtime)
+            .env("CHUGGIN_TEST_CLIPBOARD_EXPECTED", expected)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        ui.send(b"\r");
+        ui.wait("Podman not installed");
+        ui.send(b"\x1b");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        assert!(server.requests.lock().unwrap().is_empty());
+        for call in fs::read_to_string(log).unwrap().lines() {
+            assert_eq!(call, "--remote=false --version");
+        }
+    }
+
+    #[test]
     fn guided_rust_rewrite_records_reference_and_finishes_without_inference() {
         let server = Server::new(false, false);
         let root = tempfile::tempdir().unwrap();

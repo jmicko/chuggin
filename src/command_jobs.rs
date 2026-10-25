@@ -187,6 +187,7 @@ impl Job {
                 if self.checks {
                     crate::events::send(crate::events::Event::ValidationDone {
                         passed: self.results.iter().all(|r| r.passed),
+                        pending: false,
                         checkpoint: None,
                     });
                 }

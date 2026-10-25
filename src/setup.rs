@@ -673,13 +673,43 @@ fn podman_instructions() -> Result<()> {
         }
         crate::ui::clear_notes();
         crate::ui::notice(crate::sandbox::missing_help());
-        if crate::menu::select(
+        let command = crate::sandbox::current_install_command();
+        match crate::menu::select(
             "Podman not installed",
-            &["Check again".into(), "Back · install nothing".into()],
+            &[
+                "Check again".into(),
+                if command.is_some() {
+                    "Copy install command to clipboard".into()
+                } else {
+                    "Copy installation guide link".into()
+                },
+                "Back · install nothing".into(),
+            ],
             0,
-        )? != Some(0)
-        {
-            return Ok(());
+        )? {
+            Some(0) => {}
+            Some(1) => {
+                let text = command.unwrap_or("https://podman.io/docs/installation");
+                match crate::clipboard::copy(text) {
+                    Ok(crate::clipboard::CopyResult::Copied) => crate::ui::show(
+                        "Copied to clipboard",
+                        &format!(
+                            "{text}\n\nPaste into another terminal with Ctrl+Shift+V. Keep Chuggin open while pasting. Nothing has been run or installed."
+                        ),
+                    )?,
+                    Ok(crate::clipboard::CopyResult::TerminalRequested) => crate::ui::show(
+                        "Clipboard request sent to terminal",
+                        &format!(
+                            "{text}\n\nYour terminal may ask permission or may not support clipboard requests. Try pasting into another terminal with Ctrl+Shift+V. Nothing has been run or installed."
+                        ),
+                    )?,
+                    Err(e) => crate::ui::show(
+                        "Clipboard unavailable",
+                        &format!("{e}\n\n{text}\n\nNothing has been run or installed."),
+                    )?,
+                }
+            }
+            _ => return Ok(()),
         }
     }
 }

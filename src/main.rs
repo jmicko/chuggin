@@ -3,6 +3,7 @@ mod activity;
 mod agents;
 mod chat;
 mod chatgpt;
+mod clipboard;
 mod cloud;
 mod code_index;
 mod command_jobs;
