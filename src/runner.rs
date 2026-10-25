@@ -614,7 +614,7 @@ fn load_value_with_settings(
     }
     anyhow::ensure!(
         !c.model.trim().is_empty(),
-        "Choose a model from the home menu before starting a run"
+        "Choose a model in Project settings → Project model before starting a run"
     );
     if !c.activity_mode.is_chaos() {
         anyhow::ensure!(!c.goal.trim().is_empty(), "Goal must not be empty");

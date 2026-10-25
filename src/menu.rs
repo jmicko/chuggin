@@ -85,40 +85,16 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             None
         };
         let effective = project.as_ref().and_then(|p| runner::load(p).ok());
-        let private = effective
-            .as_ref()
-            .or(preview.as_ref())
-            .is_some_and(|c| c.execution.is_private());
-        let mut items = vec![
+        let items = vec![
             if project.is_some() {
                 "Resume project"
             } else {
                 "Set up this project"
             }
             .into(),
-            if project
-                .as_ref()
-                .and_then(|p| runner::load(p).ok())
-                .or_else(|| preview.clone())
-                .is_some_and(|c| c.activity_mode.is_chaos())
-            {
-                "Session mode".into()
-            } else {
-                "Project goal".into()
-            },
-            "Progress".into(),
-            "Project model".into(),
-            "Settings".into(),
-            "Run duration".into(),
-            "Project assistant".into(),
-            "More project settings".into(),
+            "Project settings".into(),
             "Global settings".into(),
-            "Messages with the loop".into(),
         ];
-        if private {
-            items.push("Open desktop".into());
-        }
-        items.push("Quit".into());
         let root = effective
             .as_ref()
             .map(|c| c.repo.clone())
@@ -177,68 +153,65 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
                         setup::wizard()?;
                     }
                 }
-                1 => {
-                    if let Some(path) = project.as_ref() {
-                        let c = runner::load(path)?;
-                        if c.activity_mode.is_chaos() {
-                            setup::choose_activity_mode(Some(path))?;
-                        } else {
-                            crate::ui::show("Project goal", &c.goal)?;
-                        }
-                    } else {
-                        crate::ui::show(
-                            "Project goal",
-                            "Set up this project to draft and accept its goal.",
-                        )?;
-                    }
-                }
-                2 => {
-                    if let Some(path) = project.as_ref() {
-                        runner::recovery_ui(path)?;
-                    } else {
-                        crate::ui::show("Saved progress", "This project has not started yet.")?;
-                    }
-                }
-                3 => setup::choose_project_model(project.as_deref())?,
-                4 => setup::project_settings_menu(project.as_deref())?,
-                5 => {
-                    if let Some(path) = project.as_ref() {
-                        setup::run_duration(path)?;
-                    } else {
-                        setup::draft_run_duration()?;
-                    }
-                }
-                6 => {
-                    if let Some(path) = project.as_ref() {
-                        crate::ui::chat_home(path, stop.clone(), running.clone())?;
-                    }
-                }
-                7 => {
-                    setup::more_project_settings(project.as_deref())?;
-                }
-                8 => setup::settings_menu()?,
-                9 => {
-                    if let Some(path) = project.as_ref() {
-                        crate::ui::messages_home(path, stop.clone(), running.clone())?;
-                    } else {
-                        crate::ui::show(
-                            "Messages",
-                            "Set up this project before leaving a message for its model.",
-                        )?;
-                    }
-                }
-                10 if private => setup::view_private_desktop(project.as_deref())?,
+                1 => setup::project_settings_menu(project.as_deref())?,
+                2 => setup::settings_menu()?,
                 _ => {}
             }
             Ok(())
         })();
-        if items[choice] == "Quit" {
-            return Ok(());
-        }
         if let Err(e) = action {
             crate::ui::clear_notes();
             crate::ui::notice(format!("{e:#}"));
             crate::ui::select("Could not complete this action", &["Return home".into()], 0)?;
+        }
+    }
+}
+
+/// Project utilities live under Project settings, leaving the welcome screen focused.
+pub fn project_tools(path: Option<&std::path::Path>) -> Result<()> {
+    loop {
+        crate::ui::clear_notes();
+        crate::ui::notice("Inspect progress, talk to the model, or open its desktop. These tools belong to this project.".into());
+        let private = match path {
+            Some(path) => runner::load(path)?.execution.is_private(),
+            None => setup::draft_config(&std::env::current_dir()?)?
+                .execution
+                .is_private(),
+        };
+        let mut rows = vec![
+            "Progress".into(),
+            "Project assistant".into(),
+            "Messages with the loop".into(),
+            "Tool requests".into(),
+            "External AI access (MCP)".into(),
+        ];
+        if private {
+            rows.push("Open desktop".into());
+        }
+        rows.push("Back".into());
+        let Some(index) = select("Project tools", &rows, 0)? else {
+            return Ok(());
+        };
+        if rows[index] == "Back" {
+            return Ok(());
+        }
+        let Some(path) = path else {
+            crate::ui::show(
+                "Set up this project first",
+                "Once setup is complete, return to Project settings → Project tools to inspect progress, chat, or open the desktop.",
+            )?;
+            continue;
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(false));
+        match index {
+            0 => runner::recovery_ui(path)?,
+            1 => crate::ui::chat_home(path, stop, running)?,
+            2 => crate::ui::messages_home(path, stop, running)?,
+            3 => crate::tool_requests::menu(path)?,
+            4 => setup::external_control_info(path)?,
+            5 if private => setup::view_private_desktop(Some(path))?,
+            _ => return Ok(()),
         }
     }
 }

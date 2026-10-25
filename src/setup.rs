@@ -508,7 +508,7 @@ pub fn computer_environment(path: Option<&Path>) -> Result<()> {
         }
         crate::ui::clear_notes();
         crate::ui::notice(format!(
-            "{}\n\nChuggin sets up and starts the private computer automatically when needed. Its installation and files persist. Open desktop is also on the home screen; F4 opens it from the observation view.\n\nDefault limits: 4 CPUs, 4 GiB RAM, public web access. Advanced settings lets you change limits or troubleshoot setup.",
+            "{}\n\nChuggin sets up and starts the private computer automatically when needed. Its installation and files persist. Open desktop is in Project settings → Project tools; F4 opens it from the observation view.\n\nDefault limits: 4 CPUs, 4 GiB RAM, public web access. Advanced settings lets you change limits or troubleshoot setup.",
             c.execution.label()
         ));
         let options = vec![
@@ -769,7 +769,7 @@ fn prepare_computer_interactive(path: Option<&Path>) -> Result<bool> {
         match result {
             Ok(()) => {
                 crate::ui::clear_notes();
-                crate::ui::notice("Private computer ready. Resource limits checked. Open desktop is on the home screen; F4 opens it from the observation view.".into());
+                crate::ui::notice("Private computer ready. Resource limits checked. Open desktop is in Project settings → Project tools; F4 opens it from the observation view.".into());
                 return Ok(true);
             }
             Err(error) => {
@@ -1118,12 +1118,7 @@ pub fn wizard() -> Result<PathBuf> {
     if preferences.exists() {
         fs::remove_file(preferences)?;
     }
-    crate::ui::clear_notes();
-    crate::ui::notice(if chaos {
-        "Session saved: No goals, only chaos. No objective or validation command is assigned. Conversation history and recovery saves persist across restarts. Select Resume project to start.".into()
-    } else {
-        "\nGoal accepted and saved. Chuggin will edit this folder on its current branch, keep recovery saves, and commit completed tasks. Existing staged changes are preserved. Select Resume project to start.".into()
-    });
+    crate::ui::setup_complete(&root.display().to_string())?;
     Ok(config)
 }
 
@@ -2394,7 +2389,7 @@ impl ProjectSetting {
                 "off"
             }
             .into(),
-            Self::More => "Setup and chat models, thinking, helpers, tool requests, MCP".into(),
+            Self::More => "Setup and chat models, thinking, helpers, computer".into(),
             Self::Global => "Shared connections and defaults for projects".into(),
         }
     }
@@ -2415,34 +2410,93 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
         let c = editing_config(path)?;
         crate::ui::clear_notes();
         crate::ui::notice(format!(
+            "Settings for {}. Changes are saved automatically and affect only this project.",
+            c.repo.display()
+        ));
+        let rows = vec![
+            if c.activity_mode.is_chaos() {
+                "Session mode".into()
+            } else {
+                "Project goal".into()
+            },
+            format!("Project model: {}", c.model),
+            format!(
+                "Run duration: {}",
+                if c.run_duration_seconds == 0 {
+                    "Unlimited".into()
+                } else {
+                    format!("{} hours", ProjectSetting::Duration.value(&c))
+                }
+            ),
+            format!("Active hours: {}", ProjectSetting::ActiveHours.value(&c)),
+            "Loop settings".into(),
+            "More project settings".into(),
+            "Project tools".into(),
+            "Back".into(),
+        ];
+        let Some(index) = crate::menu::select("Project settings", &rows, 0)? else {
+            return Ok(());
+        };
+        match index {
+            0 if c.activity_mode.is_chaos() => choose_activity_mode(path)?,
+            0 => crate::ui::show(
+                "Project goal",
+                if path.is_some() {
+                    &c.goal
+                } else {
+                    "Set up this project to write and accept its goal."
+                },
+            )?,
+            1 => choose_project_model(path)?,
+            2 => match path {
+                Some(path) => run_duration(path)?,
+                None => draft_run_duration()?,
+            },
+            3 => project_active_hours_menu(path)?,
+            4 => loop_settings_menu(path)?,
+            5 => more_project_settings(path)?,
+            6 => crate::menu::project_tools(path)?,
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn loop_settings_menu(path: Option<&Path>) -> Result<()> {
+    loop {
+        let c = editing_config(path)?;
+        crate::ui::clear_notes();
+        crate::ui::notice(format!(
             "These settings apply only to {} and are saved automatically. Global connections and defaults have their own submenu.",
             c.repo.display()
         ));
-        let mut rows: Vec<String> = PROJECT_SETTINGS
+        let settings = [
+            ProjectSetting::Thinking,
+            ProjectSetting::Context,
+            ProjectSetting::Output,
+            ProjectSetting::Timeout,
+            ProjectSetting::Completion,
+            ProjectSetting::Sampling,
+        ];
+        let mut rows: Vec<String> = settings
             .iter()
             .map(|s| format!("{}: {}", s.label(), s.value(&c)))
             .collect();
         rows.push("Back".into());
-        let Some(index) = crate::menu::select("Project settings", &rows, 0)? else {
+        let Some(index) = crate::menu::select("Loop settings", &rows, 0)? else {
             return Ok(());
         };
-        let Some(setting) = PROJECT_SETTINGS.get(index).copied() else {
+        let Some(setting) = settings.get(index).copied() else {
             return Ok(());
         };
         match setting {
-            ProjectSetting::Model => choose_project_model(path)?,
             ProjectSetting::Thinking => choose_project_reasoning(path)?,
             ProjectSetting::Sampling => project_sampling(path, "sampling")?,
-            ProjectSetting::Mode => choose_activity_mode(path)?,
             ProjectSetting::Completion if c.activity_mode.is_chaos() => {
                 crate::ui::show(
                     "Continuous session",
                     "This mode keeps scheduling inference until you pause or stop it. The model has no tool to complete the overall session.",
                 )?;
             }
-            ProjectSetting::ActiveHours => project_active_hours_menu(path)?,
-            ProjectSetting::More => more_project_settings(path)?,
-            ProjectSetting::Global => settings_menu()?,
             ProjectSetting::Context | ProjectSetting::Output => edit_project_tokens(path, setting)?,
             _ => {
                 let value = ask(setting.label(), &setting.value(&c))?;
@@ -2513,8 +2567,6 @@ pub fn more_project_settings(path: Option<&Path>) -> Result<()> {
                         "Disabled"
                     }
                 ),
-                "External AI access (MCP)".into(),
-                "Tool requests".into(),
                 format!("Setup sampling · {}", c.setup_sampling.label()),
                 format!("Chat sampling · {}", c.chat_sampling.label()),
                 "Computer environment".into(),
@@ -2581,29 +2633,9 @@ pub fn more_project_settings(path: Option<&Path>) -> Result<()> {
                 }
             }
             5 => helpers_scope(path, true)?,
-            6 => {
-                if let Some(path) = path {
-                    external_control_info(path)?;
-                } else {
-                    crate::ui::show(
-                        "External AI access (MCP)",
-                        "Set up this project's goal first. You can then connect another AI application to its tools and loop controls.",
-                    )?;
-                }
-            }
-            7 => {
-                if let Some(path) = path {
-                    crate::tool_requests::menu(path)?;
-                } else {
-                    crate::ui::show(
-                        "Tool requests",
-                        "No missing capabilities have been requested. Set up this project and start its loop to receive requests from the model.",
-                    )?;
-                }
-            }
-            8 => project_sampling(path, "setup_sampling")?,
-            9 => project_sampling(path, "chat_sampling")?,
-            10 => computer_environment(path)?,
+            6 => project_sampling(path, "setup_sampling")?,
+            7 => project_sampling(path, "chat_sampling")?,
+            8 => computer_environment(path)?,
             _ => return Ok(()),
         }
     }

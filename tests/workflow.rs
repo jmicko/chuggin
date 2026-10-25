@@ -2811,6 +2811,64 @@ mod terminal_ui {
         fn send(&mut self, keys: &[u8]) {
             self.master.write_all(keys).unwrap();
         }
+        /// Navigate by the visible label rather than depending on menu indexes.
+        fn choose(&mut self, label: &str) {
+            self.wait(label);
+            for _ in 0..40 {
+                self.read();
+                if self.parser.screen().contents().lines().any(|line| {
+                    line.contains('›')
+                        && line
+                            .split('›')
+                            .nth(1)
+                            .unwrap()
+                            .trim_start()
+                            .starts_with(label)
+                }) {
+                    self.send(b"\r");
+                    thread::sleep(Duration::from_millis(100));
+                    self.read();
+                    return;
+                }
+                self.send(b"j");
+                thread::sleep(Duration::from_millis(60));
+            }
+            panic!(
+                "Could not select {label}:\n{}",
+                self.parser.screen().contents()
+            );
+        }
+        fn home(&mut self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                self.read();
+                let text = self.parser.screen().contents();
+                if text.contains("Start here") {
+                    return;
+                }
+                if !text.trim().is_empty() {
+                    self.send(b"\x1b");
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            panic!(
+                "Could not return to welcome screen:\n{}",
+                self.parser.screen().contents()
+            );
+        }
+        fn project_setting(&mut self, label: &str) {
+            self.home();
+            self.choose("Project settings");
+            self.choose(label);
+        }
+        fn project_tool(&mut self, label: &str) {
+            self.project_setting("Project tools");
+            self.choose(label);
+        }
+        fn loop_setting(&mut self, label: &str) {
+            self.project_setting("Loop settings");
+            self.choose(label);
+        }
         fn restored(&mut self) {
             self.exited(0);
         }
@@ -3583,12 +3641,13 @@ mod terminal_ui {
         fs::write(&shared, defaults).unwrap();
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("old-project-model");
-        ui.send(b"jjj\r");
+        ui.project_setting("Project model");
         ui.wait("Inference provider");
         ui.send(b"\r");
         ui.wait("Choose model for this project");
         ui.wait("selectable only");
         ui.send(b"\r");
+        ui.home();
         ui.wait("Resume project");
         ui.wait("fake");
         ui.send(b"q");
@@ -3615,8 +3674,9 @@ mod terminal_ui {
         let original_defaults = fs::read(&shared).unwrap();
 
         let mut ui = TerminalProcess::start(root.path());
+        ui.home();
         ui.wait("Resume project");
-        ui.send(b"jjj\r");
+        ui.project_setting("Project model");
         ui.wait("Inference provider");
         ui.send(b"\r");
         ui.wait("Choose model for this project");
@@ -3634,6 +3694,7 @@ mod terminal_ui {
             "Refreshing a catalog must not select a model or change the project"
         );
         ui.send(b"\r");
+        ui.home();
         ui.wait("Resume project");
         ui.wait("fake-next");
         expected["model"] = json!("fake-next");
@@ -3663,13 +3724,15 @@ mod terminal_ui {
         let original_defaults = fs::read(&shared).unwrap();
 
         let mut ui = TerminalProcess::start(root.path());
+        ui.home();
         ui.wait("Resume project");
-        ui.send(b"jjj\r");
+        ui.project_setting("Project model");
         ui.wait("Inference provider");
         ui.send(b"\x1b");
+        ui.home();
         ui.wait("Resume project");
         assert_eq!(server.catalog_requests.load(Ordering::SeqCst), 0);
-        ui.send(b"jjj\r");
+        ui.project_setting("Project model");
         ui.wait("Inference provider");
         ui.send(b"\r");
         ui.wait("Choose model for this project");
@@ -3677,6 +3740,7 @@ mod terminal_ui {
         ui.send(b"\x1b");
         ui.wait("Inference provider");
         ui.send(b"\x1b");
+        ui.home();
         ui.wait("Resume project");
         assert!(!ui.parser.screen().contents().contains("Could not complete"));
         assert_eq!(server.catalog_requests.load(Ordering::SeqCst), 1);
@@ -3714,13 +3778,15 @@ mod terminal_ui {
         let original_defaults = fs::read(&shared).unwrap();
 
         let mut ui = TerminalProcess::start(root.path());
+        ui.home();
         ui.wait("Resume project");
-        ui.send(b"jjj\r");
+        ui.project_setting("Project model");
         ui.wait("Inference provider");
         ui.send(b"\r");
         ui.wait("Choose model for this project");
         ui.wait("selectable only");
         ui.send(b"\r");
+        ui.home();
         ui.wait("Resume project");
         ui.wait("fake");
         expected["model"] = json!("fake");
@@ -3745,8 +3811,9 @@ mod terminal_ui {
         fixture(root.path(), &server.url, true);
         for turn in 0..2 {
             let mut ui = TerminalProcess::start(root.path());
+            ui.home();
             ui.wait("Resume project");
-            ui.send(b"jjjjjj\r");
+            ui.project_tool("Project assistant");
             ui.wait("PROJECT CHAT");
             if turn == 1 {
                 assert!(
@@ -3790,6 +3857,7 @@ mod terminal_ui {
             ui.send(b"\t\t");
             ui.wait("Run saved");
             ui.send(b"\r");
+            ui.home();
             ui.wait("Resume project");
             ui.send(b"q");
             ui.restored();
@@ -3804,7 +3872,7 @@ mod terminal_ui {
         let root = tempfile::tempdir().unwrap();
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Set up this project");
-        ui.send(b"jjjjjjjj\r");
+        ui.choose("Global settings");
         ui.wait("Global settings");
         ui.send(b"\r");
         ui.wait("Inference providers · shared connections");
@@ -3847,7 +3915,7 @@ mod terminal_ui {
         .unwrap();
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Resume project");
-        ui.send(b"jjjjjjjj\r");
+        ui.choose("Global settings");
         ui.wait("Global settings");
         ui.send(b"\r");
         ui.wait("Inference providers · shared connections");
@@ -3893,36 +3961,38 @@ mod terminal_ui {
         let draft = root.path().join(".chuggin/project-draft-settings.json");
 
         let mut ui = TerminalProcess::start(root.path());
+        ui.home();
         ui.wait("Set up this project");
-        ui.wait("Project model");
-        ui.wait("More project settings");
+        ui.wait("Project settings");
         ui.wait("Global settings");
         assert!(!ui.parser.screen().contents().contains("Default model"));
-        ui.send(b"jjj\r");
+        ui.project_setting("Project model");
         ui.wait("Inference provider");
         ui.send(b"\r");
         ui.wait("Choose model for this project");
         ui.wait("selectable only");
         ui.send(b"\r");
+        ui.home();
         ui.wait("Set up this project");
         ui.wait("fake");
-        ui.send(b"jjjj\r");
-        ui.wait("Project settings");
-        ui.send(b"jj\r");
+        ui.project_setting("Loop settings");
+        ui.wait("Loop settings");
+        ui.choose("Context window");
         ui.wait("Context window · this project");
         ui.wait("1,000,000 tokens");
         // The inherited 65,536 preset is four rows before 1,000,000.
         ui.send(b"jjjj\r");
-        ui.wait("Project settings");
+        ui.wait("Loop settings");
         ui.wait("1,000,000");
-        ui.send(b"jjj\r");
+        ui.choose("Response limit");
         ui.wait("Response limit · this project");
         ui.send(b"j\r");
-        ui.wait("Project settings");
+        ui.wait("Loop settings");
         ui.wait("16,384");
         ui.send(b"\x1b");
+        ui.home();
         ui.wait("Set up this project");
-        ui.send(b"jjjjjjj\r");
+        ui.project_setting("More project settings");
         ui.wait("More project settings");
         ui.send(b"jjjjj\r");
         ui.wait("Helpers · Disabled");
@@ -3952,6 +4022,7 @@ mod terminal_ui {
         ui.wait("More project settings");
         ui.wait("Setup thinking · high effort");
         ui.send(b"\x1b");
+        ui.home();
         ui.wait("Set up this project");
         ui.send(b"q");
         ui.restored();
@@ -3970,13 +4041,15 @@ mod terminal_ui {
         let saved_bytes = fs::read(&draft).unwrap();
 
         let mut ui = TerminalProcess::start(root.path());
+        ui.home();
         ui.wait("Set up this project");
         ui.wait("fake");
-        ui.send(b"jjjj\r");
-        ui.wait("Project settings");
+        ui.project_setting("Loop settings");
+        ui.wait("Loop settings");
         ui.wait("1,000,000");
         ui.wait("16,384");
         ui.send(b"\x1b");
+        ui.home();
         ui.wait("Set up this project");
         ui.send(b"q");
         ui.restored();
@@ -4012,28 +4085,25 @@ mod terminal_ui {
         let original_defaults = fs::read(&shared).unwrap();
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Resume project");
-        ui.send(b"jjjj\r");
-        ui.wait("Project settings");
-        ui.wait("Project model");
-        ui.send(b"\r");
+        ui.project_setting("Project model");
         ui.wait("Inference provider");
         ui.send(b"\r");
         ui.wait("Choose model for this project");
         ui.wait("selectable only");
         ui.send(b"\r");
         ui.wait("Project settings");
-        ui.send(b"jj\r");
+        ui.loop_setting("Context window");
         ui.wait("Context window · this project");
         ui.wait("1,048,576 tokens");
         ui.wait("Custom");
         // Current context is 32,768. Choose the 1,000,000 preset.
         ui.send(b"jjjjj\r");
-        ui.wait("Project settings");
+        ui.wait("Loop settings");
         ui.wait("1,000,000");
-        ui.send(b"jjj\r");
+        ui.choose("Response limit");
         ui.wait("Response limit · this project");
         ui.send(b"j\r");
-        ui.wait("Project settings");
+        ui.wait("Loop settings");
         expected["model"] = json!("fake");
         expected["context_tokens"] = json!(1_000_000);
         expected["output_tokens"] = json!(8192);
@@ -4042,16 +4112,17 @@ mod terminal_ui {
             expected
         );
         assert_eq!(fs::read(&shared).unwrap(), original_defaults);
-        ui.send(b"jjjjjjjjjj\r");
+        ui.project_setting("More project settings");
         ui.wait("More project settings");
         ui.wait("Investigation helpers");
-        ui.send(b"jjjjjjj\r");
+        ui.project_tool("Tool requests");
         ui.wait("No missing capabilities have been requested");
         ui.send(b"\x1b");
-        ui.wait("More project settings");
+        ui.wait("Project tools");
         ui.send(b"\x1b");
         ui.wait("Project settings");
-        ui.send(b"jjjjjjjjjjj\r");
+        ui.home();
+        ui.choose("Global settings");
         ui.wait("Global settings");
         ui.send(b"jj\r");
         ui.wait("Default context window · global");
@@ -4067,9 +4138,7 @@ mod terminal_ui {
             serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
             expected
         );
-        ui.send(b"\x1b");
-        ui.wait("Project settings");
-        ui.send(b"\x1b");
+        ui.home();
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
@@ -4101,22 +4170,23 @@ mod terminal_ui {
         let original_defaults = fs::read(&shared).unwrap();
 
         let mut ui = TerminalProcess::start(root.path());
+        ui.home();
         ui.wait("Resume project");
-        ui.send(b"jjjj\r");
-        ui.wait("Project settings");
-        ui.send(b"jjjjjjjj\r");
+        ui.project_setting("Loop settings");
+        ui.wait("Loop settings");
+        ui.choose("Loop sampling");
         ui.wait("Loop sampling · this project");
         ui.wait("Only temperature changes");
         // Legacy starts at row 5; Exploratory is row 2.
         ui.send(b"kkk\r");
-        ui.wait("Project settings");
+        ui.wait("Loop settings");
         expected["sampling"] = json!({"mode":"exploratory"});
         assert_eq!(
             serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
             expected
         );
 
-        ui.send(b"jjjjjjjj\r");
+        ui.choose("Loop sampling");
         ui.wait("Loop sampling · this project");
         ui.send(b"jj\r");
         ui.wait("Custom sampling");
@@ -4130,7 +4200,7 @@ mod terminal_ui {
         ui.send(b"\x150.8\r");
         ui.wait("Custom sampling");
         ui.send(b"jjjjjjjjj\r");
-        ui.wait("Project settings");
+        ui.wait("Loop settings");
         expected["sampling"] = json!({"mode":"custom","value":{"top_p":0.8}});
         assert_eq!(
             serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
@@ -4139,41 +4209,44 @@ mod terminal_ui {
 
         // Reset removes the saved override; saving Custom does not manufacture
         // explicit defaults for any of the eight individual controls.
-        ui.send(b"jjjjjjjj\r");
+        ui.choose("Loop sampling");
         ui.wait("Loop sampling · this project");
         ui.send(b"\r");
         ui.wait("Custom sampling");
         ui.send(b"jjjjjjjj\r");
         ui.wait("Custom sampling");
         ui.send(b"jjjjjjjjj\r");
-        ui.wait("Project settings");
+        ui.wait("Loop settings");
         expected["sampling"] = json!({"mode":"custom","value":{}});
         assert_eq!(
             serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
             expected
         );
 
-        ui.send(b"jjjjjjjj\r");
+        ui.choose("Loop sampling");
         ui.wait("Loop sampling · this project");
         ui.send(b"kkkk\r");
-        ui.wait("Project settings");
+        ui.wait("Loop settings");
         expected["sampling"] = json!({"mode":"provider_default"});
         assert_eq!(
             serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
             expected
         );
         ui.send(b"\x1b");
+        ui.home();
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
         let saved_bytes = fs::read(&path).unwrap();
 
         let mut ui = TerminalProcess::start(root.path());
+        ui.home();
         ui.wait("Resume project");
-        ui.send(b"jjjj\r");
-        ui.wait("Project settings");
+        ui.project_setting("Loop settings");
+        ui.wait("Loop settings");
         ui.wait("Loop sampling: Provider default");
         ui.send(b"\x1b");
+        ui.home();
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
@@ -4251,7 +4324,7 @@ mod terminal_ui {
         let root = tempfile::tempdir().unwrap();
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Set up this project");
-        ui.send(b"jjjjjjjj\r");
+        ui.choose("Global settings");
         ui.wait("Global settings");
         ui.send(b"jjjjjjj\r");
         ui.wait("Enter or replace key");
@@ -4336,6 +4409,12 @@ mod terminal_ui {
         ui.wait("Where should this session run?");
         ui.wait("Private computer (Podman)");
         ui.send(b"j\r");
+        ui.wait("Setup complete");
+        ui.wait("Work has not started");
+        assert!(!root.path().join(".chuggin/state.json").exists());
+        let ready_at = std::time::Instant::now();
+        ui.wait("Start here");
+        assert!(ready_at.elapsed() >= Duration::from_secs(2));
         ui.wait("Resume project");
         let screen = ui.parser.screen().contents();
         assert!(!screen.contains("Create the first commit?"));
@@ -4407,6 +4486,7 @@ mod terminal_ui {
         ui.wait("Podman not installed");
         ui.wait("Chuggin has installed nothing");
         ui.send(b"\x1b");
+        ui.wait("Start here");
         ui.wait("Resume project");
         let config: Value =
             serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
@@ -4414,6 +4494,7 @@ mod terminal_ui {
         ui.send(b"\r");
         ui.wait("Podman not installed");
         ui.send(b"\x1b");
+        ui.wait("Start here");
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
@@ -4502,7 +4583,7 @@ mod terminal_ui {
         let requests = server.requests.lock().unwrap().len();
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Resume project");
-        ui.send(b"jjjjjj\r");
+        ui.project_tool("Project assistant");
         ui.wait("PROJECT CHAT");
         ui.send(b"\t\t\x1b[H");
         ui.wait("Earlier thinking saved only in the wire trace");
@@ -4512,6 +4593,7 @@ mod terminal_ui {
             "Viewing saved history must not start inference or replay tools"
         );
         ui.send(b"q");
+        ui.home();
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
@@ -4525,22 +4607,26 @@ mod terminal_ui {
         let root = tempfile::tempdir().unwrap();
         chaos_fixture(root.path(), &server.url);
         let mut ui = TerminalProcess::start(root.path());
+        ui.home();
         ui.wait("Resume project");
-        ui.send(b"jjjjjjjjj\r");
+        ui.project_tool("Messages with the loop");
         ui.wait("MESSAGES WITH THE LOOP");
         ui.send(b"Hello durable mailbox\r");
         ui.wait("waiting for model");
         assert!(server.requests.lock().unwrap().is_empty());
         ui.send(b"\tq");
+        ui.home();
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
         let mut ui = TerminalProcess::start(root.path());
+        ui.home();
         ui.wait("Resume project");
-        ui.send(b"jjjjjjjjj\r");
+        ui.project_tool("Messages with the loop");
         ui.wait("Hello durable mailbox");
         assert!(server.requests.lock().unwrap().is_empty());
         ui.send(b"\tq");
+        ui.home();
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
@@ -4594,16 +4680,16 @@ mod terminal_ui {
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
         let mut ui = TerminalProcess::start_with_environment(root.path(), &[("PATH", &path)]);
         ui.wait("Resume project");
-        ui.send(b"jjjjjjj\r");
+        ui.project_setting("More project settings");
         ui.wait("More project settings");
-        ui.send(b"jjjjjjjjjj\r");
+        ui.choose("Computer environment");
         ui.wait("Where should this session run?");
         ui.send(b"\r");
         ui.wait_for("More project settings", Duration::from_secs(1800));
         assert!(server.requests.lock().unwrap().is_empty());
         assert!(root.path().join("state/computer/ready.json").exists());
-        ui.send(b"\x1b");
-        ui.wait("Open desktop");
+        ui.home();
+        ui.wait("Resume project");
         ui.send(b"\r");
         ui.wait("LIVE");
         ui.send(b"p");
@@ -5170,13 +5256,13 @@ mod terminal_ui {
         );
         let mut ui = TerminalProcess::start(&root);
         ui.wait("Resume project");
-        ui.send(b"jjjjjjj\r");
+        ui.project_setting("More project settings");
         ui.wait("More project settings");
-        ui.send(b"jjjjjjjjjj\r");
+        ui.choose("Computer environment");
         ui.wait("Where should this session run?");
         ui.send(b"\r");
         ui.wait_for("More project settings", Duration::from_secs(600));
-        ui.send(b"\x1b");
+        ui.home();
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
@@ -5306,6 +5392,7 @@ mod terminal_ui {
         ui.send(b"\r");
         ui.wait("Podman not installed");
         ui.send(b"\x1b");
+        ui.wait("Start here");
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
@@ -5373,6 +5460,7 @@ mod terminal_ui {
         ui.send(b"\r");
         ui.wait("Create the first commit?");
         ui.send(b"\r");
+        ui.wait("Start here");
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();
@@ -5522,6 +5610,11 @@ mod terminal_ui {
             );
         }
         ui.send(b"\r");
+        ui.wait("Setup complete");
+        let ready_at = std::time::Instant::now();
+        ui.send(b"\r");
+        ui.wait("Start here");
+        assert!(ready_at.elapsed() < Duration::from_secs(2));
         ui.wait("Resume project");
         ui.send(b"q");
         ui.restored();

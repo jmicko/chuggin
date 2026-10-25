@@ -223,14 +223,6 @@ fn splash(
     let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .spacing(3)
         .split(rows[1]);
-    let descriptions = [
-        "Continue the next focused cycle",
-        "The ambition guiding every cycle",
-        "Saved checkpoints and check results",
-        "Change the model for this project",
-        "Defaults for projects without overrides",
-        "Return to your shell",
-    ];
     let compact_menu = items.len() * 2 > columns[0].height.saturating_sub(2) as usize;
     let entries: Vec<ListItem> = items
         .iter()
@@ -240,19 +232,11 @@ fn splash(
             if !compact_menu || i == selected {
                 lines.push(
                     Line::from(match item.as_str() {
-                        "Set up this project" => "Define a goal and start this project",
-                        "Run duration" => "Finish the current cycle when time is up",
-                        "Project assistant" | "Chat with this project" => {
-                            "A separate assistant for questions and controls"
-                        }
-                        "Messages with the loop" => "Send and read messages with the working model",
-                        "Tool requests" => "Review missing capabilities suggested by models",
-                        "Settings" => "Common settings for this project",
-                        "More project settings" => "Chat, helpers, tools and command review",
+                        "Set up this project" => "Choose a mode, model, and starting point",
+                        "Resume project" => "Continue saved work",
+                        "Project settings" => "Goal, model, schedule, and project tools",
                         "Global settings" => "Shared connections and defaults",
-                        "Open desktop" => "View the private computer in your browser",
-                        "Quit" => "Return to your shell",
-                        _ => descriptions.get(i).copied().unwrap_or(""),
+                        _ => "",
                     })
                     .fg(MUTED),
                 );
@@ -295,6 +279,63 @@ fn splash(
         rows[2],
     );
 }
+fn render_setup_complete(f: &mut Frame, project: &str, seconds: u64) {
+    base(f);
+    let outer = f.area().inner(Margin::new(3, 1));
+    let area = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(12),
+        Constraint::Fill(1),
+    ])
+    .split(outer)[1];
+    let width = area.width.min(76);
+    let area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y,
+        width,
+        area.height,
+    );
+    let text = Text::from(vec![
+        Line::from("✓ Setup complete").fg(GREEN).bold(),
+        Line::from(""),
+        Line::from(project.to_owned()).fg(CYAN),
+        Line::from(""),
+        Line::from("Your settings are saved. Work has not started."),
+        Line::from("Choose Resume project on the welcome screen when ready."),
+        Line::from(""),
+        Line::from(format!("Welcome screen in {seconds}s · Enter to continue")).fg(MUTED),
+    ]);
+    f.render_widget(p(text).block(panel("Project ready")), area);
+}
+
+pub fn setup_complete(project: &str) -> Result<()> {
+    clear_notes();
+    if !active() {
+        notice("Setup complete. Settings saved. Select Resume project to start.".into());
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        draw(|f| {
+            render_setup_complete(
+                f,
+                project,
+                remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0),
+            )
+        })?;
+        if let Some(event) = input()?
+            && let Some(key) = pressed(&event)
+            && (key.code == KeyCode::Enter || cancelled(key))
+        {
+            return Ok(());
+        }
+    }
+}
+
 pub fn home_select(
     items: &[String],
     project: &str,
@@ -3232,22 +3273,8 @@ mod tests {
         assert!(d.reader_focused());
     }
     #[test]
-    fn home_keeps_messages_desktop_and_quit_visible_with_a_full_menu() {
-        let items = [
-            "Resume project",
-            "Session mode",
-            "Progress",
-            "Project model",
-            "Settings",
-            "Run duration",
-            "Chat with this project",
-            "More project settings",
-            "Global settings",
-            "Messages with the loop",
-            "Open desktop",
-            "Quit",
-        ]
-        .map(str::to_owned);
+    fn home_shows_only_the_three_main_categories_at_common_terminal_sizes() {
+        let items = ["Resume project", "Project settings", "Global settings"].map(str::to_owned);
         for (width, height) in [(110, 36), (80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
@@ -3263,10 +3290,25 @@ mod tests {
                 })
                 .unwrap();
             let text = screen_text(&terminal);
-            assert!(text.contains("Messages with the loop"), "{text}");
-            assert!(text.contains("Open desktop"), "{text}");
-            assert!(text.contains("Quit"), "{text}");
+            for label in &items {
+                assert!(text.contains(label), "{text}");
+            }
+            assert!(text.contains("Esc / q  quit"), "{text}");
+            assert!(!text.contains("Project assistant"), "{text}");
             assert!(!text.contains("lineSecond"), "{text}");
+        }
+    }
+    #[test]
+    fn setup_success_is_clear_and_offers_a_skip() {
+        for (width, height) in [(110, 36), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| render_setup_complete(f, "/projects/example", 3))
+                .unwrap();
+            let text = screen_text(&terminal);
+            assert!(text.contains("Setup complete"), "{text}");
+            assert!(text.contains("Work has not started"), "{text}");
+            assert!(text.contains("3s · Enter to continue"), "{text}");
         }
     }
     #[test]
@@ -3772,21 +3814,10 @@ mod tests {
     #[test]
     fn renders_splash_and_live_dashboard_at_multiple_sizes() {
         let c = config();
-        let items = vec![
-            "Resume project",
-            "Project goal",
-            "Progress",
-            "Project model",
-            "Settings",
-            "Run duration",
-            "Chat with this project",
-            "More project settings",
-            "Global settings",
-            "Quit",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect::<Vec<_>>();
+        let items = vec!["Resume project", "Project settings", "Global settings"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
         for (w, h) in [(120, 40), (100, 30), (70, 24), (46, 14), (25, 8)] {
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             t.draw(|f| {
@@ -3803,8 +3834,8 @@ mod tests {
             if w == 120 {
                 let text = screen_text(&t);
                 assert!(text.contains("Resume project"));
-                assert!(text.contains("Project model"));
-                assert!(text.contains("More project settings"));
+                assert!(text.contains("Project settings"));
+                assert!(!text.contains("More project settings"));
                 assert!(text.contains("Global settings"));
                 assert!(!text.contains("shared model default"));
                 if let Ok(dir) = std::env::var("CHUGGIN_UI_SNAPSHOTS") {

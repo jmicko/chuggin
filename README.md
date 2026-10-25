@@ -152,7 +152,7 @@ held. Pressing P again while a pause is pending cancels it. Ctrl+C or Q releases
 the held continuation and saves without launching new work. Other holds, such as
 active hours or operator editing, remain independent of the manual pause.
 
-Choose **Run duration** from the home menu to set a project-specific duration
+Choose **Project settings → Run duration** from the welcome screen to set a project-specific duration
 in hours (fractional hours work; 0 means unlimited). The observation view shows
 the time remaining. When the limit is reached, Chuggin finishes the current cycle,
 saves its outcome, and stops before starting another. This is a soft limit, so
@@ -231,12 +231,12 @@ commands are never silently run.
 Setup problems show the actual error and copyable repair commands; missing Podman
 shows its installation command. Successful setup continues without extra menus.
 Build output streams in the terminal and is saved in the session's
-`computer/build.log`. **Open desktop** on the home screen or the highlighted,
+`computer/build.log`. **Project settings → Project tools → Open desktop** or the highlighted,
 clickable **F4 Open desktop** button at the top of the observation view opens a
 local, token-protected noVNC viewer in a separate browser tab, without pausing
 the model. **Alt+D** also opens it. The desktop screen offers **Open browser again**
 and **Copy desktop link** if your browser does not appear. Reopening reuses the same
-viewer address while Chuggin stays open. **More project settings → Computer environment → Advanced computer
+viewer address while Chuggin stays open. **Project settings → More project settings → Computer environment → Advanced computer
 settings** holds resource limits and optional setup checks. The model has
 `capture_screenshot` and `desktop_action` tools for its private display; inspecting
 pixels requires a vision-capable inference model. Neither the human desktop nor
@@ -395,7 +395,7 @@ Chat, investigation helpers, and external MCP clients can also inspect images.
 Models can call `request_tool` with a missing capability, a concrete use case,
 and an explanation of why current tools are insufficient. Suggestions persist
 in this project's `.chuggin/tool-requests.json`, with duplicate capability names
-grouped together. Open **Tool requests** from the home menu or **Settings** to
+grouped together. Open **Project settings → Project tools → Tool requests** to
 read them, mark them reviewed, dismiss them, or reopen them.
 
 Requests never install tools, pause the loop, or submit GitHub issues. The detail
@@ -922,18 +922,25 @@ $XDG_CONFIG_HOME/chuggin/settings.json. Project-local chuggin.json contains the 
 goal, repository, checks, and state location. Project overrides take precedence;
 shared settings are reloaded when starting a run.
 
-On the home screen, **Project model** changes only the current project's model.
-This also works before goal setup: your choices are saved in this directory and
-carried into goal drafting and the accepted project configuration. **Settings**
-opens common project settings: model, context and response limits, request timeout,
-run duration, active hours, and optional goal completion. **More project settings**
-contains setup and chat models, their thinking settings, investigation helpers,
-tool requests, command review, and MCP.
+The welcome screen has three entries: **Resume project** (or **Set up this
+project**), **Project settings**, and **Global settings**. Press Esc or Q to quit.
+After first-time setup, a success screen confirms that settings are saved and
+returns to the welcome screen after three seconds; Enter skips the countdown.
+Setup does not start the loop.
+
+**Project settings** contains the goal or session mode, project model, run
+duration, and active hours. **Loop settings** holds thinking, context and response
+limits, request timeout, sampling, and optional goal completion. **More project
+settings** contains setup and chat models, their thinking settings, investigation
+helpers, computer environment, and command review. **Project tools** holds
+progress and recovery, the project assistant, messages with the loop, the private
+desktop when configured, tool requests, and MCP connection information.
+
 **Global settings** contains shared provider connections and defaults; existing
-project overrides still take precedence. Both submenus are available directly
-from Home in new and configured projects. Preferences saved before setup live in
-`.chuggin/project-draft-settings.json` until the goal is accepted; saving preferences
-does not start the loop or initialize a Git repository.
+project overrides take precedence. Both settings menus work before setup.
+Preferences saved before setup live in `.chuggin/project-draft-settings.json`
+until setup is accepted; saving preferences does not start the loop or initialize
+a Git repository.
 Context and response limits offer presets and a
 Custom option. Request settings apply to the next request without interrupting
 the current one.
