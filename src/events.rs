@@ -35,6 +35,7 @@ pub enum Event {
         seconds: u64,
     },
     Delta(String),
+    ThinkingDelta(String),
     Metrics {
         prompt: u64,
         generated: u64,

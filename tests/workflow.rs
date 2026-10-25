@@ -4454,6 +4454,56 @@ mod terminal_ui {
     }
 
     #[test]
+    fn live_history_survives_a_controller_restart_including_legacy_reasoning() {
+        let server = Server::custom(false, false, None, |_, _| {
+            ("Fresh stream from this run".into(), json!([]))
+        });
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), &server.url, true);
+        let legacy = root.path().join("state/cycle-000000");
+        fs::create_dir_all(&legacy).unwrap();
+        let source = format!(
+            "{}\n{}\n",
+            json!({"message":{"thinking":"Earlier thinking saved only in the wire trace\n"}}),
+            json!({"message":{"content":"Earlier response\n"}})
+        );
+        fs::write(legacy.join("response-000.ndjson"), &source).unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"\r");
+        ui.wait("Fresh stream from this run");
+        ui.send(b"\x03");
+        ui.wait("Run saved");
+        ui.send(b"q");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        let saved = fs::read_to_string(root.path().join("state/live-events.jsonl")).unwrap();
+        assert!(saved.contains("Fresh stream from this run"));
+        assert!(saved.contains("Earlier thinking saved only in the wire trace"));
+        assert_eq!(
+            fs::read_to_string(legacy.join("response-000.ndjson")).unwrap(),
+            source
+        );
+        let requests = server.requests.lock().unwrap().len();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Resume project");
+        ui.send(b"jjjjjj\r");
+        ui.wait("PROJECT CHAT");
+        ui.send(b"\t\x1b[H");
+        ui.wait("Earlier thinking saved only in the wire trace");
+        assert_eq!(
+            server.requests.lock().unwrap().len(),
+            requests,
+            "Viewing saved history must not start inference or replay tools"
+        );
+        ui.send(b"q");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+    }
+
+    #[test]
     #[ignore = "Requires Podman and the desktop image; creates and removes an isolated test computer"]
     fn real_private_computer_setup_files_and_desktop() {
         assert_eq!(

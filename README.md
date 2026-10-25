@@ -685,12 +685,21 @@ survives cycles and restarts. Healthy runs do not pay for a diagnostic on every 
 
 **Live** combines model text, command summaries, tool notices and checkpoints.
 **Model** shows only streamed model text; **Checks** shows commands and validation.
-On a cold start, Live and Model restore recent model text from the saved
-conversation; Live also restores tool names and file/task hints. A New session
-divider separates this history from new activity. This display uses the last 200
-saved messages within the normal bounded scrollback; older conversation archives
-and full command logs remain on disk. It does not replay actions, reconstruct old
-command-output panels, or add anything to model context or session counters.
+Provider-separated reasoning has a muted, italic **Thinking** section; regular
+output has a **Response** section. Switching channels starts a new section even
+when the provider supplies no whitespace. Reasoning-like prose sent as ordinary
+content remains Response; Chuggin does not guess its channel from its wording.
+
+Live activity is saved separately in `.chuggin/live-events.jsonl`. On restart,
+Live and Model restore recent output, including reasoning which is deliberately
+absent from the model's working conversation. Older installations recover recent
+thinking, responses and tool notices from their saved provider traces once.
+A New session divider separates restored history from new activity. Startup reads
+a bounded recent window into the normal 2,000-entry scrollback; the full display
+log, conversation archives and command logs remain on disk. Historical commands
+show their notices and full-log paths rather than reconstructed live panels.
+Restoring the display does not execute tools, add anything to model context,
+or increment the new session's counters.
 
 Context shows the input token count last reported for the main loop. On resume,
 the saved count is labeled **Saved response** until a fresh report arrives. When

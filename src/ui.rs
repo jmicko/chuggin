@@ -830,6 +830,7 @@ pub fn show(title: &str, text: &str) -> Result<()> {
 enum Kind {
     Activity,
     Model,
+    Thinking,
     Check,
 }
 struct Entry {
@@ -979,6 +980,8 @@ struct Dashboard {
     desktop_button: Option<Rect>,
     last_output: Instant,
     partial_model: String,
+    model_channel: Option<Kind>,
+    history_sequence: u64,
     partial_check: String,
     command_status: Option<(String, u64, u64, Instant)>,
     history: VecDeque<String>,
@@ -1049,6 +1052,8 @@ impl Dashboard {
             desktop_button: None,
             last_output: Instant::now(),
             partial_model: String::new(),
+            model_channel: None,
+            history_sequence: 0,
             partial_check: String::new(),
             command_status: None,
             history: VecDeque::new(),
@@ -1087,6 +1092,72 @@ impl Dashboard {
         d
     }
     fn restore_history(&mut self, dir: &Path) {
+        match crate::observation_history::read(dir) {
+            Ok(records) if !records.is_empty() => {
+                self.history_sequence = records.last().unwrap().sequence;
+                self.push(
+                    Kind::Activity,
+                    "── Saved live history · thinking, responses and tool activity ──".into(),
+                );
+                for record in records {
+                    if record.actor != "loop" {
+                        continue;
+                    }
+                    // Presentation only: never apply old request counters,
+                    // control state, or actions to this observation session.
+                    match record.event {
+                        Event::Delta(text) => self.stream(Kind::Model, &text),
+                        Event::ThinkingDelta(text) => self.stream(Kind::Thinking, &text),
+                        Event::Tool(tool) => {
+                            self.flush_model();
+                            self.push(Kind::Activity, format!("↳ {tool}"));
+                        }
+                        Event::Log(text) => {
+                            self.flush_model();
+                            self.push(Kind::Activity, concise_activity(&text));
+                        }
+                        Event::Phase(phase) => {
+                            self.flush_model();
+                            self.push(Kind::Activity, format!("── {phase} ──"));
+                        }
+                        Event::Request | Event::RequestFinished | Event::Metrics { .. } => {
+                            self.flush_model()
+                        }
+                        Event::Check { command, path } => {
+                            self.flush_model();
+                            self.push(
+                                Kind::Check,
+                                format!(
+                                    "Previous command: {command}\nFull output: {}",
+                                    path.display()
+                                ),
+                            );
+                        }
+                        Event::CheckDone(passed) => self.push(
+                            Kind::Check,
+                            if passed {
+                                "✓ Previous command succeeded"
+                            } else {
+                                "× Previous command failed"
+                            }
+                            .into(),
+                        ),
+                        Event::Outcome { disposition, task } => self.push(
+                            Kind::Activity,
+                            format!("{} · {task}", outcome_label(&disposition)),
+                        ),
+                        _ => {}
+                    }
+                }
+                self.flush_model();
+                return;
+            }
+            Err(error) => self.push(
+                Kind::Activity,
+                format!("Saved live history unavailable: {error}"),
+            ),
+            _ => {}
+        }
         let path = dir.join("conversation.json");
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -1115,7 +1186,7 @@ impl Dashboard {
         );
         for message in messages.iter().skip(messages.len().saturating_sub(200)) {
             if message["role"] == "assistant" {
-                for field in ["thinking", "content"] {
+                for field in ["thinking", "reasoning_content", "content"] {
                     if let Some(text) = message[field].as_str() {
                         // Only a display tail: never change the saved conversation.
                         let start = text
@@ -1127,7 +1198,15 @@ impl Dashboard {
                         if start > 0 {
                             self.push(Kind::Model, "[Earlier text omitted from display]".into());
                         }
-                        self.push(Kind::Model, text[start..].into());
+                        self.stream(
+                            if field == "content" {
+                                Kind::Model
+                            } else {
+                                Kind::Thinking
+                            },
+                            &text[start..],
+                        );
+                        self.flush_model();
                     }
                 }
                 if let Some(calls) = message["tool_calls"].as_array() {
@@ -1159,7 +1238,24 @@ impl Dashboard {
         }
     }
     fn stream(&mut self, kind: Kind, text: &str) {
-        let partial = if kind == Kind::Model {
+        if text.is_empty() {
+            return;
+        }
+        let model = matches!(kind, Kind::Model | Kind::Thinking);
+        if model && self.model_channel != Some(kind) {
+            self.flush_model();
+            self.model_channel = Some(kind);
+            self.push(
+                kind,
+                if kind == Kind::Thinking {
+                    "── Thinking ──"
+                } else {
+                    "── Response ──"
+                }
+                .into(),
+            );
+        }
+        let partial = if model {
             &mut self.partial_model
         } else {
             &mut self.partial_check
@@ -1168,7 +1264,7 @@ impl Dashboard {
         let split = partial.rfind('\n').map(|n| n + 1).unwrap_or(0);
         let complete: String = partial.drain(..split).collect();
         self.push(kind, complete);
-        let partial = if kind == Kind::Model {
+        let partial = if model {
             &mut self.partial_model
         } else {
             &mut self.partial_check
@@ -1180,7 +1276,8 @@ impl Dashboard {
     }
     fn flush_model(&mut self) {
         let s = std::mem::take(&mut self.partial_model);
-        self.push(Kind::Model, s);
+        let kind = self.model_channel.take().unwrap_or(Kind::Model);
+        self.push(kind, s);
     }
     fn poll_tail(&mut self) {
         let mut budget = 65536;
@@ -1342,6 +1439,10 @@ impl Dashboard {
             Event::Delta(s) => {
                 self.last_output = Instant::now();
                 self.stream(Kind::Model, &s);
+            }
+            Event::ThinkingDelta(s) => {
+                self.last_output = Instant::now();
+                self.stream(Kind::Thinking, &s);
             }
             Event::Metrics {
                 generated, seconds, ..
@@ -1524,7 +1625,9 @@ impl Dashboard {
             if text.is_empty() {
                 return;
             }
-            if self.tab == 1 && kind != Kind::Model || self.tab == 2 && kind != Kind::Check {
+            if self.tab == 1 && !matches!(kind, Kind::Model | Kind::Thinking)
+                || self.tab == 2 && kind != Kind::Check
+            {
                 return;
             }
             if !query.is_empty() && !text.to_lowercase().contains(&query) {
@@ -1536,6 +1639,7 @@ impl Dashboard {
                 match kind {
                     Kind::Activity => CYAN,
                     Kind::Model => FG,
+                    Kind::Thinking => MUTED,
                     Kind::Check if text.contains(" failed") => GOLD,
                     Kind::Check if text.trim_start().starts_with('✓') => GREEN,
                     Kind::Check
@@ -1548,7 +1652,12 @@ impl Dashboard {
                 }
             };
             for line in textwrap::wrap(text, width) {
-                lines.push(Line::from(line.into_owned()).fg(color));
+                let line = Line::from(line.into_owned()).fg(color);
+                lines.push(if kind == Kind::Thinking {
+                    line.italic()
+                } else {
+                    line
+                });
             }
         };
         if self.tab == 3 {
@@ -1603,7 +1712,10 @@ impl Dashboard {
                     add(entry.kind, &entry.text);
                 }
             }
-            add(Kind::Model, &self.partial_model);
+            add(
+                self.model_channel.unwrap_or(Kind::Model),
+                &self.partial_model,
+            );
             add(Kind::Check, &self.partial_check);
         }
         lines
@@ -2401,8 +2513,8 @@ fn dashboard_session(
     if !config.activity_mode.is_chaos() {
         crate::setup::ensure_git_identity(&config.repo)?;
     }
-    let mut d = Dashboard::new(&config);
     let client = crate::engine::Client::connect_interactive(path)?;
+    let mut d = Dashboard::new(&config);
     if start {
         resume_client(&client)?;
     }
@@ -2411,7 +2523,7 @@ fn dashboard_session(
     if chat {
         d.tab = 5;
     }
-    let mut cursor = 0;
+    let mut cursor = d.history_sequence;
     let mut sent_stop = false;
     let result = (|| -> Result<bool> {
         loop {
@@ -2812,7 +2924,7 @@ pub fn busy<T: Send + 'static>(
         loop {
             for event in rx.try_iter().take(4096) {
                 match event {
-                    Event::Delta(s) => output.push_str(&clean(&s)),
+                    Event::Delta(s) | Event::ThinkingDelta(s) => output.push_str(&clean(&s)),
                     Event::Phase(s) => status = clean(&s),
                     _ => {}
                 }
@@ -3155,6 +3267,55 @@ mod tests {
                 .iter()
                 .any(|e| e.text.contains("could not be displayed"))
         );
+    }
+
+    #[test]
+    fn thinking_and_response_are_separate_and_survive_cold_start_without_recounting_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config();
+        c.state_dir = dir.path().into();
+        let (mut journal, _) = crate::observation_history::Journal::open(dir.path()).unwrap();
+        let events = vec![
+            Event::ThinkingDelta("thinking-end".into()),
+            Event::Delta("response-start".into()),
+            Event::Metrics {
+                prompt: 100,
+                generated: 50,
+                seconds: 1.,
+            },
+            Event::Tool("read_file example.txt".into()),
+        ];
+        let mut before = Dashboard::new(&c);
+        for (index, event) in events.into_iter().enumerate() {
+            journal
+                .append(&crate::engine::Record {
+                    sequence: index as u64 + 1,
+                    actor: "loop".into(),
+                    event: event.clone(),
+                })
+                .unwrap();
+            before.apply(event);
+        }
+        let mut after = Dashboard::new(&c);
+        for tab in [0, 1] {
+            after.tab = tab;
+            let text = after
+                .lines(100, &c.goal)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Thinking"));
+            assert!(text.contains("Response"));
+            assert!(text.contains("thinking-end\n"));
+            assert!(text.contains("response-start"));
+            assert!(!text.contains("thinking-endresponse-start"));
+            assert_eq!(text.matches("thinking-end").count(), 1);
+        }
+        assert_eq!(after.history_sequence, 4);
+        assert_eq!(after.calls, 0);
+        assert_eq!(after.generated, 0);
+        assert_eq!(after.completed_cycles, 0);
     }
 
     #[test]
@@ -3861,6 +4022,7 @@ struct ChatPanel {
     draft: String,
     history: Vec<serde_json::Value>,
     partial: String,
+    thinking: String,
     busy: bool,
     error: String,
     last_poll: Option<Instant>,
@@ -3886,6 +4048,7 @@ impl ChatPanel {
         let messages = value["messages"].as_array().cloned().unwrap_or_default();
         if messages.last() != self.history.last() {
             self.partial.clear();
+            self.thinking.clear();
         }
         self.history = messages;
         self.busy = value["busy"] == true;
@@ -3895,11 +4058,13 @@ impl ChatPanel {
     fn apply(&mut self, event: events::Event) {
         match event {
             events::Event::Delta(text) => self.partial.push_str(&text),
+            events::Event::ThinkingDelta(text) => self.thinking.push_str(&text),
             events::Event::ProviderWait { reason, seconds } => {
                 self.partial = format!("Waiting for provider · {reason} · retry in {seconds}s")
             }
             events::Event::Tool(name) => {
                 self.partial.clear();
+                self.thinking.clear();
                 self.partial = format!("Using {name}…");
             }
             _ => {}
@@ -3909,6 +4074,8 @@ impl ChatPanel {
         let mut lines = vec![
             Line::from("PROJECT CHAT").fg(ACCENT).bold(),
             Line::from("Ask about progress, guide the loop, or work directly."),
+            Line::from("Separate conversation; use a nudge to send direction to the loop.")
+                .fg(MUTED),
             Line::from(""),
         ];
         for message in &self.history {
@@ -3943,6 +4110,16 @@ impl ChatPanel {
             lines.push(Line::from(""));
         }
         if self.busy {
+            if !self.thinking.is_empty() {
+                lines.push(Line::from("Thinking").fg(MUTED).italic());
+                for line in textwrap::wrap(&self.thinking, width.max(1)) {
+                    lines.push(Line::from(line.into_owned()).fg(MUTED).italic());
+                }
+                lines.push(Line::from(""));
+            }
+            if !self.partial.is_empty() {
+                lines.push(Line::from("Response").fg(ACCENT));
+            }
             for line in textwrap::wrap(&self.partial, width.max(1)) {
                 lines.push(Line::from(line.into_owned()).fg(FG));
             }
@@ -3978,6 +4155,7 @@ impl ChatPanel {
                         self.draft.clear();
                         self.busy = true;
                         self.partial.clear();
+                        self.thinking.clear();
                         self.last_poll = None;
                     }
                     Err(e) => self.error = format!("{e:#}"),

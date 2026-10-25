@@ -26,6 +26,7 @@ mod migration;
 mod model;
 mod model_picker;
 mod nudge;
+mod observation_history;
 mod openai;
 mod operator;
 mod project;

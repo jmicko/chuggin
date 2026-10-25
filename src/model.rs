@@ -1159,13 +1159,17 @@ impl Model {
                 }
                 bail!("Model provider stream error: {e}")
             }
-            if let Some(s) = d["message"]["content"].as_str() {
-                content.push_str(s);
-                crate::events::send(crate::events::Event::Delta(s.into()));
-            }
             if let Some(s) = d["message"]["thinking"].as_str() {
                 thinking.push_str(s);
-                crate::events::send(crate::events::Event::Delta(s.into()));
+                if !s.is_empty() {
+                    crate::events::send(crate::events::Event::ThinkingDelta(s.into()));
+                }
+            }
+            if let Some(s) = d["message"]["content"].as_str() {
+                content.push_str(s);
+                if !s.is_empty() {
+                    crate::events::send(crate::events::Event::Delta(s.into()));
+                }
             }
             if let Some(c) = d["message"]["tool_calls"].as_array() {
                 calls.extend(c.clone());

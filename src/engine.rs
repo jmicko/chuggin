@@ -394,15 +394,17 @@ impl Engine {
             "status" => self.controller.status(),
             "events" => {
                 let since = v["after"].as_u64().unwrap_or(0);
-                let events: Vec<_> = self
-                    .events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|e| e.sequence > since)
-                    .take(4096)
-                    .cloned()
-                    .collect();
+                let saved = self.events.lock().unwrap();
+                let mut events = Vec::new();
+                let mut bytes = 0;
+                for record in saved.iter().filter(|e| e.sequence > since).take(4096) {
+                    let size = serde_json::to_vec(record)?.len();
+                    if !events.is_empty() && bytes + size > 2_000_000 {
+                        break;
+                    }
+                    bytes += size;
+                    events.push(record.clone());
+                }
                 Ok(serde_json::to_value(events)?)
             }
             "start" => self.controller.start_count(
@@ -554,8 +556,27 @@ pub fn serve(path: &Path) -> Result<()> {
         let listener = std::os::unix::net::UnixListener::bind(&socket)?;
         listener.set_nonblocking(false)?;
         let rx = crate::events::tap();
+        let (mut journal, saved) = match crate::observation_history::Journal::open(
+            &controller.config()?.state_dir,
+        ) {
+            Ok((journal, saved)) => (Some(journal), saved),
+            Err(error) => {
+                crate::events::log(format!(
+                    "Live history could not be saved: {error:#}. Current work can continue; existing diagnostic traces are retained."
+                ));
+                (
+                    None,
+                    crate::observation_history::read(&controller.config()?.state_dir)
+                        .unwrap_or_default(),
+                )
+            }
+        };
+        let mut sequence = saved.last().map(|r| r.sequence).unwrap_or(0);
         let engine = Arc::new(Engine {
             controller,
+            // API events describe this controller's current activity. The UI
+            // reads historical display records separately without replaying
+            // old requests, metrics, or control transitions to API consumers.
             events: Mutex::default(),
             chats: crate::chat::Chats::default(),
             touched: Mutex::new(Instant::now()),
@@ -597,16 +618,24 @@ pub fn serve(path: &Path) -> Result<()> {
                 }
             }
         });
-        let mut sequence = 0;
         while !engine.quit.load(Ordering::SeqCst) {
             for (actor, event) in rx.try_iter().take(8192) {
                 sequence += 1;
-                let mut events = engine.events.lock().unwrap();
-                events.push_back(Record {
+                let record = Record {
                     sequence,
                     actor,
                     event,
-                });
+                };
+                if let Some(writer) = journal.as_mut()
+                    && let Err(error) = writer.append(&record)
+                {
+                    journal = None;
+                    crate::events::log(format!(
+                        "Live history saving stopped: {error:#}. Current work is retained; check disk space and file permissions."
+                    ));
+                }
+                let mut events = engine.events.lock().unwrap();
+                events.push_back(record);
                 if events.len() > 16000 {
                     events.pop_front();
                 }
@@ -629,6 +658,20 @@ pub fn serve(path: &Path) -> Result<()> {
                 && engine.touched.lock().unwrap().elapsed() > Duration::from_secs(60)
             {
                 break;
+            }
+        }
+        // Save final events queued after the last controller tick before exiting.
+        if let Some(writer) = journal.as_mut() {
+            for (actor, event) in rx.try_iter() {
+                sequence += 1;
+                if let Err(error) = writer.append(&Record {
+                    sequence,
+                    actor,
+                    event,
+                }) {
+                    eprintln!("Could not save final live history: {error:#}");
+                    break;
+                }
             }
         }
         let marker = engine
