@@ -12,6 +12,8 @@ mod command_session;
 mod command_watch;
 mod communication;
 mod computer_tools;
+mod context_compaction;
+mod context_memory;
 mod context_usage;
 mod dev_tools;
 mod engine;

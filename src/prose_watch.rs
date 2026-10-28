@@ -1,11 +1,15 @@
-//! Cross-response prose repetition. Arguments, source code and short progress
-//! labels are not reasoning. File changes clear suspicion; elapsed time does not.
+//! Cross-response prose repetition. Tool arguments and source code are excluded.
+//! Short labels accompanying tools are allowed; repeated text-only outputs are
+//! checked separately. New evidence clears suspicion; elapsed time does not.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const HISTORY: usize = 384;
 const SKETCH: usize = 512;
 const REPEATS: usize = 4;
+const SHORT_HISTORY: usize = 16;
+const SHORT_REPEATS: usize = 8;
+const SHORT_CHARACTERS: usize = 180;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Signature {
@@ -22,6 +26,13 @@ pub struct ProseWatch {
     recent: Vec<Signature>,
     warned: Option<Signature>,
     warned_patterns: Vec<Signature>,
+    /// Text-only responses have no tool result to distinguish an acknowledgement
+    /// from idle narration. Require an exact normalized recurrence, more often
+    /// and within a smaller window than substantial reasoning.
+    short_recent: Vec<Option<u64>>,
+    short_warned_patterns: Vec<u64>,
+    short_notice_pending: bool,
+    short_refresh_pending: bool,
     initialized: bool,
     notice_pending: bool,
     pub pending_refresh: bool,
@@ -39,19 +50,78 @@ impl ProseWatch {
         self.recent.clear();
         self.warned = None;
         self.warned_patterns.clear();
+        self.short_progress();
         self.notice_pending = false;
         self.pending_refresh = false;
         self.initialized = true;
     }
 
     pub fn take_notice(&mut self) -> bool {
-        std::mem::take(&mut self.notice_pending)
+        std::mem::take(&mut self.notice_pending) | std::mem::take(&mut self.short_notice_pending)
     }
 
+    /// New observations and completed actions justify the same brief status
+    /// again, while substantial reasoning may still be repeating. Do not call
+    /// this for unchanged rereads or merely submitting a pending tool call.
+    pub fn short_progress(&mut self) {
+        self.short_recent.clear();
+        self.short_warned_patterns.clear();
+        self.short_notice_pending = false;
+        if std::mem::take(&mut self.short_refresh_pending) {
+            self.pending_refresh = false;
+        }
+    }
+
+    #[cfg(test)]
     pub fn suspected(&self) -> bool {
-        self.warned.is_some() || self.pending_refresh
+        self.warned.is_some() || !self.short_warned_patterns.is_empty() || self.pending_refresh
     }
 
+    /// Check user-facing output, accounting for whether the response requested
+    /// tools. A brief label attached to pending tools is not an idle reply.
+    /// Call `short_progress` when intervening tools supply new observations or
+    /// complete an action; unchanged rereads must not clear this history.
+    pub fn observe_response(
+        &mut self,
+        prose: &str,
+        changed: bool,
+        has_tool_calls: bool,
+    ) -> Option<Intervention> {
+        let intervention = self.observe(prose, changed);
+        if intervention.is_some() || changed || self.pending_refresh || has_tool_calls {
+            return intervention;
+        }
+        if prose.trim().is_empty() {
+            return None;
+        }
+        let short = short_signature(prose);
+        self.short_recent.push(short);
+        if self.short_recent.len() > SHORT_HISTORY {
+            self.short_recent.remove(0);
+        }
+        let short = short?;
+        if self
+            .short_recent
+            .iter()
+            .filter(|old| **old == Some(short))
+            .count()
+            < SHORT_REPEATS
+        {
+            return None;
+        }
+        let escalated = self.short_warned_patterns.contains(&short);
+        if !escalated {
+            self.short_warned_patterns.push(short);
+            if self.short_warned_patterns.len() > HISTORY {
+                self.short_warned_patterns.remove(0);
+            }
+        }
+        self.short_recent.clear();
+        Some(self.intervene(escalated, true))
+    }
+
+    /// Substantial prose only: internal thinking and existing callers retain
+    /// their original behavior. Use `observe_response` for assistant content.
     pub fn observe(&mut self, prose: &str, changed: bool) -> Option<Intervention> {
         self.initialized = true;
         if changed {
@@ -93,13 +163,22 @@ impl ProseWatch {
         }
         // Give the model another complete set of attempts after the notice.
         self.recent.clear();
+        Some(self.intervene(escalated, false))
+    }
+
+    fn intervene(&mut self, escalated: bool, short: bool) -> Intervention {
         self.interventions = self.interventions.saturating_add(1);
         if escalated {
             self.pending_refresh = true;
-            Some(Intervention::Refresh)
+            self.short_refresh_pending = short;
+            Intervention::Refresh
         } else {
-            self.notice_pending = true;
-            Some(Intervention::Notice)
+            if short {
+                self.short_notice_pending = true;
+            } else {
+                self.notice_pending = true;
+            }
+            Intervention::Notice
         }
     }
 
@@ -142,7 +221,14 @@ impl ProseWatch {
                     )
                 })
             });
-            self.observe(message["content"].as_str().unwrap_or(""), mutating);
+            let has_tool_calls = message["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty());
+            self.observe_response(
+                message["content"].as_str().unwrap_or(""),
+                mutating,
+                has_tool_calls,
+            );
         }
         self.initialized = true;
     }
@@ -154,7 +240,7 @@ fn hash(bytes: impl IntoIterator<Item = u8>) -> u64 {
     })
 }
 
-fn signature(text: &str) -> Option<Signature> {
+fn prose_words(text: &str) -> Option<(Vec<u64>, Vec<char>)> {
     if text.trim_start().starts_with(['{', '[']) {
         return None;
     }
@@ -181,15 +267,33 @@ fn signature(text: &str) -> Option<Signature> {
                 .map(|w| hash(w.to_lowercase().bytes())),
         );
     }
-    // Routine labels such as "Let me read the next page" legitimately recur.
-    if text.len() < 180 {
+    Some((words, letters))
+}
+
+fn substantial_words(text: &str, words: &[u64], letters: &[char]) -> bool {
+    text.len() >= 180
+        && (words.len() >= 32 || (letters.len() >= 64 && letters.iter().any(|c| !c.is_ascii())))
+}
+
+fn short_signature(text: &str) -> Option<u64> {
+    if text.chars().take(SHORT_CHARACTERS + 1).count() > SHORT_CHARACTERS {
+        return None;
+    }
+    let (words, letters) = prose_words(text)?;
+    if words.is_empty() || substantial_words(text, &words, &letters) {
+        return None;
+    }
+    Some(hash(words.iter().flat_map(|w| w.to_le_bytes())))
+}
+
+fn signature(text: &str) -> Option<Signature> {
+    let (mut words, letters) = prose_words(text)?;
+    // Routine labels accompanying tools legitimately recur.
+    if !substantial_words(text, &words, &letters) {
         return None;
     }
     // Scripts without spaces need character shingles instead of word shingles.
     if words.len() < 32 {
-        if letters.len() < 64 || !letters.iter().any(|c| !c.is_ascii()) {
-            return None;
-        }
         words = letters
             .iter()
             .map(|c| hash(c.to_string().bytes()))
@@ -237,6 +341,61 @@ fn similar(a: &Signature, b: &Signature) -> bool {
         union += 1;
     }
     union >= 16 && shared * 100 >= union * 80
+}
+
+/// Locate assistant narration to quarantine during a repetition handoff. Match
+/// the same normalized prose as the live watcher, including earlier members of
+/// each repeated group; changing punctuation or a line number must not leave
+/// the original loop in the selected history. Tool arguments and user text are
+/// never candidates. The original message indices remain archive references.
+pub(crate) fn repeated_narration_indices(messages: &[Value]) -> Vec<usize> {
+    enum Candidate {
+        Substantial(Signature),
+        Short(u64),
+    }
+    let mut recent = Vec::<(usize, Candidate)>::new();
+    let mut repeated = std::collections::BTreeSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        if message["role"] != "assistant" {
+            continue;
+        }
+        let Some(prose) = message["content"].as_str() else {
+            continue;
+        };
+        let candidate = if let Some(signature) = signature(prose) {
+            Candidate::Substantial(signature)
+        } else if !message["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| !calls.is_empty())
+            && let Some(short) = short_signature(prose)
+        {
+            Candidate::Short(short)
+        } else {
+            continue;
+        };
+        let matches: Vec<_> = recent
+            .iter()
+            .filter(|(_, old)| match (old, &candidate) {
+                (Candidate::Substantial(a), Candidate::Substantial(b)) => similar(a, b),
+                (Candidate::Short(a), Candidate::Short(b)) => a == b,
+                _ => false,
+            })
+            .map(|(index, _)| *index)
+            .collect();
+        let threshold = match candidate {
+            Candidate::Substantial(_) => REPEATS,
+            Candidate::Short(_) => SHORT_REPEATS,
+        };
+        if matches.len() + 1 >= threshold {
+            repeated.extend(matches);
+            repeated.insert(index);
+        }
+        recent.push((index, candidate));
+        if recent.len() > HISTORY {
+            recent.remove(0);
+        }
+    }
+    repeated.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -350,5 +509,231 @@ mod tests {
             assert_eq!(watch.observe(LOOP, false), None);
         }
         assert_eq!(watch.observe(LOOP, false), Some(Intervention::Refresh));
+    }
+
+    #[test]
+    fn repeated_short_text_only_responses_warn_then_refresh_after_restart() {
+        let mut watch = ProseWatch::default();
+        for _ in 0..SHORT_REPEATS - 1 {
+            assert_eq!(
+                watch.observe_response("All complete. Standing by.", false, false),
+                None
+            );
+        }
+        assert_eq!(
+            watch.observe_response("ALL COMPLETE! Standing by", false, false),
+            Some(Intervention::Notice)
+        );
+        assert!(watch.suspected());
+        let mut watch: ProseWatch =
+            serde_json::from_value(serde_json::to_value(watch).unwrap()).unwrap();
+        assert!(watch.take_notice());
+        for _ in 0..SHORT_REPEATS - 1 {
+            assert_eq!(
+                watch.observe_response("All complete. Standing by.", false, false),
+                None
+            );
+        }
+        assert_eq!(
+            watch.observe_response("All complete. Standing by.", false, false),
+            Some(Intervention::Refresh)
+        );
+        assert!(watch.pending_refresh);
+        assert_eq!(watch.interventions, 2);
+    }
+
+    #[test]
+    fn repeated_short_outputs_are_language_and_wording_independent() {
+        for text in [
+            "Done.",
+            "D'accord, j'attends.",
+            "完了しました。待機しています。",
+        ] {
+            let mut watch = ProseWatch::default();
+            for _ in 0..SHORT_REPEATS - 1 {
+                assert_eq!(watch.observe_response(text, false, false), None);
+            }
+            assert_eq!(
+                watch.observe_response(text, false, false),
+                Some(Intervention::Notice)
+            );
+        }
+    }
+
+    #[test]
+    fn short_labels_with_pending_tools_are_not_text_only_replies() {
+        let mut watch = ProseWatch::default();
+        for _ in 0..100 {
+            assert_eq!(
+                watch.observe_response("Let me read the next page.", false, true),
+                None
+            );
+        }
+        assert!(!watch.suspected());
+        for _ in 0..SHORT_REPEATS - 1 {
+            assert_eq!(
+                watch.observe_response("Let me read the next page.", false, false),
+                None
+            );
+        }
+        assert_eq!(
+            watch.observe_response("Let me read the next page.", false, false),
+            Some(Intervention::Notice)
+        );
+    }
+
+    #[test]
+    fn fresh_evidence_allows_repeated_brief_acknowledgements() {
+        let mut watch = ProseWatch::default();
+        for _ in 0..100 {
+            assert_eq!(watch.observe_response("Done.", false, false), None);
+            // A new observation or completed action arrives between replies.
+            watch.short_progress();
+        }
+        assert!(!watch.suspected());
+        for _ in 0..SHORT_REPEATS {
+            watch.observe_response("Done.", false, false);
+        }
+        assert!(watch.suspected());
+        assert_eq!(watch.observe_response("Done.", true, false), None);
+        assert!(!watch.suspected());
+        assert!(!watch.take_notice());
+    }
+
+    #[test]
+    fn short_progress_cancels_short_recovery_but_preserves_repeated_reasoning() {
+        let mut watch = ProseWatch::default();
+        for _ in 0..SHORT_REPEATS {
+            watch.observe_response("Done.", false, false);
+        }
+        watch.short_progress();
+        assert!(!watch.take_notice());
+        assert!(!watch.suspected());
+        for _ in 0..SHORT_REPEATS * 2 {
+            watch.observe_response("Done.", false, false);
+        }
+        assert!(watch.pending_refresh);
+        watch.short_progress();
+        assert!(!watch.pending_refresh);
+
+        for _ in 0..REPEATS {
+            watch.observe(LOOP, false);
+        }
+        watch.short_progress();
+        assert!(watch.take_notice());
+        assert!(watch.suspected());
+        for _ in 0..REPEATS {
+            watch.observe(LOOP, false);
+        }
+        watch.short_progress();
+        assert!(watch.pending_refresh);
+    }
+
+    #[test]
+    fn short_outputs_with_new_values_and_sparse_recurrences_are_allowed() {
+        let mut watch = ProseWatch::default();
+        for i in 0..100 {
+            assert_eq!(
+                watch.observe_response(&format!("Observed value {i}."), false, false),
+                None
+            );
+            if i % 3 == 0 {
+                assert_eq!(watch.observe_response("Done.", false, false), None);
+            }
+        }
+        assert!(!watch.suspected());
+    }
+
+    #[test]
+    fn short_recurrences_survive_unchanged_read_labels_and_alternating_patterns() {
+        let mut watch = ProseWatch::default();
+        let mut refreshed = false;
+        for i in 0..SHORT_REPEATS * 8 {
+            assert_eq!(
+                watch.observe_response("Checking current state.", false, true),
+                None
+            );
+            let text = if i % 2 == 0 { "Ready." } else { "Waiting." };
+            if watch.observe_response(text, false, false) == Some(Intervention::Refresh) {
+                refreshed = true;
+                break;
+            }
+            watch.take_notice();
+        }
+        assert!(refreshed);
+    }
+
+    #[test]
+    fn code_and_tool_arguments_do_not_become_short_output_loops() {
+        let mut watch = ProseWatch::default();
+        for _ in 0..100 {
+            for text in ["```rust\nlet done = true;\n```", "{\"done\":true}", "x();"] {
+                assert_eq!(watch.observe_response(text, false, false), None);
+            }
+        }
+        assert!(!watch.suspected());
+    }
+
+    #[test]
+    fn cold_resume_checks_short_text_only_outputs_but_not_pending_tool_labels() {
+        let messages: Vec<_> = (0..SHORT_REPEATS * 2)
+            .map(|_| json!({"role":"assistant","content":"All complete. Standing by."}))
+            .collect();
+        let mut watch = ProseWatch::default();
+        watch.bootstrap(&messages);
+        assert!(watch.pending_refresh);
+
+        let messages: Vec<_> = (0..100)
+            .map(|_| json!({"role":"assistant","content":"Reading.","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"file.rs"}}}]}))
+            .collect();
+        let mut watch = ProseWatch::default();
+        watch.bootstrap(&messages);
+        assert!(!watch.suspected());
+    }
+
+    #[test]
+    fn saved_older_detector_state_and_thinking_keep_existing_behavior() {
+        let mut watch: ProseWatch = serde_json::from_value(json!({
+            "recent":[], "warned":null, "warned_patterns":[], "initialized":true,
+            "notice_pending":false, "pending_refresh":false, "interventions":0
+        }))
+        .unwrap();
+        for _ in 0..100 {
+            assert_eq!(watch.observe("Done.", false), None);
+        }
+        for _ in 0..REPEATS - 1 {
+            assert_eq!(watch.observe_response(LOOP, false, false), None);
+        }
+        assert_eq!(
+            watch.observe_response(LOOP, false, false),
+            Some(Intervention::Notice)
+        );
+    }
+
+    #[test]
+    fn handoff_quarantines_all_near_duplicate_narration_but_preserves_unique_outputs() {
+        let mut messages = vec![json!({"role":"user","content":LOOP})];
+        for index in 0..REPEATS {
+            messages.push(json!({"role":"assistant","content":format!("{LOOP} Next read is line {}.", index * 80)}));
+        }
+        let expected: Vec<_> = (1..=REPEATS).collect();
+        messages.push(
+            json!({"role":"assistant","content":"A unique observation about a different sample."}),
+        );
+        for _ in 0..SHORT_REPEATS {
+            messages.push(json!({"role":"assistant","content":"Done.","tool_calls":[{"id":"pending","function":{"name":"read_file","arguments":{}}}]}));
+            messages.push(json!({"role":"assistant","content":"```rust\nlet done = true;\n```"}));
+            messages.push(json!({"role":"assistant","content":"{\"done\":true}"}));
+        }
+        assert_eq!(repeated_narration_indices(&messages), expected);
+        let first_short = messages.len();
+        for _ in 0..SHORT_REPEATS * 2 {
+            messages.push(json!({"role":"assistant","content":"Done."}));
+        }
+        let expected: Vec<_> = expected
+            .into_iter()
+            .chain(first_short..messages.len())
+            .collect();
+        assert_eq!(repeated_narration_indices(&messages), expected);
     }
 }

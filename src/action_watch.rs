@@ -27,6 +27,9 @@ pub struct ActionWatch {
     notice_pending: bool,
     pub pending_refresh: bool,
     pub interventions: u64,
+    /// Monotonic new-evidence signal shared with short narration detection.
+    pub evidence_revision: u64,
+    command_observations: BTreeMap<String, u64>,
     known_actions: Vec<u64>,
     read_sources: Vec<ReadSource>,
     stale_actions: Vec<u64>,
@@ -72,6 +75,7 @@ pub enum Intervention {
 
 impl ActionWatch {
     pub fn progress(&mut self) {
+        self.evidence_revision = self.evidence_revision.saturating_add(1);
         self.recent.clear();
         self.known_actions.clear();
         self.read_sources.clear();
@@ -100,6 +104,30 @@ impl ActionWatch {
             .as_str()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_else(|| result["result"].clone());
+        if name == "command_status" && result["ok"] == true {
+            if let Some(id) = output["command_id"].as_str() {
+                // Cursor, log generation and completion are observations;
+                // elapsed time and repeated output excerpts are not progress.
+                let signature = hash(
+                    serde_json::json!([
+                        output["log_id"],
+                        output["next_output_offset"],
+                        output["running"],
+                        output["exit_code"],
+                        output["stop_reason"]
+                    ])
+                    .to_string(),
+                );
+                if self.command_observations.get(id) != Some(&signature) {
+                    self.command_observations.insert(id.into(), signature);
+                    self.evidence_revision = self.evidence_revision.saturating_add(1);
+                    while self.command_observations.len() > 64 {
+                        self.command_observations.pop_first();
+                    }
+                }
+            }
+            return None;
+        }
         let unchanged_edit = matches!(name, "edit_file" | "write_file")
             && (result["ok"] == false || output["changed"] == false);
         let repeated_message = name == "send_message" && output["changed"] == false;
@@ -115,6 +143,7 @@ impl ActionWatch {
                 name,
                 "read_file"
                     | "read_progress_note"
+                    | "read_context_memory"
                     | "read_task_evidence"
                     | "read_history"
                     | "search_history"
@@ -145,6 +174,9 @@ impl ActionWatch {
             ) {
                 self.progress();
             } else {
+                if result["ok"] == true {
+                    self.evidence_revision = self.evidence_revision.saturating_add(1);
+                }
                 self.recent.clear();
                 self.clear_suspicion();
             }
@@ -209,6 +241,7 @@ impl ActionWatch {
         }
         trim_front(&mut self.known_actions, ACTION_HISTORY_LIMIT);
         if new_evidence {
+            self.evidence_revision = self.evidence_revision.saturating_add(1);
             self.clear_suspicion();
         } else {
             self.stale_count = self.stale_count.saturating_add(1);
@@ -479,6 +512,23 @@ fn read_observation(args: &Value, output: &Value) -> Option<ReadObservation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn command_observations_require_new_output_or_state_not_elapsed_time() {
+        let mut watch = ActionWatch::default();
+        let mut status = serde_json::json!({"ok":true,"result":{"command_id":"build","log_id":"log-1","next_output_offset":12,"running":true,"elapsed_seconds":1}});
+        watch.observe("command_status", &serde_json::json!({}), &status);
+        let first = watch.evidence_revision;
+        status["result"]["elapsed_seconds"] = serde_json::json!(200);
+        watch.observe("command_status", &serde_json::json!({}), &status);
+        assert_eq!(watch.evidence_revision, first);
+        status["result"]["next_output_offset"] = serde_json::json!(24);
+        watch.observe("command_status", &serde_json::json!({}), &status);
+        assert_eq!(watch.evidence_revision, first + 1);
+        status["result"]["running"] = serde_json::json!(false);
+        watch.observe("command_status", &serde_json::json!({}), &status);
+        assert_eq!(watch.evidence_revision, first + 2);
+    }
+
     #[test]
     fn new_browser_snapshot_ids_do_not_disguise_identical_page_reads() {
         let mut watch = ActionWatch::default();

@@ -708,10 +708,50 @@ are not inferred from identical stdout.
 
 Recovery archives the conversation and retains the current goal, active nudge,
 task, checkpoints, observed check results, failures, log IDs, and running command
-IDs. Repeated narration and old model notes remain retrievable in history but do
-not seed the fresh prompt or later capacity handoffs. New progress notes can be
-used normally. Recovery neither pauses the run, stops a command, nor rolls back
-files. Healthy conversations continue unchanged until recovery is warranted.
+IDs. Repetitive narration, cached reasoning and completed progress-note calls
+are quarantined rather than copied back into the next context. Unrelated
+observations and explicitly structured episode notes remain available. Recovery
+neither pauses the run, stops a command, nor rolls back files. Healthy
+conversations continue unchanged until recovery is warranted. Short repeated
+text-only replies are checked too: eight matching normalized replies within a
+16-response window receive feedback; continued recurrence triggers a handoff.
+Silence is allowed in unassigned sessions, and tool-attached progress labels do
+not count as idle narration. New observations clear short-reply suspicion.
+
+### Context handoffs and durable memory
+
+Capacity handling first tries clearing older bulky completed tool results while
+retaining the ordered conversation, recent results and pending tool calls. The
+original payloads remain retrievable through immutable `read_history` references.
+It accepts this lighter compaction only when estimated input usage, including
+tool schemas and memory, leaves sufficient room for another response. Otherwise,
+it builds a structured handoff with recent complete exchanges selected by a
+token estimate proportional to the configured context window, rather than a
+fixed number of messages. Estimates guide selection; they do not impose a new
+context guard or pause the run. Protected instructions or pending calls can
+exceed a selection budget, and diagnostics report that condition.
+
+Previously delivered human operator directions and explicitly fetched mailbox
+messages have their own source-linked memory, separate from model-authored
+notes. Compaction never reads unread mailbox bodies or private operator chats.
+Existing sessions backfill delivered records from their loop archives once.
+Explicit goal replacements are marked as historical; ordinary notes retain their
+original scope. Recent directions are prioritized in previews, and full exact
+records remain available through `read_context_memory`.
+
+`save_progress_note` accepts optional `observations`, `decisions`, `reasons`,
+`open_questions`, and `attempts` arrays. These structured entries survive
+handoffs as unverified model-authored memory, with source references; they do
+not assign a new goal or prove a result. Freeform notes remain available through
+`read_progress_note`. The memory reader pages the `human` or `episode` section; an optional `record_id`
+selects one exact entry instead of scanning the whole ledger. Pass the returned `revision` with each `next_offset` continuation, restarting at
+zero if records changed. No extra summary-model calls are made. Between
+compactions, the conversation remains append-only for inference caching.
+
+Each handoff saves `context-compaction-N.json` beside its immutable conversation
+archive, reporting estimated sizes, retained exchanges, archived evidence,
+repetition quarantine, and any protected overage. Its live event explains whether
+older tool payloads were cleared or a new context was assembled.
 
 Recovery events appear in live output and `prose-recovery-N.json`, `thinking-recovery-N.json`,
 `action-recovery-N.json`, and `repetition-context-reset-N.json` cycle artifacts.

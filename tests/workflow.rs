@@ -225,6 +225,41 @@ impl Drop for Server {
         let _ = self.handle.take().unwrap().join();
     }
 }
+// Compaction preserves complete exchanges. A fixed message-count ceiling would
+// reject useful retained context without checking either its size or validity.
+fn assert_compacted_tool_protocol(messages: &Value) {
+    let mut pending = Vec::<(Option<Value>, String)>::new();
+    for message in messages.as_array().unwrap() {
+        if message["role"] == "assistant" {
+            assert!(
+                pending.is_empty(),
+                "Unanswered tool batch before another assistant turn"
+            );
+            for call in message["tool_calls"].as_array().into_iter().flatten() {
+                pending.push((
+                    call.get("id").cloned(),
+                    call["function"]["name"].as_str().unwrap().into(),
+                ));
+            }
+        } else if message["role"] == "tool" {
+            let id = message.get("tool_call_id");
+            let name = message["tool_name"].as_str();
+            let index = pending
+                .iter()
+                .position(|(expected, expected_name)| match id {
+                    Some(id) => expected.as_ref() == Some(id),
+                    None => name == Some(expected_name.as_str()),
+                })
+                .expect("Orphan result after compaction");
+            pending.remove(index);
+        }
+    }
+    assert!(
+        pending.is_empty(),
+        "A provider request must include completed tool replies"
+    );
+}
+
 const CROSS_RESPONSE_LOOP: &str = "I've now read through the entire editor. Let me analyze the key usability concerns for the active nudge. The most important one I can identify is a concrete bug in the render loop. The document body is rendered inside a ScrollArea, but the caret is drawn at absolute paragraph positions. Let me verify the actual typing and rendering path works by checking the keyboard integration test and confirming the render produces visible text.";
 
 #[test]
@@ -269,7 +304,7 @@ fn exercise_cross_response_recovery_in_mode(thinking: bool, chaos: bool) {
                 assert!(messages.contains("Improve value incrementally"));
             }
             assert!(!messages.contains("I've now read through the entire editor"));
-            assert!(body["messages"].as_array().unwrap().len() < 10);
+            assert_compacted_tool_protocol(&body["messages"]);
         }
         match n {
             0 => (
@@ -6004,8 +6039,14 @@ fn repeated_tool_recovery_archives_loop_and_preserves_work() {
         if [9, 17, 25].contains(&n) {
             let text = body["messages"].to_string();
             assert!(text.contains("repetitive history was archived"));
-            assert!(body["messages"].as_array().unwrap().len() < 10);
-            assert!(!text.contains("PRIVATE_REPEATED_READ"));
+            assert_compacted_tool_protocol(&body["messages"]);
+            assert!(!body["messages"].as_array().unwrap().iter().any(|message| {
+                message["role"] == "tool"
+                    && message["tool_name"] == "read_file"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("PRIVATE_REPEATED_READ"))
+            }));
         }
         (
             String::new(),
@@ -6399,7 +6440,7 @@ fn command_stall_survives_restart_and_recovers_with_read_only_diagnosis() {
         work += 1;
         if n == 16 {
             assert!(body["messages"].to_string().contains("command_diagnostic"));
-            assert!(body["messages"].as_array().unwrap().len() < 10);
+            assert_compacted_tool_protocol(&body["messages"]);
             return (
                 String::new(),
                 json!([

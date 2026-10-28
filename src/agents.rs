@@ -16,6 +16,7 @@ const READ_TOOLS: &[&str] = &[
     "lookup_symbol",
     "read_command_log",
     "read_progress_note",
+    "read_context_memory",
     "read_task_evidence",
     "search_history",
     "read_history",

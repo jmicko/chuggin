@@ -278,6 +278,8 @@ struct Conversation {
     messages: Vec<Value>,
     tools: Value,
     note: RepairNote,
+    memory: crate::context_memory::Memory,
+    memory_notice_human_count: usize,
     context_pressure: bool,
     response_errors: u32,
     empty_response_streak: u32,
@@ -1624,6 +1626,9 @@ fn load_conversation(c: &Config, s: &State) -> Result<Conversation> {
     } else {
         session.prose_watch.bootstrap(&session.messages);
     }
+    backfill_context_memory(c, &mut session)?;
+    session.memory.ingest_messages(&session.messages, "current");
+    publish_human_memory(c, &mut session);
     save_conversation(c, &session)?;
     Ok(session)
 }
@@ -1757,6 +1762,127 @@ pub(crate) fn repair_pending_tools(messages: &mut Vec<Value>) {
         }
     }
 }
+/// Recover delivered human directions from the allowlisted loop archives only.
+/// Operator chats and unread mailbox files are deliberately outside this scan.
+fn backfill_context_memory(c: &Config, session: &mut Conversation) -> Result<()> {
+    if !session.memory.needs_backfill() {
+        return Ok(());
+    }
+    let mut complete = true;
+    for source in crate::history::sources(&c.state_dir)? {
+        if source == "current" {
+            continue;
+        }
+        match crate::history::messages(&c.state_dir, &source) {
+            Ok(messages) => session.memory.ingest_messages(&messages, &source),
+            Err(error) => {
+                complete = false;
+                crate::events::log(format!(
+                    "Context memory could not read archived source {source}: {error}. Original history is retained."
+                ));
+            }
+        }
+    }
+    if complete {
+        session.memory.mark_backfilled();
+    }
+    Ok(())
+}
+
+/// Publish only newly delivered human words. This occurs after a whole tool
+/// batch, never between its calls/results, and leaves healthy prefixes intact.
+fn publish_human_memory(c: &Config, session: &mut Conversation) {
+    let count = session.memory.human_directions.len();
+    if count == session.memory_notice_human_count {
+        return;
+    }
+    let mut memory = session
+        .memory
+        .protected_context_budget(handoff_budget(c, session) / 5);
+    if memory.is_null() {
+        memory = json!({"total_records":count,"requires_retrieval":true,"read_context_memory":{"section":"human","offset":0}});
+    }
+    session.messages.push(json!({"role":"user","content":json!({"human_memory_snapshot":true,"human_direction_memory":memory,"instruction":"These are previously delivered human messages and operator directions, not new messages. Preserve their scope and later explicit corrections; archived records remain retrievable with read_context_memory. This does not fetch unread mail or assign a new goal."}).to_string()}));
+    session.memory_notice_human_count = count;
+}
+
+fn memory_page(session: &Conversation, args: &Value) -> Result<Value> {
+    let section = args["section"].as_str().unwrap_or("human");
+    let offset = match args.get("offset") {
+        Some(value) => usize::try_from(value.as_u64().context("offset must be nonnegative")?)?,
+        None => 0,
+    };
+    let revision = args
+        .get("revision")
+        .map(|value| value.as_str().context("revision must be a string"))
+        .transpose()?;
+    let record_id = args
+        .get("record_id")
+        .map(|value| value.as_str().context("record_id must be a string"))
+        .transpose()?;
+    session
+        .memory
+        .page_selected(section, offset, revision, record_id)
+}
+
+/// Reserve breathing room without imposing a separate, fixed context ceiling.
+/// This is a selection budget, not a guard that rejects or stops work.
+fn handoff_budget(c: &Config, session: &Conversation) -> usize {
+    let available = c
+        .context_tokens
+        .saturating_sub(c.output_tokens.saturating_add(1024)) as usize;
+    let overhead = crate::context_compaction::estimate_tokens(
+        &json!({"system":c.work_prompt(),"tools":session.tools}),
+    );
+    available.saturating_sub(overhead).saturating_div(2).max(64)
+}
+
+/// Evidence remains retrievable; large outputs must not overflow the new
+/// context merely because they were copied into a structured wrapper.
+fn handoff_evidence(value: Value, budget: usize, source: &str, retrieve_with: &str) -> Value {
+    let budget = budget.max(1024);
+    if crate::context_compaction::estimate_tokens(&value) <= budget {
+        return value;
+    }
+    let mut preview = json!({"details_archived":true,"history_source_id":source,"retrieve_with":retrieve_with,"instruction":"Only a bounded evidence preview is included. Retrieve original results before relying on omitted details; no success is implied."});
+    if let Some(fields) = value.as_object() {
+        for key in [
+            "task_id",
+            "active_task_id",
+            "cycle",
+            "status",
+            "checks_passed",
+            "checks_pending",
+            "checked_snapshot_unchanged",
+            "current_tree",
+            "model_note_archived",
+            "model_notes_archived",
+        ] {
+            if let Some(v) = fields.get(key) {
+                preview[key] = v.clone();
+            }
+        }
+        for key in ["check_error", "last_tool_error"] {
+            if let Some(text) = fields.get(key).and_then(Value::as_str) {
+                preview[key] = json!(project::excerpt(
+                    text,
+                    budget.saturating_div(4).clamp(80, 800)
+                ));
+            }
+        }
+        if let Some(validation) = fields.get("validation") {
+            preview["validation"] = json!({"status":validation["status"],"checked_tree":validation["checked_tree"],"current_files_match":validation["current_files_match"],"log_ids":validation["log_ids"].as_array().map(|ids|ids.iter().take(4).cloned().collect::<Vec<_>>())});
+        }
+    }
+    if crate::context_compaction::estimate_tokens(&preview) <= budget {
+        preview
+    } else {
+        json!({"details_archived":true,"history_source_id":source,"retrieve_with":retrieve_with})
+    }
+}
+
+/// Known capacity and repetition call sites choose their policy explicitly;
+/// human-facing reason text never controls what evidence is retained.
 fn refresh_conversation(
     c: &Config,
     s: &State,
@@ -1764,6 +1890,28 @@ fn refresh_conversation(
     art: &Path,
     reason: &str,
     keep_recent: bool,
+) -> Result<()> {
+    refresh_conversation_with_kind(
+        c,
+        s,
+        session,
+        art,
+        reason,
+        if keep_recent {
+            crate::context_compaction::Reason::Capacity
+        } else {
+            crate::context_compaction::Reason::Repetition
+        },
+    )
+}
+
+fn refresh_conversation_with_kind(
+    c: &Config,
+    s: &State,
+    session: &mut Conversation,
+    art: &Path,
+    reason: &str,
+    kind: crate::context_compaction::Reason,
 ) -> Result<()> {
     // Several recoveries can have identical message counts in one cycle.
     // Never overwrite the evidence of an earlier recovery.
@@ -1776,21 +1924,65 @@ fn refresh_conversation(
         archive_index += 1;
     };
     save(&archive, session)?;
-    let factual_only =
-        !keep_recent || session.prose_watch.suspected() || session.thinking_watch.suspected();
-    let recent = if !factual_only {
-        let minimum = session.messages.len().saturating_sub(12).max(2);
-        session
-            .messages
-            .iter()
-            .enumerate()
-            .skip(minimum)
-            .find(|(_, m)| m["role"] == "assistant")
-            .map(|(i, _)| session.messages[i..].to_vec())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let source = format!(
+        "{}/{}",
+        art.file_name().unwrap_or_default().to_string_lossy(),
+        archive.file_name().unwrap_or_default().to_string_lossy()
+    );
+    backfill_context_memory(c, session)?;
+    session.memory.ingest_messages(&session.messages, &source);
+    let factual_only = kind != crate::context_compaction::Reason::Capacity;
+    let budget = handoff_budget(c, session);
+    let before_tokens = crate::context_compaction::estimate_tokens(&json!(session.messages));
+    let human_memory = session.memory.protected_context_budget(budget / 5);
+    let episode_memory = session.memory.episode_context_budget(budget / 5);
+    // First try clearing older completed tool payloads. The transcript order,
+    // recent results and pending calls remain intact; its original is archived.
+    if kind == crate::context_compaction::Reason::Capacity {
+        let cleared = crate::context_compaction::clear_old_tool_results(
+            &session.messages,
+            &source,
+            budget / 2,
+        );
+        let after_tokens = crate::context_compaction::estimate_tokens(&json!(cleared.recent));
+        let saved = before_tokens.saturating_sub(after_tokens);
+        let notice = json!({"role":"user","content":json!({"context_compaction":{"kind":"older_tool_results_cleared","history_source_id":source,"instruction":"Older completed tool payloads were archived. Their original calls, recent exchanges, files and processes remain available. Read evidence references only when needed; no action was undone or replayed."},"human_memory_snapshot":true,"human_direction_memory":human_memory,"episode_memory":episode_memory}).to_string()});
+        let tool_tokens = crate::context_compaction::estimate_tokens(&session.tools);
+        let ratio = session
+            .last_context_usage
+            .as_ref()
+            .filter(|usage| usage.model == c.model && usage.context_tokens == c.context_tokens)
+            .map(|usage| {
+                (usage.prompt as f64 / before_tokens.saturating_add(tool_tokens).max(1) as f64)
+                    .clamp(0.25, 4.0)
+            })
+            .unwrap_or(1.0);
+        let projected = ((after_tokens
+            .saturating_add(tool_tokens)
+            .saturating_add(crate::context_compaction::estimate_tokens(&notice)))
+            as f64
+            * ratio)
+            .ceil() as usize;
+        let input_limit =
+            c.context_tokens
+                .saturating_sub(c.output_tokens.saturating_add(1024)) as usize;
+        // Retain a meaningful amount of headroom, including schemas and the
+        // memory notice. Usage calibration is an estimate, never a new limit.
+        if saved >= before_tokens / 4 && projected <= input_limit.saturating_mul(4) / 5 {
+            session.messages = cleared.recent;
+            session.messages.push(notice);
+            session.memory_notice_human_count = session.memory.human_directions.len();
+            session.context_pressure = false;
+            let stats = json!({"kind":"tool_results","reason":reason,"source_id":source,"before_estimated_tokens":before_tokens,"after_estimated_tokens":after_tokens,"projected_input_tokens":projected,"input_allowance":input_limit,"usage_calibration":ratio,"selection":cleared.stats});
+            emit(art, &format!("context-compaction-{archive_index}"), &stats)?;
+            crate::events::log(format!(
+                "Context compaction: older tool results archived; estimated history size {before_tokens} → {after_tokens}. Recent conversation retained."
+            ));
+            return save_conversation(c, session);
+        }
+    }
+    let compacted =
+        crate::context_compaction::compact(&session.messages, &source, kind, budget * 3 / 5);
     session.messages = vec![
         json!({"role":"system","content":c.work_prompt()}),
         json!({"role":"user","content":activity_context(c,s).to_string()}),
@@ -1824,6 +2016,8 @@ fn refresh_conversation(
             evidence.insert("model_notes_archived".into(), json!(true));
         }
     }
+    feedback = handoff_evidence(feedback, budget / 10, &source, "read_task_evidence");
+    evidence = handoff_evidence(evidence, budget / 10, &source, "read_task_evidence");
     let completed = s.completed_tasks.last().map(|task| json!({"id":task.id,"title":task.title,"checkpoint":task.checkpoint,"summary_available_in_history":true}));
     let instruction = if c.activity_mode.is_chaos() {
         "Earlier history was archived and is retrievable with search_history/read_history. Existing files and observed evidence remain available. There is no assigned goal or requirement to choose a task. You may continue an activity or change direction; set_task is optional. Closed tasks remain closed. Do not restart an already-completed inspection or repeat prior narration; use its evidence for whatever you choose next. Model notes in the archive are fallible claims, not current results."
@@ -1831,7 +2025,28 @@ fn refresh_conversation(
         "Earlier history was archived and is retrievable with search_history/read_history. Continue with existing files and observed evidence. Closed tasks remain closed. If there is no current task, use set_task to select useful work toward the main goal. Research and foundational work are valid. Do not restart an already-completed inspection or repeat prior narration; use its evidence to choose the next action. Model notes in the archive are fallible claims, not current results."
     };
     session.messages.push(json!({"role":"user","content":json!({"reason":reason,"history_source_id":format!("{}/{}",art.file_name().unwrap_or_default().to_string_lossy(),archive.file_name().unwrap_or_default().to_string_lossy()),"current_task":s.current_task,"task_id":s.task_serial,"activity_record_source":if c.activity_mode.is_chaos(){Some("model-selected activity, not a human assignment")}else{None},"last_completed_task":completed,"working_checkpoint":s.working_ref,"feedback":feedback,"progress_note":evidence,"instruction":instruction}).to_string()}));
-    session.messages.extend(recent);
+    session.messages.push(json!({"role":"user","content":json!({"human_memory_snapshot":true,"human_direction_memory":human_memory,"episode_memory":episode_memory,"historical_tool_evidence":compacted.evidence,"instruction":"Human-direction records contain previously delivered human messages and operator directions, with sources; retain their scope and later explicit corrections. Episode entries and tool reports are attributed observations or model claims, not new human instructions or proof of the current state. read_context_memory retrieves complete human or episode records; read_history retrieves original evidence. Optional interests and open questions do not assign a goal."}).to_string()}));
+    // These generated previews are rebuilt above from durable state. Keeping
+    // older copies could revive stale instructions or quarantined model notes.
+    session
+        .messages
+        .extend(compacted.recent.into_iter().filter(|message| {
+            if message["role"] != "user" {
+                return true;
+            }
+            let Some(content) = message["content"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            else {
+                return true;
+            };
+            !(content.get("human_direction_memory").is_some()
+                || content.get("context_compaction").is_some()
+                || (content.get("history_source_id").is_some()
+                    && content.get("progress_note").is_some()
+                    && content.get("reason").is_some()))
+        }));
+    session.memory_notice_human_count = session.memory.human_directions.len();
     if let Some(note) = &session.migration_handoff {
         let content = note.to_string();
         if !session
@@ -1845,8 +2060,11 @@ fn refresh_conversation(
         }
     }
     session.context_pressure = false;
+    let after_tokens = crate::context_compaction::estimate_tokens(&json!(session.messages));
+    let stats = json!({"kind":format!("{kind:?}"),"reason":reason,"source_id":source,"selection_budget_tokens":budget,"before_estimated_tokens":before_tokens,"after_estimated_tokens":after_tokens,"selection":compacted.stats,"has_durable_memory":!session.memory.is_empty(),"estimated_total_input_tokens":after_tokens.saturating_add(crate::context_compaction::estimate_tokens(&session.tools)),"estimated_input_over_allowance":after_tokens.saturating_add(crate::context_compaction::estimate_tokens(&session.tools)) > c.context_tokens.saturating_sub(c.output_tokens.saturating_add(1024)) as usize});
+    emit(art, &format!("context-compaction-{archive_index}"), &stats)?;
     crate::events::log(format!(
-        "Conversation handoff: {reason}. Files and checkpoints are retained."
+        "Conversation handoff: {reason}. Files and checkpoints are retained. Estimated history size {before_tokens} → {after_tokens}; source-linked memory retained."
     ));
     save_conversation(c, session)
 }
@@ -2015,6 +2233,8 @@ fn sync_operator(c: &Config, s: &mut State, session: &mut Conversation) -> Resul
             session.thinking_watch.progress();
             session.action_watch.progress();
             session.operator_revision = revision;
+            session.memory.ingest_messages(&session.messages, "current");
+            publish_human_memory(c, session);
             if !c.activity_mode.is_chaos()
                 && let Ok(goal) =
                     crate::operator::read_json(&c.state_dir.join("operator-goal.json"))
@@ -2088,14 +2308,20 @@ fn observe_prose(
     prose: &str,
     changed: bool,
     thinking: bool,
+    has_tool_calls: bool,
 ) -> Result<()> {
     let watch = if thinking {
         &mut session.thinking_watch
     } else {
         &mut session.prose_watch
     };
-    if let Some(intervention) = watch.observe(prose, changed) {
-        let reason = "Repeated substantial reasoning across responses. The model is restating the same investigation rather than advancing it. Preserve existing work and choose a concrete next action using already-observed evidence.";
+    let intervention = if thinking {
+        watch.observe(prose, changed)
+    } else {
+        watch.observe_response(prose, changed, has_tool_calls)
+    };
+    if let Some(intervention) = intervention {
+        let reason = "Repeated narration across responses without new observations. Existing files, evidence and human directions remain available. Repetitive narration can be archived without assigning a new activity.";
         emit(
             art,
             &format!(
@@ -2436,6 +2662,7 @@ fn work(
         c.check_workspace(&s.working_workspace, &s.working_branch)?;
         let command_updates = jobs.monitor(c, s.current_task.as_ref(), m, stop)?;
         if !command_updates.is_empty() {
+            session.prose_watch.short_progress();
             let tree = c.tree(&s.working_workspace)?;
             if tree != session.observed_tree {
                 session.prose_watch.progress();
@@ -2497,9 +2724,15 @@ fn work(
             session.messages.push(json!({"role":"user","content":crate::prompts::reasoning_recovery(c.activity_mode)}));
             save_conversation(c, session)?;
         }
+        let live_config = load(config_path)?;
+        ensure_activity_mode(&live_config, s)?;
         if session.context_pressure {
+            let mut compaction_config = c.clone();
+            compaction_config.context_tokens = live_config.context_tokens;
+            compaction_config.output_tokens = live_config.output_tokens;
+            compaction_config.model = live_config.model.clone();
             refresh_conversation(
-                c,
+                &compaction_config,
                 s,
                 session,
                 art,
@@ -2511,8 +2744,6 @@ fn work(
         sync_operator(c, s, session)?;
         sync_nudge(c, session)?;
         sync_mailbox(c, session)?;
-        let live_config = load(config_path)?;
-        ensure_activity_mode(&live_config, s)?;
         let allow_completion = live_config.allows_goal_completion();
         session.tools = crate::model::project_tools(&s.working_workspace);
         if c.execution.is_private() {
@@ -2579,13 +2810,13 @@ fn work(
                     .record("model request", &format!("{error:#}"), true);
                 session.messages.push(json!({"role":"user","content":format!("The model request failed: {error:#}. Existing work and completed tool results are retained. Continue the current task.")}));
                 if session.response_errors == 2 {
-                    refresh_conversation(
+                    refresh_conversation_with_kind(
                         c,
                         s,
                         session,
                         art,
                         "Repeated request recovery failed",
-                        false,
+                        crate::context_compaction::Reason::Recovery,
                     )?;
                 }
                 save_conversation(c, session)?;
@@ -2652,8 +2883,8 @@ fn work(
         }
         session.empty_response_streak = 0;
         if calls.is_empty() {
-            observe_prose(session, art, &response_prose, false, false)?;
-            observe_prose(session, art, &response_thinking, false, true)?;
+            observe_prose(session, art, &response_prose, false, false, false)?;
+            observe_prose(session, art, &response_thinking, false, true, false)?;
             save_conversation(c, session)?;
             break;
         }
@@ -2920,6 +3151,7 @@ fn work(
                     }
                     "save_progress_note" => {
                         let note = args["note"].as_str().context("Missing note")?;
+                        session.memory.record_episode(args, json!({"tool_log_id":format!("{}/tool-{step}-{index}.json", art.file_name().unwrap_or_default().to_string_lossy()),"cycle":s.cycle}))?;
                         if args["append"] == true {
                             session.note.append_note(note)?;
                         } else {
@@ -2937,6 +3169,7 @@ fn work(
                         };
                         Ok(session.note.page(offset)?.to_string())
                     }
+                    "read_context_memory" => Ok(memory_page(session, args)?.to_string()),
                     "read_task_evidence" => {
                         let tree = c.tree(&root)?;
                         Ok(json!({"task_id":s.current_task.as_ref().map(|_|s.task_serial),"task":s.current_task,"evidence":session.note.context_at(s.current_task.as_ref().map(|_|s.task_serial),Some(&tree))}).to_string())
@@ -2994,6 +3227,9 @@ fn work(
                                     .note
                                     .page(args["offset"].as_u64().unwrap_or(0) as usize)?
                                     .to_string()),
+                                "read_context_memory" => {
+                                    Ok(memory_page(session, args)?.to_string())
+                                }
                                 "read_task_evidence" => Ok(session
                                     .note
                                     .context_at(
@@ -3252,7 +3488,7 @@ fn work(
                 .or_else(|| args["reason"].as_str())
                 .unwrap_or("");
             // A ledger read must not manufacture new evidence by recording itself.
-            if name != "read_task_evidence" {
+            if !["read_task_evidence", "read_context_memory"].contains(&name) {
                 session.note.record(
                     &format!("{name} {}", project::excerpt(detail, 180)),
                     &value.to_string(),
@@ -3268,6 +3504,10 @@ fn work(
             };
             let reply = crate::vision::tool_reply(name, &reply_value, call.get("id"));
             session.messages.push(reply);
+            if name == "read_messages" && value["ok"] == true {
+                session.memory.ingest_messages(&session.messages, "current");
+            }
+            let evidence_revision = session.action_watch.evidence_revision;
             if let Some(intervention) = session.action_watch.observe(name, args, &value) {
                 let reason = format!(
                     "Repeated inspection pattern: {name}. Already-seen unchanged evidence is being revisited. Use existing observations to advance the investigation, change the approach, or select new work if the previous task is closed. Files and completed actions are retained."
@@ -3279,7 +3519,14 @@ fn work(
                 )?;
                 crate::events::log(reason);
             }
+            if session.action_watch.evidence_revision != evidence_revision {
+                session.prose_watch.short_progress();
+            }
             save_conversation(c, session)?;
+        }
+        publish_human_memory(c, session);
+        if !completed_commands.is_empty() {
+            session.prose_watch.short_progress();
         }
         for update in completed_commands {
             observe_command_validation(c, s, session, &update, validation_tickets, art)?;
@@ -3293,12 +3540,14 @@ fn work(
             &response_prose,
             proposal_tree != observed_tree,
             false,
+            true,
         )?;
         observe_prose(
             session,
             art,
             &response_thinking,
             proposal_tree != observed_tree,
+            true,
             true,
         )?;
         save_conversation(c, session)?;
@@ -5139,3 +5388,6 @@ pub fn recovery_ui(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod context_tests;

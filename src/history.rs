@@ -2,7 +2,7 @@
 //! chats, credentials and arbitrary state files are deliberately not searchable.
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::{fs, path::Path};
+use std::{cmp::Ordering, fs, path::Path};
 
 pub fn schemas() -> Vec<Value> {
     vec![
@@ -86,7 +86,7 @@ fn source_path(state: &Path, id: &str) -> Result<std::path::PathBuf> {
     }
     Ok(canonical)
 }
-fn sources(state: &Path) -> Result<Vec<String>> {
+pub(crate) fn sources(state: &Path) -> Result<Vec<String>> {
     let mut ids = Vec::new();
     for dir in fs::read_dir(state)? {
         let dir = dir?;
@@ -102,13 +102,47 @@ fn sources(state: &Path) -> Result<Vec<String>> {
             }
         }
     }
-    ids.sort();
+    // Archive serials are not uniformly zero padded. Lexical order would put
+    // refresh-10 before refresh-2 and can reverse the order of human corrections
+    // during legacy memory backfill. Compare every numeric run by its value.
+    ids.sort_by(|left, right| natural_order(left, right));
     if state.join("conversation.json").exists() {
         ids.push("current".into());
     }
     Ok(ids)
 }
-fn messages(state: &Path, id: &str) -> Result<Vec<Value>> {
+
+fn natural_order(mut left: &str, mut right: &str) -> Ordering {
+    while !left.is_empty() && !right.is_empty() {
+        let left_numeric = left.as_bytes()[0].is_ascii_digit();
+        let right_numeric = right.as_bytes()[0].is_ascii_digit();
+        if left_numeric && right_numeric {
+            let left_end = left.bytes().take_while(u8::is_ascii_digit).count();
+            let right_end = right.bytes().take_while(u8::is_ascii_digit).count();
+            let left_digits = left[..left_end].trim_start_matches('0');
+            let right_digits = right[..right_end].trim_start_matches('0');
+            let numeric = left_digits
+                .len()
+                .cmp(&right_digits.len())
+                .then_with(|| left_digits.cmp(right_digits));
+            if numeric != Ordering::Equal {
+                return numeric;
+            }
+            left = &left[left_end..];
+            right = &right[right_end..];
+        } else {
+            let next = left.as_bytes()[0].cmp(&right.as_bytes()[0]);
+            if next != Ordering::Equal {
+                return next;
+            }
+            // Source IDs have already passed the ASCII-only archive allowlist.
+            left = &left[1..];
+            right = &right[1..];
+        }
+    }
+    left.len().cmp(&right.len())
+}
+pub(crate) fn messages(state: &Path, id: &str) -> Result<Vec<Value>> {
     let source: Value = serde_json::from_slice(&fs::read(source_path(state, id)?)?)?;
     let messages = source
         .as_array()
@@ -221,6 +255,47 @@ pub fn read(state: &Path, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn archive_serials_are_naturally_ordered_and_current_remains_last() {
+        let d = tempfile::tempdir().unwrap();
+        let early_cycle = "cycle-999999";
+        let later_cycle = "cycle-1000000";
+        for cycle in [early_cycle, later_cycle] {
+            fs::create_dir(d.path().join(cycle)).unwrap();
+        }
+        for name in [
+            "conversation-before-refresh-10.json",
+            "conversation-before-refresh-2.json",
+            "conversation-before-refresh-1.json",
+        ] {
+            fs::write(d.path().join(early_cycle).join(name), "[]").unwrap();
+        }
+        fs::write(
+            d.path()
+                .join(later_cycle)
+                .join("conversation-before-refresh-0.json"),
+            "[]",
+        )
+        .unwrap();
+        fs::write(d.path().join("conversation.json"), "[]").unwrap();
+        fs::create_dir(d.path().join("operator-chats")).unwrap();
+        fs::write(
+            d.path().join("operator-chats/private.json"),
+            "private human words",
+        )
+        .unwrap();
+        assert_eq!(
+            sources(d.path()).unwrap(),
+            [
+                "cycle-999999/conversation-before-refresh-1.json",
+                "cycle-999999/conversation-before-refresh-2.json",
+                "cycle-999999/conversation-before-refresh-10.json",
+                "cycle-1000000/conversation-before-refresh-0.json",
+                "current",
+            ]
+        );
+    }
+
     #[test]
     fn archived_evidence_is_searchable_and_large_unicode_results_are_complete() {
         let d = tempfile::tempdir().unwrap();
