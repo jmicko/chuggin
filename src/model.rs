@@ -117,7 +117,7 @@ impl Model {
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .build()?,
-            url: crate::cloud::url(url, name),
+            url: crate::cloud::try_url(url, name)?,
             name: name.into(),
             context,
             output,
@@ -135,7 +135,7 @@ impl Model {
             context_pressure: Cell::new(false),
             run_controls: None,
             controls: Arc::new(crate::run_control::RunControl::default()),
-            request_target: RefCell::new((name.into(), crate::cloud::url(url, name))),
+            request_target: RefCell::new((name.into(), crate::cloud::try_url(url, name)?)),
             pinned_target: None,
             vision_capabilities: RefCell::new(HashMap::new()),
             reasoning: crate::reasoning::Setting::default(),
@@ -211,6 +211,24 @@ impl Model {
         if crate::cloud::provider(name).is_some() {
             // Cloud catalog capabilities are validated before the request. If
             // an endpoint rejects an image, the ordinary text recovery applies.
+            return true;
+        }
+        if name.starts_with("connection/") {
+            if let Ok(Some(metadata)) = crate::connections::metadata(name) {
+                let supported = metadata["capabilities"]
+                    .as_array()
+                    .map(|values| values.iter().any(|value| value == "vision"))
+                    .or_else(|| {
+                        metadata["input_modalities"]
+                            .as_array()
+                            .map(|values| values.iter().any(|value| value == "image"))
+                    })
+                    .unwrap_or(true);
+                self.vision_capabilities
+                    .borrow_mut()
+                    .insert(cache_key, supported);
+                return supported;
+            }
             return true;
         }
         let Some(base) = url.strip_suffix("/api/chat") else {
@@ -335,13 +353,15 @@ impl Model {
     }
     fn provider_target(&self) -> Result<(String, String, Option<PathBuf>)> {
         if let Some((name, url, wait)) = &self.pinned_target {
-            return Ok((name.clone(), url.clone(), Some(wait.clone())));
+            let url = crate::connections::resolve(name)?
+                .map_or_else(|| url.clone(), |resolved| resolved.connection.endpoint());
+            return Ok((name.clone(), url, Some(wait.clone())));
         }
         if let Some(path) = &self.settings_path {
             let c = crate::runner::load(path)?;
             Ok((
                 self.selected_name(&c).into(),
-                crate::cloud::url(&c.ollama_url, self.selected_name(&c)),
+                crate::cloud::try_url(&c.ollama_url, self.selected_name(&c))?,
                 Some(
                     self.chat_settings
                         .clone()
@@ -349,7 +369,11 @@ impl Model {
                 ),
             ))
         } else {
-            Ok((self.name.clone(), self.url.clone(), None))
+            let url = crate::connections::resolve(&self.name)?.map_or_else(
+                || self.url.clone(),
+                |resolved| resolved.connection.endpoint(),
+            );
+            Ok((self.name.clone(), url, None))
         }
     }
     fn wait_for_provider(&self, record: &Value) -> Result<()> {
@@ -726,7 +750,8 @@ impl Model {
         }
         let url = live
             .as_ref()
-            .map(|c| crate::cloud::url(&c.ollama_url, self.selected_name(c)))
+            .map(|c| crate::cloud::try_url(&c.ollama_url, self.selected_name(c)))
+            .transpose()?
             .unwrap_or_else(|| self.url.clone());
         let url = self
             .pinned_target
@@ -741,10 +766,20 @@ impl Model {
         } else {
             timeout
         };
+        let named = crate::connections::resolve(name)?;
+        let url = named
+            .as_ref()
+            .map_or(url, |resolved| resolved.connection.endpoint());
+        let named_openai = named.as_ref().is_some_and(|resolved| {
+            resolved.connection.kind == crate::connections::Kind::OpenAICompatible
+        });
+        let raw_name = named
+            .as_ref()
+            .map_or(name, |resolved| resolved.model_id.as_str());
         let groq = crate::groq::model_id(name);
         let cloud = crate::cloud::provider(name);
         let chatgpt = crate::chatgpt::model_id(name);
-        let remote = cloud.is_some() || chatgpt.is_some();
+        let remote = cloud.is_some() || chatgpt.is_some() || named_openai;
         let openai = groq.is_some() || remote;
         // Metadata refresh errors belong to this target as well. Recording a
         // previous model here would let a live switch bypass provider backoff.
@@ -801,7 +836,9 @@ impl Model {
             Some(capabilities)
         };
         // Validate/read credentials before reserving capacity. Never include them in traces.
-        let key = if chatgpt.is_some() {
+        let key = if let Some(resolved) = &named {
+            crate::connections::key(resolved.connection.id)?
+        } else if chatgpt.is_some() {
             Some(self.chatgpt_token(&url)?)
         } else if groq.is_some() {
             Some(crate::groq::key()?)
@@ -854,6 +891,12 @@ impl Model {
         if self.controls.stopped_while_held() {
             return Err(crate::provider::Stopped("Stopped while awaiting inference".into()).into());
         }
+        if named.is_some() {
+            let current = self.provider_target()?;
+            if current.0 != name || current.1 != url {
+                return Err(ProviderTargetChanged.into());
+            }
+        }
         *self.request_target.borrow_mut() = (name.to_owned(), url.clone());
         crate::events::send(crate::events::Event::RequestModel(name.to_owned()));
         crate::events::send(crate::events::Event::Request);
@@ -863,7 +906,7 @@ impl Model {
         } else {
             messages.to_vec()
         };
-        let mut body = json!({"model":name,"messages":wire_messages,"stream":true,"options":{"num_ctx":context,"num_predict":output}});
+        let mut body = json!({"model":raw_name,"messages":wire_messages,"stream":true,"options":{"num_ctx":context,"num_predict":output}});
         if let Some(t) = tools {
             body["tools"] = t;
         }
@@ -873,9 +916,12 @@ impl Model {
         if chatgpt.is_some() {
             body =
                 crate::responses::request(name, messages, body.get("tools"), body.get("format"))?;
-        } else if let Some(id) = groq.or_else(|| crate::cloud::model_id(name)) {
+        } else if let Some(id) = groq
+            .or_else(|| crate::cloud::model_id(name))
+            .or_else(|| named_openai.then_some(raw_name))
+        {
             let formatted = body.get("format").is_some();
-            let wire_messages = if cloud.is_some() {
+            let wire_messages = if cloud.is_some() || named_openai {
                 crate::openai::messages_for(messages, name)?
             } else {
                 crate::openai::messages(messages)?
@@ -895,7 +941,7 @@ impl Model {
             if let Some(t) = body.get("tools") {
                 wire["tools"] = t.clone();
             }
-            if formatted && (groq.is_some() || crate::cloud::supports_json(name)?) {
+            if formatted && (groq.is_some() || named_openai || crate::cloud::supports_json(name)?) {
                 wire["response_format"] = json!({"type":"json_object"});
             }
             body = wire;
@@ -922,7 +968,7 @@ impl Model {
         } else {
             None
         };
-        let cloud_client = if openai {
+        let cloud_client = if openai || named.is_some() {
             Some(crate::groq::client()?)
         } else {
             None
@@ -1046,7 +1092,15 @@ impl Model {
                 }
             })?;
             if let Some(file) = trace.as_mut() {
-                writeln!(file, "{line}")?;
+                let safe_line = if named.is_some() {
+                    key.as_deref()
+                        .filter(|key| !key.is_empty())
+                        .map(|key| line.replace(key, "[redacted]"))
+                        .unwrap_or_else(|| line.clone())
+                } else {
+                    line.clone()
+                };
+                writeln!(file, "{safe_line}")?;
             }
             if line.is_empty() {
                 continue;
@@ -1157,6 +1211,9 @@ impl Model {
                 {
                     return Err(provider.into());
                 }
+                if named.is_some() {
+                    bail!("Saved connection returned a stream error");
+                }
                 bail!("Model provider stream error: {e}")
             }
             if let Some(s) = d["message"]["thinking"].as_str() {
@@ -1237,7 +1294,7 @@ impl Model {
                 reply["_chuggin_responses"] = json!({"model":name,"items":items});
             }
         }
-        if cloud.is_some() && !self.watchdog_call.get() {
+        if (cloud.is_some() || named_openai) && !self.watchdog_call.get() {
             reply["_chuggin_reasoning"] =
                 json!({"model":name,"content":thinking,"details":stream.reasoning_details});
         }
@@ -3133,6 +3190,253 @@ mod zen_live_tests {
         assert_eq!(reply["token"], "CHUGGIN_ZEN_ROUNDTRIP_OK");
         println!(
             "Public Zen tool request and JSON reply succeeded through Chuggin's production client."
+        );
+    }
+}
+
+#[cfg(test)]
+mod named_connection_transport_tests {
+    use super::*;
+    use crate::connections::{self, Kind};
+
+    fn request(socket: &std::net::TcpStream) -> (String, String, Value) {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        let mut headers = String::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap();
+            }
+            headers.push_str(&line);
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        (
+            first,
+            headers,
+            if body.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&body).unwrap()
+            },
+        )
+    }
+    fn reply(socket: &mut std::net::TcpStream, content_type: &str, body: &str) {
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    }
+    fn model(name: &str) -> Model {
+        Model::new(
+            "http://127.0.0.1:1/legacy-must-not-be-used",
+            name,
+            32768,
+            2048,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn two_named_ollama_endpoints_discover_and_infer_with_raw_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = connections::test_directory(directory.path());
+        let mut servers = Vec::new();
+        let mut saved = Vec::new();
+        for index in 0..2 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let connection = connections::save(
+                None,
+                &format!("GPU {index}"),
+                Kind::Ollama,
+                &format!("http://{}/proxy", listener.local_addr().unwrap()),
+                Some("native-fixture-key"),
+            )
+            .unwrap();
+            saved.push(connection);
+            servers.push(std::thread::spawn(move || {
+                for round in 0..3 {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    let (first, headers, body) = request(&socket);
+                    assert!(headers.to_lowercase().contains("authorization: bearer native-fixture-key"));
+                    match round {
+                        0 => { assert!(first.starts_with("GET /proxy/api/tags ")); reply(&mut socket,"application/json",r#"{"models":[{"name":"org/shared:latest"}]}"#); },
+                        1 => { assert!(first.starts_with("POST /proxy/api/show ")); assert_eq!(body["model"],"org/shared:latest"); reply(&mut socket,"application/json",r#"{"thinking":{"values":[true,false]},"capabilities":["completion"]}"#); },
+                        _ => {
+                            assert!(first.starts_with("POST /proxy/api/chat "));
+                            assert_eq!(body["model"],"org/shared:latest");
+                            assert_eq!(body["think"],true);
+                            assert_eq!(body["options"]["temperature"],0.4);
+                            assert!(body.get("provider").is_none());
+                            reply(&mut socket,"application/x-ndjson",&format!("{}\n",json!({"message":{"content":format!("GPU {index}")},"done":true,"prompt_eval_count":100+index,"eval_count":3,"eval_duration":1_000_000})));
+                        }
+                    }
+                }
+            }));
+        }
+        for (index, connection) in saved.iter().enumerate() {
+            let catalog = connections::catalog(connection.id).unwrap();
+            assert_eq!(catalog[0].id, "org/shared:latest");
+            let name = connections::route(connection.id, &catalog[0].id);
+            let mut inference = model(&name);
+            inference.set_reasoning(crate::reasoning::Setting::On);
+            assert_eq!(
+                inference
+                    .chat_format_once(&[json!({"role":"user","content":"Hi"})], None, None)
+                    .unwrap()["content"],
+                format!("GPU {index}")
+            );
+            assert_eq!(inference.take_context_usage().unwrap().model, name);
+        }
+        for server in servers {
+            server.join().unwrap();
+        }
+        assert_ne!(saved[0].endpoint(), saved[1].endpoint());
+        let duplicate = connections::save(
+            None,
+            "Same GPU renamed connection",
+            Kind::Ollama,
+            &saved[0].base_url,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            duplicate.endpoint(),
+            saved[0].endpoint(),
+            "queue identity is endpoint URL, not connection name or model"
+        );
+    }
+
+    #[test]
+    fn custom_sse_tools_continue_after_rename_without_vendor_limits_or_token_traces() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = connections::test_directory(directory.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let connection = connections::save(
+            None,
+            "Custom",
+            Kind::OpenAICompatible,
+            &format!(
+                "http://{}/proxy/v1/chat/completions",
+                listener.local_addr().unwrap()
+            ),
+            Some("custom-fixture-secret"),
+        )
+        .unwrap();
+        let name = connections::route(connection.id, "org/tool-model");
+        let server = std::thread::spawn(move || {
+            for round in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let (first, headers, body) = request(&socket);
+                assert!(first.starts_with("POST /proxy/v1/chat/completions "));
+                assert!(
+                    headers
+                        .to_lowercase()
+                        .contains("authorization: bearer custom-fixture-secret")
+                );
+                assert_eq!(body["model"], "org/tool-model");
+                assert_eq!(body["max_tokens"], 2048);
+                assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+                for absent in [
+                    "provider",
+                    "options",
+                    "temperature",
+                    "reasoning_effort",
+                    "think",
+                    "max_completion_tokens",
+                ] {
+                    assert!(body.get(absent).is_none(), "{absent}");
+                }
+                if round == 0 {
+                    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+                    let chunks = [
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_named","type":"function","function":{"name":"lookup","arguments":"{\"value\":"}}]},"finish_reason":null}]}),
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"7}"}}]},"finish_reason":"tool_calls"}]}),
+                        json!({"choices":[],"usage":{"prompt_tokens":71,"completion_tokens":9}}),
+                    ];
+                    reply(
+                        &mut socket,
+                        "text/event-stream",
+                        &format!(
+                            "{}data: [DONE]\n\n",
+                            chunks
+                                .iter()
+                                .map(|chunk| format!("data: {chunk}\n\n"))
+                                .collect::<String>()
+                        ),
+                    );
+                } else {
+                    assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_named");
+                    assert_eq!(
+                        body["messages"][1]["tool_calls"][0]["function"]["arguments"],
+                        "{\"value\":7}"
+                    );
+                    assert_eq!(body["messages"][2]["tool_call_id"], "call_named");
+                    assert_eq!(body["messages"][2]["content"], "tool result retained");
+                    reply(
+                        &mut socket,
+                        "text/event-stream",
+                        &format!(
+                            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            json!({"choices":[{"delta":{"content":"complete"},"finish_reason":"stop"}]}),
+                            json!({"choices":[],"usage":{"prompt_tokens":83,"completion_tokens":4}})
+                        ),
+                    );
+                }
+            }
+        });
+        let inference = model(&name);
+        let trace = tempfile::tempdir().unwrap();
+        inference.trace_to(trace.path());
+        let tools = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"value":{"type":"integer"}}}}}]);
+        let user = json!({"role":"user","content":"lookup seven"});
+        let first = inference
+            .chat(std::slice::from_ref(&user), Some(tools.clone()), false)
+            .unwrap();
+        assert_eq!(
+            first["tool_calls"][0]["function"]["arguments"],
+            json!({"value":7})
+        );
+        connections::save(
+            Some(connection.id),
+            "Renamed custom",
+            connection.kind,
+            &connection.base_url,
+            None,
+        )
+        .unwrap();
+        let result = inference.chat(&[user,first,json!({"role":"tool","tool_call_id":"call_named","content":"tool result retained"})],Some(tools),false).unwrap();
+        assert_eq!(result["content"], "complete");
+        assert_eq!(inference.take_context_usage().unwrap().model, name);
+        server.join().unwrap();
+        for file in std::fs::read_dir(trace.path()).unwrap() {
+            assert!(
+                !std::fs::read_to_string(file.unwrap().path())
+                    .unwrap()
+                    .contains("custom-fixture-secret")
+            );
+        }
+        connections::delete(connection.id).unwrap();
+        let error = inference.chat(&[], None, false).unwrap_err();
+        assert!(error.to_string().contains("missing or was deleted"));
+        assert!(!error.to_string().contains("custom-fixture-secret"));
+        assert!(
+            Model::new(
+                "http://localhost:11434",
+                &name,
+                8192,
+                1024,
+                Arc::new(AtomicBool::new(false))
+            )
+            .is_err()
         );
     }
 }

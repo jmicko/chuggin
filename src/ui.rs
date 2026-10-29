@@ -344,9 +344,10 @@ pub fn home_select(
     status: &str,
 ) -> Result<Option<usize>> {
     clear_notes();
+    let model = crate::model_picker::display_model(model);
     let mut index = 0;
     loop {
-        draw(|f| splash(f, items, index, project, model, status))?;
+        draw(|f| splash(f, items, index, project, &model, status))?;
         if let Some(e) = input()?
             && let Some(k) = pressed(&e)
         {
@@ -535,12 +536,12 @@ pub fn select_model(
             .iter()
             .map(|i| clean(&entries[*i].row(current)))
             .collect();
-        rows.extend([
-            "Refresh model list".into(),
-            "Connection settings…".into(),
-            "Choose another provider".into(),
-            "Cancel selection".into(),
-        ]);
+        rows.extend(["Refresh model list".into(), "Connection settings…".into()]);
+        let manual = matches!(provider, crate::model_picker::Provider::Named(_));
+        if manual {
+            rows.push("Enter model ID…".into());
+        }
+        rows.extend(["Choose another provider".into(), "Cancel selection".into()]);
         index = index.min(rows.len() - 1);
         let selected_detail = visible.get(index).map(|i| entries[*i].details()).unwrap_or_else(|| if visible.is_empty() { "No matching selectable models. Refresh, change provider, or press A to inspect all catalog entries.".into() } else { "Choose an action below.".into() });
         let missing_current = !current.is_empty() && !entries.iter().any(|e| e.id == current);
@@ -556,7 +557,10 @@ pub fn select_model(
             selected_detail,
             provider.description(),
             if missing_current {
-                format!("\nCurrent selection {current} is not listed by this provider.")
+                format!(
+                    "\nCurrent selection {} is not listed by this provider.",
+                    crate::model_picker::display_model(current)
+                )
             } else {
                 String::new()
             },
@@ -577,7 +581,8 @@ pub fn select_model(
                 Some(i) if i < visible.len() => Action::Select(visible[i]),
                 Some(i) if i == visible.len() => Action::Refresh,
                 Some(i) if i == visible.len() + 1 => Action::Connection,
-                Some(i) if i == visible.len() + 2 => Action::Provider,
+                Some(i) if manual && i == visible.len() + 2 => Action::Manual,
+                Some(i) if i == visible.len() + 2 + usize::from(manual) => Action::Provider,
                 Some(_) => Action::Cancel,
                 None => Action::Provider,
             });
@@ -592,6 +597,8 @@ pub fn select_model(
                 &detail,
                 if searching {
                     "Type to search · Enter browse · Esc clear search"
+                } else if manual {
+                    "↑ ↓ select · Enter choose · / search · R refresh\nC connection · M model ID · A all entries · Esc providers"
                 } else {
                     "↑ ↓ select · Enter choose · / search · R refresh\nC connection · A all entries · Esc providers"
                 },
@@ -646,6 +653,7 @@ pub fn select_model(
                     KeyCode::Char('/') => searching = true,
                     KeyCode::Char('r' | 'R') => return Ok(Action::Refresh),
                     KeyCode::Char('c' | 'C') => return Ok(Action::Connection),
+                    KeyCode::Char('m' | 'M') if manual => return Ok(Action::Manual),
                     KeyCode::Char('a' | 'A') => {
                         all = !all;
                         index = 0;
@@ -662,7 +670,8 @@ pub fn select_model(
                             return Ok(match index - visible.len() {
                                 0 => Action::Refresh,
                                 1 => Action::Connection,
-                                2 => Action::Provider,
+                                2 if manual => Action::Manual,
+                                n if n == 2 + usize::from(manual) => Action::Provider,
                                 _ => Action::Cancel,
                             });
                         }
@@ -1924,7 +1933,10 @@ fn settings_lines(d: &Dashboard, c: &runner::Config) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("↑↓ select · Enter edit/save · Ctrl+U clear · Esc cancel"),
         Line::from("Model, thinking, token limits and timeout apply to the NEXT request."),
-        Line::from(format!("Current/last request model: {}", d.active_model)),
+        Line::from(format!(
+            "Current/last request model: {}",
+            crate::model_picker::display_model(&d.active_model)
+        )),
         Line::from("Timer changes apply now, measured from this run's start."),
         Line::from("An expired timer finishes the cycle; it never cancels a call."),
         Line::from("Command review changes apply when the next command starts."),
@@ -2409,15 +2421,17 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         let model = if let Some(helper) = &d.helper {
             vec![
                 Line::from("HELPER MODEL").fg(CYAN).bold(),
-                Line::from(if helper.model.is_empty() {
-                    if c.helpers.model.is_empty() {
-                        c.model.clone()
+                Line::from(crate::model_picker::display_model(
+                    if helper.model.is_empty() {
+                        if c.helpers.model.is_empty() {
+                            &c.model
+                        } else {
+                            &c.helpers.model
+                        }
                     } else {
-                        c.helpers.model.clone()
-                    }
-                } else {
-                    helper.model.clone()
-                }),
+                        &helper.model
+                    },
+                )),
                 Line::from(if paused {
                     "Ⅱ Investigation paused".into()
                 } else if let Some((reason, seconds)) = &helper.wait {
@@ -2439,7 +2453,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         } else {
             vec![
                 Line::from("MODEL").fg(CYAN).bold(),
-                Line::from(d.active_model.clone()),
+                Line::from(crate::model_picker::display_model(&d.active_model)),
                 Line::from(if d.finished.is_some() {
                     "○ Idle · no work running".to_owned()
                 } else if paused {
@@ -3524,6 +3538,45 @@ mod tests {
         assert!(screen_text(&terminal).contains("Provider: OpenRouter"));
         assert_eq!(c.model, "example-model:latest");
     }
+
+    #[test]
+    fn named_connection_labels_follow_renames_without_exposing_saved_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::connections::test_directory(temp.path());
+        let connection = crate::connections::save(
+            None,
+            "Desktop",
+            crate::connections::Kind::Ollama,
+            "http://127.0.0.1:1",
+            None,
+        )
+        .unwrap();
+        let mut c = config();
+        c.model = crate::connections::route(connection.id, "example-model:latest");
+        let mut d = Dashboard::new(&c);
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut d, &c, false))
+            .unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.contains("Desktop"));
+        assert!(text.contains("example-model:latest"));
+        assert!(!text.contains("connection/"));
+        crate::connections::save(
+            Some(connection.id),
+            "Renamed computer",
+            connection.kind,
+            &connection.base_url,
+            None,
+        )
+        .unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut d, &c, false))
+            .unwrap();
+        assert!(screen_text(&terminal).contains("Renamed computer"));
+        assert_eq!(d.active_model, c.model);
+    }
+
     #[test]
     fn common_token_settings_remain_visible_at_small_terminal_sizes() {
         let mut c = config();
@@ -3804,7 +3857,7 @@ mod tests {
         assert_eq!(e.value, "héllo\nworld");
     }
     fn config() -> runner::Config {
-        runner::Config {execution:crate::sandbox::Settings::default(),activity_mode:crate::activity::Mode::Goal,sampling:crate::sampling::Settings::default(),setup_sampling:crate::sampling::Settings::default(),chat_sampling:crate::sampling::Settings::default(),reasoning:crate::reasoning::Setting::Default,setup_model:String::new(),setup_reasoning:crate::reasoning::Setting::Default,chat_reasoning:crate::reasoning::Setting::Default,helpers:crate::agents::Settings::default(),chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
+        runner::Config {self_profile:crate::self_profile::Variant::Baseline,execution:crate::sandbox::Settings::default(),activity_mode:crate::activity::Mode::Goal,sampling:crate::sampling::Settings::default(),setup_sampling:crate::sampling::Settings::default(),chat_sampling:crate::sampling::Settings::default(),reasoning:crate::reasoning::Setting::Default,setup_model:String::new(),setup_reasoning:crate::reasoning::Setting::Default,chat_reasoning:crate::reasoning::Setting::Default,helpers:crate::agents::Settings::default(),chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}
     }
     fn screen_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();

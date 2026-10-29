@@ -805,6 +805,166 @@ fn chaos_continues_without_tasks_or_idle_delays_and_retains_conversation_on_rest
 }
 
 #[test]
+fn self_profile_tools_update_and_survive_a_cold_resume_without_assigning_a_goal() {
+    let server = Server::custom(false, false, None, |body, n| {
+        let messages = body["messages"].as_array().unwrap();
+        let snapshots: Vec<Value> = messages
+            .iter()
+            .filter_map(|message| {
+                let content: Value = serde_json::from_str(message["content"].as_str()?).ok()?;
+                (content["kind"] == "model_authored_self_profile").then_some(content)
+            })
+            .collect();
+        let latest = snapshots.last().unwrap();
+        assert!(
+            body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "update_self_profile")
+        );
+        assert!(!messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("Improve value incrementally"))
+        }));
+        match n {
+            0 => {
+                assert_eq!(latest["revision"], 0);
+                assert_eq!(latest["profile"]["profile"]["interests"], json!([]));
+                (
+                    String::new(),
+                    json!([{"function":{"name":"read_self_profile","arguments":{"action":"read"}}}]),
+                )
+            }
+            1 => {
+                assert_eq!(latest["revision"], 0);
+                (
+                    String::new(),
+                    json!([{"function":{"name":"update_self_profile","arguments":{
+                        "expected_revision":0,"reason":"A provisional interest after an observation",
+                        "evidence":["Synthetic observation"],
+                        "patch":{"interests":["Comparing leaf shapes"],"open_questions":["Which shapes recur?"]}
+                    }}}]),
+                )
+            }
+            2..=4 => {
+                assert_eq!(latest["revision"], if n == 4 { 2 } else { 1 });
+                assert_eq!(
+                    latest["profile"]["profile"]["interests"],
+                    json!(["Comparing leaf shapes"])
+                );
+                if n == 3 {
+                    return (
+                        String::new(),
+                        json!([{"function":{"name":"update_self_profile","arguments":{
+                            "expected_revision":1,"reason":"Reconsidering a tendency after resuming",
+                            "patch":{"tendencies":["Compare observations before generalizing"]}
+                        }}}]),
+                    );
+                }
+                (format!("A short observation {n}."), json!([]))
+            }
+            _ => panic!("Unexpected request {n}"),
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = chaos_fixture(root.path(), &server.url);
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["self_profile"] = json!("self_directed");
+    fs::write(&path, config.to_string()).unwrap();
+    run_cycles_bounded(root.path(), 1);
+    // Retain previously collected repetition evidence across restart and a
+    // successful profile edit. A changed self-description is not work progress.
+    let conversation_path = root.path().join("state/conversation.json");
+    let mut previous: Value =
+        serde_json::from_slice(&fs::read(&conversation_path).unwrap()).unwrap();
+    previous["command_watch"]["count"] = json!(7);
+    previous["action_watch"]["evidence_revision"] = json!(12);
+    fs::write(&conversation_path, previous.to_string()).unwrap();
+    run_cycles_bounded(root.path(), 1);
+    assert_eq!(server.requests.lock().unwrap().len(), 5);
+    assert_eq!(
+        fs::read_to_string(root.path().join("repo/value.txt")).unwrap(),
+        "USER_EDIT"
+    );
+    assert!(!root.path().join("repo/.git").exists());
+    let saved: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/conversation.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["self_profile_revision"], 2);
+    assert_eq!(saved["self_profile_variant"], "self_directed");
+    assert_eq!(saved["command_watch"]["count"], 7);
+    assert_eq!(saved["action_watch"]["evidence_revision"], 12);
+}
+
+#[test]
+fn self_profile_variant_change_rejects_an_inflight_update_from_the_previous_variant() {
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("chuggin.json");
+    let live_path = config_path.clone();
+    let server = Server::custom(false, false, None, move |body, n| match n {
+        0 => {
+            let mut config: Value = serde_json::from_slice(&fs::read(&live_path).unwrap()).unwrap();
+            config["self_profile"] = json!("personality");
+            fs::write(&live_path, config.to_string()).unwrap();
+            (
+                String::new(),
+                json!([{"function":{"name":"update_self_profile","arguments":{
+                    "expected_revision":0,"reason":"This call was requested under the previous variant",
+                    "patch":{"interests":["Must not enter either profile"]}
+                }}}]),
+            )
+        }
+        1 => {
+            let tool_result = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "tool")
+                .unwrap();
+            assert!(tool_result["content"].as_str().unwrap().contains("changed"));
+            let update = body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["function"]["name"] == "update_self_profile")
+                .unwrap();
+            assert!(
+                !update["function"]["parameters"]["properties"]["patch"]["properties"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("interests")
+            );
+            (
+                "Continuing with the selected profile variant.".into(),
+                json!([]),
+            )
+        }
+        _ => panic!("Unexpected request {n}"),
+    });
+    chaos_fixture(root.path(), &server.url);
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["self_profile"] = json!("self_directed");
+    fs::write(&config_path, config.to_string()).unwrap();
+    run_cycles_bounded(root.path(), 1);
+    assert!(
+        !root
+            .path()
+            .join("state/self-profile/self_directed/head.json")
+            .exists()
+    );
+    assert!(
+        !root
+            .path()
+            .join("state/self-profile/personality/head.json")
+            .exists()
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
 fn chaos_accepts_silent_responses_across_intervals_and_cold_resume() {
     let server = Server::custom(false, false, None, |_, _| (String::new(), json!([])));
     let root = tempfile::tempdir().unwrap();
@@ -5679,6 +5839,87 @@ mod terminal_ui {
                 .to_string()
                 .contains("Include reliable document persistence.")
         );
+    }
+    #[test]
+    fn named_ollama_can_be_added_and_selected_without_replacing_existing_connections() {
+        let existing_server = Server::new(false, false);
+        let added_server = Server::new(false, false);
+        *added_server.catalog.lock().unwrap() = json!({"models":[{"name":"org/shared:latest"}]});
+        let root = tempfile::tempdir().unwrap();
+        let config_path = chaos_fixture(root.path(), &existing_server.url);
+        let mut expected: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        let original_project = fs::read(&config_path).unwrap();
+        let shared = root.path().join(".chuggin/global/chuggin/settings.json");
+        let registry = shared.with_file_name("connections/registry.json");
+        fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        fs::write(
+            &shared,
+            json!({"model":"shared-model","ollama_url":existing_server.url}).to_string(),
+        )
+        .unwrap();
+        let original_defaults = fs::read(&shared).unwrap();
+        let existing = json!({"id":7,"name":"Existing Workstation","kind":"ollama",
+            "base_url":existing_server.url});
+        fs::write(
+            &registry,
+            json!({"next_id":7,"connections":[existing.clone()]}).to_string(),
+        )
+        .unwrap();
+
+        let mut ui = TerminalProcess::start(root.path());
+        ui.home();
+        ui.choose("Global settings");
+        ui.choose("Inference providers");
+        ui.wait("Inference providers · shared connections");
+        ui.choose("Add Ollama connection");
+        ui.wait("Connection name");
+        ui.send(b"\x15Second Workstation\r");
+        ui.wait("Base URL");
+        ui.send(format!("\x15{}\r", added_server.url).as_bytes());
+        ui.wait("Optional connection API key");
+        ui.choose("No API key");
+        ui.wait("Second Workstation · shared connection");
+        ui.wait("Optional · not configured");
+        ui.home();
+
+        assert_eq!(fs::read(&config_path).unwrap(), original_project);
+        assert_eq!(fs::read(&shared).unwrap(), original_defaults);
+        assert_eq!(added_server.catalog_requests.load(Ordering::SeqCst), 0);
+        ui.project_setting("Project model");
+        ui.wait("Inference provider");
+        ui.wait("Existing Workstation");
+        ui.wait("Second Workstation");
+        // The selected legacy Ollama row precedes OpenAI, Zen, OpenRouter,
+        // the existing named server and the newly added named server.
+        ui.send(b"\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r");
+        ui.wait("Choose model for this project");
+        ui.wait("org/shared:latest");
+        ui.wait("Second Workstation");
+        ui.send(b"\r");
+        ui.home();
+        ui.wait("Second Workstation · org/shared:latest");
+        assert!(!ui.parser.screen().contents().contains("connection/8/"));
+        ui.send(b"q");
+        ui.restored();
+
+        expected["model"] = json!("connection/8/org/shared:latest");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&config_path).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(fs::read(&shared).unwrap(), original_defaults);
+        let connections: Value = serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
+        assert_eq!(connections["connections"].as_array().unwrap().len(), 2);
+        assert_eq!(connections["connections"][0], existing);
+        assert_eq!(connections["connections"][1]["id"], 8);
+        assert_eq!(connections["connections"][1]["name"], "Second Workstation");
+        assert_eq!(connections["connections"][1]["base_url"], added_server.url);
+        assert!(!registry.with_file_name("8.key").exists());
+        assert_eq!(existing_server.catalog_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(added_server.catalog_requests.load(Ordering::SeqCst), 1);
+        assert!(existing_server.requests.lock().unwrap().is_empty());
+        assert!(added_server.requests.lock().unwrap().is_empty());
+        assert!(!root.path().join("state/state.json").exists());
     }
 }
 

@@ -12,6 +12,7 @@ pub enum Provider {
     OpenAI,
     Zen,
     OpenRouter,
+    Named(u64),
 }
 pub const PROVIDERS: [Provider; 5] = [
     Provider::Groq,
@@ -24,6 +25,8 @@ impl Provider {
     pub fn for_model(name: &str) -> Option<Self> {
         if name.is_empty() {
             None
+        } else if let Ok(Some((id, _))) = crate::connections::route_parts(name) {
+            Some(Self::Named(id))
         } else if crate::chatgpt::model_id(name).is_some() {
             Some(Self::OpenAI)
         } else if crate::groq::model_id(name).is_some() {
@@ -36,22 +39,28 @@ impl Provider {
             })
         }
     }
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Self::Groq => "Groq",
-            Self::Ollama => "Ollama",
-            Self::OpenAI => "OpenAI · ChatGPT plan",
-            Self::Zen => "OpenCode Zen",
-            Self::OpenRouter => "OpenRouter",
+            Self::Groq => "Groq".into(),
+            Self::Ollama => "Ollama".into(),
+            Self::OpenAI => "OpenAI · ChatGPT plan".into(),
+            Self::Zen => "OpenCode Zen".into(),
+            Self::OpenRouter => "OpenRouter".into(),
+            Self::Named(id) => crate::connections::get(id)
+                .map(|connection| connection.name)
+                .unwrap_or_else(|_| format!("Connection {id} · unavailable")),
         }
     }
-    fn endpoint(self, local_url: &str) -> &str {
+    fn endpoint(self, local_url: &str) -> String {
         match self {
-            Self::Groq => crate::groq::ENDPOINT,
-            Self::Ollama => local_url,
-            Self::OpenAI => "https://api.openai.com/v1",
-            Self::Zen => "https://opencode.ai/zen/v1",
-            Self::OpenRouter => "https://openrouter.ai/api/v1",
+            Self::Groq => crate::groq::ENDPOINT.into(),
+            Self::Ollama => local_url.into(),
+            Self::OpenAI => "https://api.openai.com/v1".into(),
+            Self::Zen => "https://opencode.ai/zen/v1".into(),
+            Self::OpenRouter => "https://openrouter.ai/api/v1".into(),
+            Self::Named(id) => crate::connections::get(id)
+                .map(|connection| connection.base_url)
+                .unwrap_or_else(|_| "Connection unavailable".into()),
         }
     }
     fn credential_ready(self) -> Result<bool> {
@@ -61,7 +70,7 @@ impl Provider {
             Self::OpenAI => crate::chatgpt::accounts()?
                 .iter()
                 .any(|a| a.active && a.connected && a.plan_enabled),
-            Self::Ollama | Self::Zen => true,
+            Self::Ollama | Self::Zen | Self::Named(_) => true,
         })
     }
     fn status(self, local_url: &str) -> Result<String> {
@@ -75,6 +84,19 @@ impl Provider {
             }
             Self::Zen => "Anonymous · live free catalog".into(),
             Self::OpenAI => crate::chatgpt::account_status()?,
+            Self::Named(id) => {
+                let connection = crate::connections::get(id)?;
+                format!(
+                    "{} · {}{}",
+                    connection.kind.label(),
+                    connection.base_url,
+                    if crate::connections::has_key(id)? {
+                        " · key configured"
+                    } else {
+                        ""
+                    }
+                )
+            }
             _ if self.credential_ready()? => "API key configured".into(),
             _ => "Add API key".into(),
         })
@@ -96,7 +118,19 @@ impl Provider {
             Self::OpenRouter => {
                 "The catalog checks current zero-cost models with tool support. An API key is needed for inference. Free access has provider and account limits; paid fallback remains disabled."
             }
+            Self::Named(_) => {
+                "Models available through this named connection. Its server controls model support, pricing and limits. Refresh the catalog or enter an exact model ID when the server does not offer discovery."
+            }
         }
+    }
+}
+
+/// Keep the connection identity in saved configuration, and its name in the UI.
+pub fn display_model(model: &str) -> String {
+    if let Ok(Some((id, raw))) = crate::connections::route_parts(model) {
+        format!("{} · {raw}", Provider::Named(id).label())
+    } else {
+        model.into()
     }
 }
 
@@ -124,7 +158,12 @@ impl Entry {
         )
     }
     pub fn details(&self) -> String {
-        let mut detail = format!("{}\nModel ID: {}\n{}", self.name, self.id, self.badge);
+        let model = crate::connections::route_parts(&self.id)
+            .ok()
+            .flatten()
+            .map(|(_, model)| model)
+            .unwrap_or(&self.id);
+        let mut detail = format!("{}\nModel ID: {}\n{}", self.name, model, self.badge);
         if let Some(context) = self.context {
             detail.push_str(&format!(" · context: {context} tokens"));
         }
@@ -155,6 +194,7 @@ pub enum Action {
     Select(usize),
     Refresh,
     Connection,
+    Manual,
     Provider,
     Cancel,
 }
@@ -206,6 +246,12 @@ fn load(provider: Provider, local_url: &str) -> Result<Vec<Entry>> {
                 Entry { id:entry.id, name:entry.name, context:entry.context_tokens, output:entry.output_tokens, selectable, explanation, badge:match entry.pricing { crate::cloud::PriceStatus::Free => "Free · access limits apply", crate::cloud::PriceStatus::Paid => "Paid · unavailable here", crate::cloud::PriceStatus::Unknown => "Pricing unconfirmed" }.into() }
             }).collect())
         }
+        Provider::Named(id) => Ok(crate::connections::catalog(id)?.into_iter().map(|model| Entry {
+            id:crate::connections::route(id, &model.id), name:model.name,
+            badge:"Named connection · server limits apply".into(), context:model.context_tokens,
+            output:model.output_tokens, selectable:true,
+            explanation:"Listed by this connection. Selecting a model does not generate a response; model capability and access are verified when a request runs.".into(),
+        }).collect()),
     }
 }
 
@@ -217,23 +263,37 @@ fn fetch(provider: Provider, url: &str) -> Result<Vec<Entry>> {
     )
 }
 
+fn providers() -> Result<Vec<Provider>> {
+    Ok(PROVIDERS
+        .into_iter()
+        .chain(
+            crate::connections::list()?
+                .into_iter()
+                .map(|connection| Provider::Named(connection.id)),
+        )
+        .collect())
+}
+
 /// Both back levels are ordinary navigation. A refresh never commits a selection.
 pub fn choose(current: &str, local_url: &str, title: &str) -> Result<Option<Selection>> {
     let mut url = local_url.to_owned();
-    let mut provider_index = Provider::for_model(current)
-        .and_then(|provider| PROVIDERS.iter().position(|p| *p == provider))
-        .unwrap_or(0);
+    let mut selected_provider = Provider::for_model(current).unwrap_or(PROVIDERS[0]);
     loop {
+        let providers = providers()?;
+        let provider_index = providers
+            .iter()
+            .position(|provider| *provider == selected_provider)
+            .unwrap_or(0);
         crate::ui::clear_notes();
         crate::ui::notice(format!(
             "{title}\nCurrent model: {}\nChoose a provider, then browse its live model catalog. Connections are shared; this selection only changes the requested model role.",
             if current.is_empty() {
-                "Not selected"
+                "Not selected".into()
             } else {
-                current
+                display_model(current)
             }
         ));
-        let mut rows = PROVIDERS
+        let mut rows = providers
             .iter()
             .map(|p| Ok(format!("{} · {}", p.label(), p.status(&url)?)))
             .collect::<Result<Vec<_>>>()?;
@@ -244,7 +304,7 @@ pub fn choose(current: &str, local_url: &str, title: &str) -> Result<Option<Sele
         let Some(index) = crate::menu::select("Inference provider", &rows, provider_index)? else {
             return Ok(None);
         };
-        if index == PROVIDERS.len() {
+        if index == providers.len() {
             let old_url = crate::setup::settings()?.ollama_url;
             connections_menu()?;
             let new_url = crate::setup::settings()?.ollama_url;
@@ -253,10 +313,10 @@ pub fn choose(current: &str, local_url: &str, title: &str) -> Result<Option<Sele
             }
             continue;
         }
-        let Some(provider) = PROVIDERS.get(index).copied() else {
+        let Some(provider) = providers.get(index).copied() else {
             return Ok(None);
         };
-        provider_index = index;
+        selected_provider = provider;
         let mut selected = current.to_owned();
         loop {
             if matches!(provider, Provider::OpenAI | Provider::Groq)
@@ -293,22 +353,28 @@ pub fn choose(current: &str, local_url: &str, title: &str) -> Result<Option<Sele
                         "Could not refresh {} models.\n{error:#}\nYour selected model has not changed.",
                         provider.label()
                     ));
-                    match crate::menu::select(
-                        "Model catalog unavailable",
-                        &[
-                            "Retry catalog refresh".into(),
-                            "Connection settings…".into(),
-                            "Choose another provider".into(),
-                            "Cancel selection".into(),
-                        ],
-                        0,
-                    )? {
+                    let mut actions = vec![
+                        "Retry catalog refresh".into(),
+                        "Connection settings…".into(),
+                        "Choose another provider".into(),
+                        "Cancel selection".into(),
+                    ];
+                    if matches!(provider, Provider::Named(_)) {
+                        actions.insert(2, "Enter model ID…".into());
+                    }
+                    match crate::menu::select("Model catalog unavailable", &actions, 0)? {
                         Some(0) => continue,
                         Some(1) => {
                             edit_connection(provider, &mut url)?;
                             continue;
                         }
-                        Some(3) => return Ok(None),
+                        Some(2) if matches!(provider, Provider::Named(_)) => {
+                            if let Some(selection) = manual_model(provider, current)? {
+                                return Ok(Some(selection));
+                            }
+                            continue;
+                        }
+                        Some(index) if index == actions.len() - 1 => return Ok(None),
                         _ => break,
                     }
                 }
@@ -343,12 +409,50 @@ pub fn choose(current: &str, local_url: &str, title: &str) -> Result<Option<Sele
                 Action::Refresh => continue,
                 Action::Connection => {
                     edit_connection(provider, &mut url)?;
+                    if let Provider::Named(id) = provider
+                        && crate::connections::get(id).is_err()
+                    {
+                        break;
+                    }
+                }
+                Action::Manual => {
+                    if let Some(selection) = manual_model(provider, current)? {
+                        return Ok(Some(selection));
+                    }
                 }
                 Action::Provider => break,
                 Action::Cancel => return Ok(None),
             }
         }
     }
+}
+
+fn manual_model(provider: Provider, current: &str) -> Result<Option<Selection>> {
+    let Provider::Named(id) = provider else {
+        return Ok(None);
+    };
+    let connection = crate::connections::get(id)?;
+    let default = crate::connections::route_parts(current)?
+        .filter(|(current_id, _)| *current_id == id)
+        .map(|(_, model)| model)
+        .unwrap_or("");
+    crate::ui::clear_notes();
+    crate::ui::notice(format!(
+        "Enter the exact model ID for {}. This saves the selection without generating a response. The server will verify the model when a request runs. Leave it blank to return to the catalog.",
+        connection.name
+    ));
+    let model = crate::setup::ask("Model ID", default)?;
+    if model.is_empty() {
+        return Ok(None);
+    }
+    ensure!(
+        !model.chars().any(char::is_whitespace),
+        "Model ID must not contain spaces"
+    );
+    Ok(Some(Selection {
+        model: crate::connections::route(id, &model),
+        local_url: None,
+    }))
 }
 
 fn edit_connection(provider: Provider, url: &mut String) -> Result<()> {
@@ -366,7 +470,8 @@ pub fn connections_menu() -> Result<()> {
         let settings = crate::setup::settings()?;
         crate::ui::clear_notes();
         crate::ui::notice("Manage inference providers in one place. Connections are global; each project and role keeps its own selected model. Catalog tests do not generate responses.".into());
-        let mut rows = PROVIDERS
+        let providers = providers()?;
+        let mut rows = providers
             .iter()
             .map(|p| {
                 Ok(format!(
@@ -376,19 +481,184 @@ pub fn connections_menu() -> Result<()> {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        rows.push("Back".into());
+        rows.extend([
+            "Add Ollama connection…".into(),
+            "Add custom OpenAI-compatible connection…".into(),
+            "Back".into(),
+        ]);
         let selected = Provider::for_model(&settings.model)
-            .and_then(|p| PROVIDERS.iter().position(|v| *v == p))
+            .and_then(|p| providers.iter().position(|v| *v == p))
             .unwrap_or(0);
         let Some(index) =
             crate::menu::select("Inference providers · shared connections", &rows, selected)?
         else {
             return Ok(());
         };
-        let Some(provider) = PROVIDERS.get(index) else {
+        if let Some(provider) = providers.get(index) {
+            connection_menu(*provider)?;
+        } else if index == providers.len() {
+            add_connection(crate::connections::Kind::Ollama)?;
+        } else if index == providers.len() + 1 {
+            add_connection(crate::connections::Kind::OpenAICompatible)?;
+        } else {
             return Ok(());
-        };
-        connection_menu(*provider)?;
+        }
+    }
+}
+
+fn add_connection(kind: crate::connections::Kind) -> Result<()> {
+    crate::ui::clear_notes();
+    crate::ui::notice(format!(
+        "Add a named {} connection. Give each computer or service its own name; adding one preserves your existing connections and model selections. Connections are shared across projects. No request is sent until you test the catalog or select a model.",
+        kind.label()
+    ));
+    let name = crate::setup::ask("Connection name", kind.label())?;
+    let default_url = match kind {
+        crate::connections::Kind::Ollama => "http://localhost:11434",
+        crate::connections::Kind::OpenAICompatible => "http://localhost:8000/v1",
+    };
+    let url = crate::setup::ask("Base URL", default_url)?;
+    let key = match crate::menu::select(
+        "Optional connection API key",
+        &[
+            "No API key".into(),
+            "Enter API key · masked input".into(),
+            "Cancel new connection".into(),
+        ],
+        0,
+    )? {
+        Some(0) => None,
+        Some(1) => Some(prompt_key("Connection API key")?),
+        _ => return Ok(()),
+    };
+    let connection = crate::connections::save(None, &name, kind, &url, key.as_deref())?;
+    named_connection_menu(connection.id)
+}
+
+fn named_connection_menu(id: u64) -> Result<()> {
+    loop {
+        let connection = crate::connections::get(id)?;
+        crate::ui::clear_notes();
+        crate::ui::notice(format!(
+            "{} connection shared across projects. Changes to its URL or key affect the next request wherever it is selected. Renaming preserves saved model selections. Catalog tests list models without generating a response.",
+            connection.kind.label()
+        ));
+        let rows = vec![
+            format!("Name · {}", connection.name),
+            format!("Base URL · {}", connection.base_url),
+            format!(
+                "API key · {}",
+                if crate::connections::has_key(id)? {
+                    "Configured"
+                } else {
+                    "Optional · not configured"
+                }
+            ),
+            "Test catalog connection".into(),
+            "Remove connection…".into(),
+            "Back".into(),
+        ];
+        match crate::menu::select(
+            &format!("{} · shared connection", connection.name),
+            &rows,
+            0,
+        )? {
+            Some(0) => {
+                let name = crate::setup::ask("Connection name", &connection.name)?;
+                crate::connections::save(
+                    Some(id),
+                    &name,
+                    connection.kind,
+                    &connection.base_url,
+                    None,
+                )?;
+            }
+            Some(1) => {
+                let url = crate::setup::ask("Base URL", &connection.base_url)?;
+                crate::connections::save(Some(id), &connection.name, connection.kind, &url, None)?;
+            }
+            Some(2) => edit_named_key(&connection)?,
+            Some(3) => match fetch(Provider::Named(id), "") {
+                Ok(entries) => crate::ui::show(
+                    "Catalog connection works",
+                    &format!(
+                        "{}\n{} models currently listed. This checks the catalog only; it does not generate a response or verify model capabilities or remaining allowance.\n\n{}",
+                        connection.name,
+                        entries.len(),
+                        entries
+                            .iter()
+                            .map(|entry| entry.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                )?,
+                Err(error) => crate::ui::show(
+                    "Catalog connection failed",
+                    &format!(
+                        "{error:#}\n\nUpdate the connection or retry. If this server does not support model discovery, you can enter an exact model ID when choosing a model."
+                    ),
+                )?,
+            },
+            Some(4) => {
+                crate::ui::clear_notes();
+                crate::ui::notice(format!(
+                    "Remove {} ({}) at {}?\n\nThis removes the shared connection and its stored API key. Projects that select models through this connection will need another connection selected before their next request. Other connections and their model selections are preserved.",
+                    connection.name,
+                    connection.kind.label(),
+                    connection.base_url
+                ));
+                if crate::menu::select(
+                    "Remove shared connection",
+                    &[
+                        "Keep connection".into(),
+                        format!("Remove {}", connection.name),
+                    ],
+                    0,
+                )? == Some(1)
+                {
+                    crate::connections::delete(id)?;
+                    return Ok(());
+                }
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn edit_named_key(connection: &crate::connections::Connection) -> Result<()> {
+    crate::ui::clear_notes();
+    crate::ui::notice("The optional Bearer API key is stored privately in your user configuration and shared by projects using this connection. It is never added to project files or model prompts.".into());
+    let key = match crate::menu::select(
+        "Connection API key",
+        &[
+            "Enter or replace key · masked input".into(),
+            "Remove key".into(),
+            "Back".into(),
+        ],
+        0,
+    )? {
+        Some(0) => prompt_key("Connection API key")?,
+        Some(1) => String::new(),
+        _ => return Ok(()),
+    };
+    crate::connections::save(
+        Some(connection.id),
+        &connection.name,
+        connection.kind,
+        &connection.base_url,
+        Some(&key),
+    )?;
+    Ok(())
+}
+
+fn prompt_key(title: &str) -> Result<String> {
+    if crate::ui::active() {
+        crate::ui::ask_secret(&format!("{title} · input is masked"))
+    } else {
+        Ok(dialoguer::Password::new()
+            .with_prompt(title)
+            .allow_empty_password(true)
+            .interact()?)
     }
 }
 
@@ -403,6 +673,9 @@ fn validate_url(url: &str) -> Result<()> {
 }
 
 pub fn connection_menu(provider: Provider) -> Result<()> {
+    if let Provider::Named(id) = provider {
+        return named_connection_menu(id);
+    }
     loop {
         let settings = crate::setup::settings()?;
         crate::ui::clear_notes();
@@ -636,5 +909,105 @@ mod tests {
             cloud.patch("chat_model"),
             json!({"chat_model":"zen/new-model"})
         );
+    }
+
+    #[test]
+    fn named_providers_keep_legacy_order_and_stable_model_routes_after_rename() {
+        use crate::connections::{Kind, save};
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::connections::test_directory(temp.path());
+        let first = save(None, "Desktop", Kind::Ollama, "http://127.0.0.1:1", None).unwrap();
+        let second = save(
+            None,
+            "Custom service",
+            Kind::OpenAICompatible,
+            "http://127.0.0.1:2/v1",
+            Some("test-private-key"),
+        )
+        .unwrap();
+        assert_eq!(
+            providers().unwrap(),
+            [
+                PROVIDERS.to_vec(),
+                vec![Provider::Named(first.id), Provider::Named(second.id)]
+            ]
+            .concat()
+        );
+        let route = crate::connections::route(first.id, "organization/model:latest");
+        assert_eq!(Provider::for_model(&route), Some(Provider::Named(first.id)));
+        save(
+            Some(first.id),
+            "Renamed desktop",
+            Kind::Ollama,
+            &first.base_url,
+            None,
+        )
+        .unwrap();
+        assert_eq!(Provider::Named(first.id).label(), "Renamed desktop");
+        assert_eq!(Provider::for_model(&route), Some(Provider::Named(first.id)));
+        assert_eq!(
+            display_model(&route),
+            "Renamed desktop · organization/model:latest"
+        );
+        assert_eq!(
+            Provider::Ollama
+                .status("http://legacy-server:11434")
+                .unwrap(),
+            "http://legacy-server:11434"
+        );
+        let status = Provider::Named(second.id)
+            .status("http://legacy-server:11434")
+            .unwrap();
+        assert!(status.contains("key configured"));
+        assert!(!status.contains("test-private-key"));
+        let selection = Selection {
+            model: route.clone(),
+            local_url: None,
+        };
+        assert_eq!(selection.patch("model"), json!({"model":route}));
+    }
+
+    #[test]
+    fn named_catalog_uses_its_connection_and_keeps_raw_model_ids_in_routes() {
+        use std::io::{BufRead, BufReader, Write};
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::connections::test_directory(temp.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("GET /v1/models "));
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let body = json!({"data":[{"id":"organization/model:variant","name":"A listed model","context_length":65536,"max_output_tokens":8192}]}).to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let connection = crate::connections::save(
+            None,
+            "Local test service",
+            crate::connections::Kind::OpenAICompatible,
+            &url,
+            None,
+        )
+        .unwrap();
+        let entries = load(Provider::Named(connection.id), "http://127.0.0.1:1").unwrap();
+        server.join().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].id,
+            crate::connections::route(connection.id, "organization/model:variant")
+        );
+        assert_eq!(entries[0].name, "A listed model");
+        assert_eq!(entries[0].context, Some(65536));
+        assert_eq!(entries[0].output, Some(8192));
+        assert!(entries[0].selectable);
     }
 }

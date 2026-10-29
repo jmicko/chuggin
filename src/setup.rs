@@ -73,6 +73,7 @@ pub fn settings() -> Result<Settings> {
 const DRAFT_SETTING_FIELDS: &[&str] = &[
     "execution",
     "activity_mode",
+    "self_profile",
     "sampling",
     "setup_sampling",
     "chat_sampling",
@@ -905,7 +906,7 @@ pub fn wizard() -> Result<PathBuf> {
         crate::ui::notice(format!(
             "Give a short description of this project: what you want to accomplish, any important requirements, and what a successful result would look like. Chuggin will draft a goal for you to review before work starts.\n\nProject: {}\nGoal drafting model: {} on {} (change Setup model in More project settings).",
             root.display(),
-            setup_model,
+            crate::model_picker::display_model(setup_model),
             crate::cloud::label(&s.ollama_url, setup_model)
         ));
         let draft_path = root.join(".chuggin/goal-draft.json");
@@ -1098,7 +1099,7 @@ pub fn wizard() -> Result<PathBuf> {
     }
     let preferences = draft_config(&root)?;
     let mut accepted = json!({"repo":".","goal":goal,"state_dir":".chuggin","helpers":preferences.helpers,"active_hours":{"mode":"shared"},
-        "activity_mode":preferences.activity_mode,"execution":preferences.execution,
+        "activity_mode":preferences.activity_mode,"execution":preferences.execution,"self_profile":preferences.self_profile,
         "sampling":preferences.sampling,"setup_sampling":preferences.setup_sampling,"chat_sampling":preferences.chat_sampling,
         "model":preferences.model,"setup_model":preferences.setup_model,
         "reasoning":preferences.reasoning,"setup_reasoning":preferences.setup_reasoning,"chat_reasoning":preferences.chat_reasoning,
@@ -1296,7 +1297,10 @@ pub fn choose_model(project: Option<&Path>) -> Result<()> {
         }
         save(&settings_path()?, &defaults)?;
     }
-    crate::ui::notice(format!("Model saved: {}", selection.model));
+    crate::ui::notice(format!(
+        "Model saved: {}",
+        crate::model_picker::display_model(&selection.model)
+    ));
     Ok(())
 }
 
@@ -1327,7 +1331,10 @@ pub fn choose_project_model(project: Option<&Path>) -> Result<()> {
             return Ok(());
         }
         save_draft_patch(&root, patch)?;
-        crate::ui::notice(format!("Project model saved: {}", selection.model));
+        crate::ui::notice(format!(
+            "Project model saved: {}",
+            crate::model_picker::display_model(&selection.model)
+        ));
     }
     Ok(())
 }
@@ -1791,9 +1798,9 @@ pub fn settings_menu() -> Result<()> {
             format!(
                 "Default loop model     {}",
                 if s.model.is_empty() {
-                    "Not selected"
+                    "Not selected".into()
                 } else {
-                    &s.model
+                    crate::model_picker::display_model(&s.model)
                 }
             ),
             format!("Default context window    {}", s.context_tokens),
@@ -1818,9 +1825,9 @@ pub fn settings_menu() -> Result<()> {
             format!(
                 "Default setup model     {}",
                 if s.setup_model.is_empty() {
-                    "Use loop model"
+                    "Use loop model".into()
                 } else {
-                    &s.setup_model
+                    crate::model_picker::display_model(&s.setup_model)
                 }
             ),
             format!("Default loop thinking     {}", s.reasoning.label()),
@@ -2368,7 +2375,7 @@ impl ProjectSetting {
     }
     pub fn value(self, c: &runner::Config) -> String {
         match self {
-            Self::Model => c.model.clone(),
+            Self::Model => crate::model_picker::display_model(&c.model),
             Self::Thinking => c.reasoning.label(),
             Self::Sampling => c.sampling.label(),
             Self::Mode => c.activity_mode.label().into(),
@@ -2413,13 +2420,16 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
             "Settings for {}. Changes are saved automatically and affect only this project.",
             c.repo.display()
         ));
-        let rows = vec![
+        let mut rows = vec![
             if c.activity_mode.is_chaos() {
                 "Session mode".into()
             } else {
                 "Project goal".into()
             },
-            format!("Project model: {}", c.model),
+            format!(
+                "Project model: {}",
+                crate::model_picker::display_model(&c.model)
+            ),
             format!(
                 "Run duration: {}",
                 if c.run_duration_seconds == 0 {
@@ -2432,8 +2442,14 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
             "Loop settings".into(),
             "More project settings".into(),
             "Project tools".into(),
-            "Back".into(),
         ];
+        if c.activity_mode.is_chaos() {
+            rows.push(format!(
+                "Self-profile experiment: {}",
+                c.self_profile.label()
+            ));
+        }
+        rows.push("Back".into());
         let Some(index) = crate::menu::select("Project settings", &rows, 0)? else {
             return Ok(());
         };
@@ -2456,9 +2472,276 @@ pub fn project_settings_menu(path: Option<&Path>) -> Result<()> {
             4 => loop_settings_menu(path)?,
             5 => more_project_settings(path)?,
             6 => crate::menu::project_tools(path)?,
+            7 if c.activity_mode.is_chaos() => profile_experiment_menu(path)?,
             _ => return Ok(()),
         }
     }
+}
+
+pub fn profile_experiment_menu(path: Option<&Path>) -> Result<()> {
+    use crate::self_profile::Variant;
+    loop {
+        let c = editing_config(path)?;
+        if !c.activity_mode.is_chaos() {
+            return crate::ui::show(
+                "Self-profile experiment",
+                "This experiment is available in No goals, only chaos sessions.",
+            );
+        }
+        crate::ui::clear_notes();
+        crate::ui::notice("Compare three instruction variants without assigning a goal. Editable personality lets the model revise its saved working tendencies. Personality + interests/questions also keeps interests, open questions and possible next activities, with permission to initiate an activity. You can inspect each saved version.\n\nChanges apply to the next model call and persist across restarts and handoffs. Baseline removes the active profile snapshot and tools, preserving saved profiles. Earlier conversation and tool results remain historical; use fresh session directories for clean comparisons. Each editable variant keeps its own profile.".into());
+        let variants = [
+            Variant::Baseline,
+            Variant::Personality,
+            Variant::SelfDirected,
+        ];
+        let selected = variants
+            .iter()
+            .position(|variant| *variant == c.self_profile)
+            .unwrap_or(0);
+        let mut rows = vec![
+            "Baseline · current behavior, no profile in context".to_string(),
+            "Editable personality · revisable working tendencies".to_string(),
+            "Personality + interests/questions · recommended".to_string(),
+        ];
+        rows[selected].push_str(" · selected");
+        rows.extend([
+            "View saved profile…".into(),
+            "View version history…".into(),
+            "Back".into(),
+        ]);
+        let Some(index) = crate::menu::select("Self-profile experiment", &rows, selected)? else {
+            return Ok(());
+        };
+        match index {
+            0..=2 => {
+                let variant = variants[index];
+                if variant != c.self_profile {
+                    save_project_patch(path, json!({"self_profile":variant}))?;
+                }
+                return Ok(());
+            }
+            3 | 4 => {
+                if let Some(variant) = profile_view_variant(c.self_profile)? {
+                    if index == 3 {
+                        show_self_profile(&c.state_dir, variant, None)?;
+                    } else {
+                        profile_history_menu(&c.state_dir, variant)?;
+                    }
+                }
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn profile_view_variant(
+    current: crate::self_profile::Variant,
+) -> Result<Option<crate::self_profile::Variant>> {
+    use crate::self_profile::Variant;
+    crate::ui::clear_notes();
+    crate::ui::notice("Choose the saved profile to inspect. Viewing a profile or its history does not change the selected experiment.".into());
+    let variants = [Variant::Personality, Variant::SelfDirected];
+    let rows: Vec<String> = variants
+        .iter()
+        .map(|variant| {
+            format!(
+                "{}{}",
+                variant.label(),
+                if *variant == current {
+                    " · selected"
+                } else {
+                    ""
+                }
+            )
+        })
+        .chain(std::iter::once("Back".into()))
+        .collect();
+    let selected = usize::from(current == Variant::SelfDirected);
+    Ok(crate::menu::select("View profile", &rows, selected)?
+        .and_then(|index| variants.get(index).copied()))
+}
+
+fn read_profile_record(
+    state_dir: &Path,
+    variant: crate::self_profile::Variant,
+    mut revision: Option<u64>,
+) -> Result<Value> {
+    let mut record = String::new();
+    let mut offset = 0;
+    loop {
+        let mut args = json!({"action":"read","offset":offset,"limit":65536});
+        if let Some(revision) = revision {
+            args["revision"] = json!(revision);
+        }
+        let page = crate::self_profile::call(state_dir, variant, "read_self_profile", &args)?;
+        record.push_str(
+            page["record_json"]
+                .as_str()
+                .context("Profile page is missing its record")?,
+        );
+        // Pin later pages so a model update cannot mix two profile versions.
+        revision = Some(
+            page["revision"]
+                .as_u64()
+                .context("Profile page is missing its version")?,
+        );
+        if page["complete"].as_bool() == Some(true) {
+            return serde_json::from_str(&record).context("Could not read the saved profile");
+        }
+        let next = page["next_offset"]
+            .as_u64()
+            .context("Profile page is missing its next page")?;
+        anyhow::ensure!(next > offset, "Profile paging did not advance");
+        offset = next;
+    }
+}
+
+fn profile_record_text(record: &Value) -> String {
+    let mut text = format!("Version {}", record["revision"].as_u64().unwrap_or(0));
+    if let Some(saved) = record["updated_at"].as_str() {
+        text.push_str(&format!(" · {saved}"));
+    }
+    if let Some(reason) = record["reason"]
+        .as_str()
+        .filter(|reason| !reason.is_empty())
+    {
+        text.push_str(&format!("\nWhy it changed: {reason}"));
+    }
+    for (key, label) in [
+        ("tendencies", "Working tendencies"),
+        ("interests", "Interests"),
+        ("open_questions", "Open questions"),
+        ("intentions", "Possible next activities"),
+        ("reflections", "Reflections"),
+    ] {
+        if let Some(items) = record["profile"][key].as_array() {
+            text.push_str(&format!("\n\n{label}"));
+            if items.is_empty() {
+                text.push_str("\nNone recorded.");
+            } else {
+                for item in items.iter().filter_map(Value::as_str) {
+                    text.push_str(&format!("\n• {item}"));
+                }
+            }
+        }
+    }
+    if let Some(items) = record["evidence"]
+        .as_array()
+        .filter(|items| !items.is_empty())
+    {
+        text.push_str("\n\nEvidence recorded with this change");
+        for item in items.iter().filter_map(Value::as_str) {
+            text.push_str(&format!("\n• {item}"));
+        }
+    }
+    text
+}
+
+fn show_self_profile(
+    state_dir: &Path,
+    variant: crate::self_profile::Variant,
+    revision: Option<u64>,
+) -> Result<()> {
+    let record = read_profile_record(state_dir, variant, revision)?;
+    crate::ui::show(
+        &format!("Saved profile · {}", variant.label()),
+        &profile_record_text(&record),
+    )
+}
+
+fn profile_history_menu(state_dir: &Path, variant: crate::self_profile::Variant) -> Result<()> {
+    let mut pages = vec![0];
+    let mut revision = None;
+    loop {
+        let after = *pages.last().unwrap();
+        let history = read_profile_history(state_dir, variant, after, &mut revision)?;
+        let versions = history["revisions"]
+            .as_array()
+            .context("Profile history is missing its versions")?;
+        if versions.is_empty() && after == 0 {
+            return crate::ui::show("Profile history", "No profile changes have been saved yet.");
+        }
+        crate::ui::clear_notes();
+        crate::ui::notice("Saved versions are listed in order. Select one to inspect its profile, reason and evidence. Viewing history does not change the current profile.".into());
+        let mut rows: Vec<String> = versions
+            .iter()
+            .map(|version| {
+                let reason = version["reason"]
+                    .as_str()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut characters = reason.chars();
+                let mut reason: String = characters.by_ref().take(80).collect();
+                if characters.next().is_some() {
+                    reason.push('…');
+                }
+                format!(
+                    "Version {} · {} · {}",
+                    version["revision"].as_u64().unwrap_or(0),
+                    version["updated_at"]
+                        .as_str()
+                        .unwrap_or("Initial empty profile"),
+                    reason
+                )
+            })
+            .collect();
+        let next = history["next_after_revision"]
+            .as_u64()
+            .filter(|next| history["complete"].as_bool() != Some(true) && *next > after);
+        let next_index = next.map(|_| {
+            rows.push("More versions…".into());
+            rows.len() - 1
+        });
+        let previous_index = (pages.len() > 1).then(|| {
+            rows.push("Previous versions…".into());
+            rows.len() - 1
+        });
+        rows.push("Back".into());
+        let Some(index) =
+            crate::menu::select(&format!("Profile history · {}", variant.label()), &rows, 0)?
+        else {
+            return Ok(());
+        };
+        if let Some(version) = versions.get(index) {
+            show_self_profile(
+                state_dir,
+                variant,
+                Some(
+                    version["revision"]
+                        .as_u64()
+                        .context("Profile history version is invalid")?,
+                ),
+            )?;
+        } else if Some(index) == next_index {
+            pages.push(next.unwrap());
+        } else if Some(index) == previous_index {
+            pages.pop();
+        } else {
+            return Ok(());
+        }
+    }
+}
+
+fn read_profile_history(
+    state_dir: &Path,
+    variant: crate::self_profile::Variant,
+    after: u64,
+    revision: &mut Option<u64>,
+) -> Result<Value> {
+    let mut args = json!({"action":"history","after_revision":after,"limit":20});
+    if let Some(revision) = *revision {
+        args["revision"] = json!(revision);
+    }
+    let history = crate::self_profile::call(state_dir, variant, "read_self_profile", &args)?;
+    *revision = Some(
+        history["latest_revision"]
+            .as_u64()
+            .context("Profile history is missing its latest version")?,
+    );
+    Ok(history)
 }
 
 fn loop_settings_menu(path: Option<&Path>) -> Result<()> {
@@ -2534,46 +2817,50 @@ pub fn more_project_settings(path: Option<&Path>) -> Result<()> {
         let c = editing_config(path)?;
         crate::ui::clear_notes();
         crate::ui::notice("These options apply only to this project. You can save them before setting up its goal.".into());
-        let Some(choice) = crate::ui::select(
-            "More project settings · only this project",
-            &[
-                format!(
-                    "Command first review · {} seconds",
-                    c.command_review_seconds
-                ),
-                format!(
-                    "Setup model · {}",
-                    if c.setup_model.is_empty() {
-                        "Use loop model"
-                    } else {
-                        &c.setup_model
-                    }
-                ),
-                format!("Setup thinking · {}", c.setup_reasoning.label()),
-                format!(
-                    "Chat model · {}",
-                    if c.chat_model.is_empty() {
-                        "Use loop model"
-                    } else {
-                        &c.chat_model
-                    }
-                ),
-                format!("Chat thinking · {}", c.chat_reasoning.label()),
-                format!(
-                    "Investigation helpers · {}",
-                    if c.helpers.enabled {
-                        "Enabled"
-                    } else {
-                        "Disabled"
-                    }
-                ),
-                format!("Setup sampling · {}", c.setup_sampling.label()),
-                format!("Chat sampling · {}", c.chat_sampling.label()),
-                "Computer environment".into(),
-                "Back".into(),
-            ],
-            0,
-        )?
+        let mut rows = vec![
+            format!(
+                "Command first review · {} seconds",
+                c.command_review_seconds
+            ),
+            format!(
+                "Setup model · {}",
+                if c.setup_model.is_empty() {
+                    "Use loop model".into()
+                } else {
+                    crate::model_picker::display_model(&c.setup_model)
+                }
+            ),
+            format!("Setup thinking · {}", c.setup_reasoning.label()),
+            format!(
+                "Chat model · {}",
+                if c.chat_model.is_empty() {
+                    "Use loop model".into()
+                } else {
+                    crate::model_picker::display_model(&c.chat_model)
+                }
+            ),
+            format!("Chat thinking · {}", c.chat_reasoning.label()),
+            format!(
+                "Investigation helpers · {}",
+                if c.helpers.enabled {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+            ),
+            format!("Setup sampling · {}", c.setup_sampling.label()),
+            format!("Chat sampling · {}", c.chat_sampling.label()),
+            "Computer environment".into(),
+        ];
+        if c.activity_mode.is_chaos() {
+            rows.push(format!(
+                "Self-profile experiment · {}",
+                c.self_profile.label()
+            ));
+        }
+        rows.push("Back".into());
+        let Some(choice) =
+            crate::ui::select("More project settings · only this project", &rows, 0)?
         else {
             return Ok(());
         };
@@ -2636,6 +2923,7 @@ pub fn more_project_settings(path: Option<&Path>) -> Result<()> {
             6 => project_sampling(path, "setup_sampling")?,
             7 => project_sampling(path, "chat_sampling")?,
             8 => computer_environment(path)?,
+            9 if c.activity_mode.is_chaos() => profile_experiment_menu(path)?,
             _ => return Ok(()),
         }
     }
@@ -2654,9 +2942,9 @@ fn helper_rows(helpers: &crate::agents::Settings) -> Vec<String> {
         format!(
             "Model · {}",
             if helpers.model.is_empty() {
-                "Use project model"
+                "Use project model".into()
             } else {
-                &helpers.model
+                crate::model_picker::display_model(&helpers.model)
             }
         ),
         format!("Model responses per helper · {}", helpers.max_calls),
@@ -2882,6 +3170,75 @@ mod project_draft_tests {
     }
 
     #[test]
+    fn self_profile_is_baseline_until_explicitly_selected_for_this_project() {
+        use crate::self_profile::Variant;
+        let root = tempfile::tempdir().unwrap();
+        let defaults = Settings::default();
+        let preview = draft_config_with(root.path(), &defaults, &json!({})).unwrap();
+        assert_eq!(preview.self_profile, Variant::Baseline);
+        assert!(
+            draft_settings(root.path())
+                .unwrap()
+                .get("self_profile")
+                .is_none()
+        );
+        save_draft_patch_with(root.path(), json!({"activity_mode":"chaos"}), &defaults).unwrap();
+
+        for variant in [
+            Variant::Personality,
+            Variant::SelfDirected,
+            Variant::Baseline,
+        ] {
+            save_draft_patch_with(root.path(), json!({"self_profile":variant}), &defaults).unwrap();
+            let saved = draft_settings(root.path()).unwrap();
+            let reloaded = draft_config_with(root.path(), &defaults, &saved).unwrap();
+            assert_eq!(reloaded.self_profile, variant);
+            assert_eq!(saved["self_profile"], json!(variant));
+            assert!(!root.path().join("chuggin.json").exists());
+        }
+    }
+
+    #[test]
+    fn profile_viewer_keeps_exact_large_records_and_pins_history_pages() {
+        use crate::self_profile::Variant;
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let variant = Variant::SelfDirected;
+        let tendency = "A freely chosen tendency. ".repeat(2000);
+        for expected in 0..21 {
+            crate::self_profile::call(
+                &state,
+                variant,
+                "update_self_profile",
+                &json!({"expected_revision":expected,"reason":format!("Observed change {expected}"),
+                    "patch":{"tendencies":[format!("{expected}: {tendency}"),tendency]}}),
+            )
+            .unwrap();
+        }
+        let record = read_profile_record(&state, variant, Some(1)).unwrap();
+        assert_eq!(record["revision"], 1);
+        assert!(serde_json::to_vec(&record).unwrap().len() > 65536);
+        assert_eq!(record["profile"]["tendencies"][0], format!("0: {tendency}"));
+        let mut revision = None;
+        let first = read_profile_history(&state, variant, 0, &mut revision).unwrap();
+        assert_eq!(revision, Some(21));
+        assert_eq!(first["revisions"].as_array().unwrap().len(), 20);
+        crate::self_profile::call(
+            &state,
+            variant,
+            "update_self_profile",
+            &json!({"expected_revision":21,"reason":"Changed during inspection", "patch":{"tendencies":[]}}),
+        )
+        .unwrap();
+        let next = first["next_after_revision"].as_u64().unwrap();
+        let second = read_profile_history(&state, variant, next, &mut revision).unwrap();
+        assert_eq!(second["latest_revision"], 21);
+        assert_eq!(second["complete"], true);
+        assert_eq!(second["revisions"].as_array().unwrap().len(), 1);
+        assert_eq!(second["revisions"][0]["revision"], 21);
+    }
+
+    #[test]
     fn independent_model_and_thinking_choices_survive_goal_setup_preferences() {
         use crate::reasoning::Setting;
         let root = tempfile::tempdir().unwrap();
@@ -2984,6 +3341,7 @@ mod project_draft_tests {
             json!({"reasoning":{"mode":"effort","value":"invalid\neffort"}}),
             json!({"setup_reasoning":{"mode":"token_budget","value":0}}),
             json!({"chat_reasoning":{"mode":"unrecognized"}}),
+            json!({"self_profile":"unrecognized"}),
             json!({"ollama_url":"not a URL"}),
             json!({"context_tokens":2048}),
             json!({"output_tokens":32768}),

@@ -149,7 +149,10 @@ fn legacy(state: &Path, model: &str, context_tokens: u32) -> Option<Usage> {
         })
         .collect();
     cycles.sort_unstable_by_key(|cycle| std::cmp::Reverse(cycle.0));
-    let wire_model = crate::cloud::model_id(model)
+    let named = crate::connections::route_parts(model).ok().flatten();
+    let wire_model = named
+        .map(|(_, raw)| raw)
+        .or_else(|| crate::cloud::model_id(model))
         .or_else(|| crate::groq::model_id(model))
         .unwrap_or(model);
     let mut remaining_request_bytes = LEGACY_SCAN_BYTES;
@@ -201,7 +204,11 @@ fn legacy(state: &Path, model: &str, context_tokens: u32) -> Option<Usage> {
                         .as_ref()
                         .filter(|metadata| !metadata.model.is_empty())
                 });
-            if recorded_model.is_some_and(|metadata| metadata.model != model) {
+            // Equal raw model IDs at distinct saved endpoints do not share
+            // usage. Named routes require an exact durable connection identity.
+            if (named.is_some() && recorded_model.is_none())
+                || recorded_model.is_some_and(|metadata| metadata.model != model)
+            {
                 continue;
             }
             let limit = request
@@ -424,6 +431,25 @@ mod tests {
         assert_eq!(usage.prompt, 87234);
         assert_eq!(usage.context_tokens, 1000000);
         assert_eq!(usage.model, "zen/free-model");
+    }
+
+    #[test]
+    fn named_connections_with_the_same_raw_model_keep_distinct_usage() {
+        let state = tempfile::tempdir().unwrap();
+        let cycle = state.path().join("cycle-000001");
+        request(&cycle, 0, "org/shared-model", true, None);
+        response(&cycle, 0, "data: {\"usage\":{\"prompt_tokens\":4321}}\n\n");
+        assert!(load(state.path(), "connection/12/org/shared-model", 32768).is_none());
+        fs::write(
+            cycle.join("connection-000.json"),
+            r#"{"model":"connection/12/org/shared-model","context_tokens":65536}"#,
+        )
+        .unwrap();
+        let usage = load(state.path(), "connection/12/org/shared-model", 32768).unwrap();
+        assert_eq!(usage.prompt, 4321);
+        assert_eq!(usage.context_tokens, 65536);
+        assert_eq!(usage.model, "connection/12/org/shared-model");
+        assert!(load(state.path(), "connection/13/org/shared-model", 32768).is_none());
     }
 
     #[test]

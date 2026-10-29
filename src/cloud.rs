@@ -93,7 +93,23 @@ pub fn model_id(name: &str) -> Option<&str> {
         .or_else(|| provider(name).and_then(|provider| name.strip_prefix(provider.prefix())))
 }
 
+pub fn try_url(ollama: &str, name: &str) -> Result<String> {
+    if let Some(resolved) = crate::connections::resolve(name)? {
+        return Ok(resolved.connection.endpoint());
+    }
+    Ok(url(ollama, name))
+}
+
 pub fn url(ollama: &str, name: &str) -> String {
+    if name.starts_with("connection/") {
+        // Fallible request paths use try_url. A missing identity must never
+        // accidentally route an old project to its legacy Ollama endpoint.
+        return crate::connections::resolve(name)
+            .ok()
+            .flatten()
+            .map(|resolved| resolved.connection.endpoint())
+            .unwrap_or_default();
+    }
     if crate::chatgpt::model_id(name).is_some() {
         return "https://api.openai.com/v1/responses".into();
     }
@@ -103,13 +119,20 @@ pub fn url(ollama: &str, name: &str) -> String {
     )
 }
 
-pub fn label<'a>(ollama: &'a str, name: &str) -> &'a str {
+pub fn label(ollama: &str, name: &str) -> String {
+    if name.starts_with("connection/") {
+        return crate::connections::label(name)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "Unavailable saved connection".into());
+    }
     match provider(name) {
         Some(provider) => provider.label(),
         None if crate::chatgpt::model_id(name).is_some() => "OpenAI · ChatGPT plan",
         None if crate::groq::model_id(name).is_some() => "Groq",
         None => ollama,
     }
+    .to_owned()
 }
 
 pub fn key(name: &str) -> Result<Option<String>> {

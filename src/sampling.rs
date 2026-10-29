@@ -170,6 +170,20 @@ impl Capabilities {
 /// Metadata/documented capabilities only. No generation requests are sent, and
 /// a provider-default or Legacy request does not need this discovery step.
 pub fn discover(_ollama_url: &str, name: &str) -> Result<Capabilities> {
+    if let Some(resolved) = crate::connections::resolve(name)? {
+        return Ok(match resolved.connection.kind {
+            crate::connections::Kind::Ollama => Capabilities::known(
+                PARAMETERS,
+                "Ollama native protocol",
+                "Sampling overrides use native Ollama options; unset fields preserve server/model defaults.",
+            ),
+            crate::connections::Kind::OpenAICompatible => {
+                let metadata = crate::connections::metadata(name)?
+                    .context("Connection model metadata is unavailable")?;
+                compatible_capabilities(&metadata)
+            }
+        });
+    }
     if crate::chatgpt::model_id(name).is_some() {
         return Ok(Capabilities { parameters: vec![], verified: true, source: "Signed-in ChatGPT Responses transport".into(), detail: "Sampling overrides are not supported by this ChatGPT plan connection. Provider default preserves its normal model behavior.".into() });
     }
@@ -189,6 +203,24 @@ pub fn discover(_ollama_url: &str, name: &str) -> Result<Capabilities> {
         }
         None => Ok(Capabilities::known(PARAMETERS, "https://github.com/ollama/ollama/blob/main/api/types.go", "Sampling overrides are passed as documented Ollama options; unset fields keep the server/model defaults.")),
     }
+}
+
+pub fn compatible_capabilities(metadata: &Value) -> Capabilities {
+    let advertised = metadata["supported_parameters"].as_array();
+    // Only Chat Completions parameter names are portable here. Extended native
+    // options require a provider-specific mapping and are not inferred.
+    let parameters = [
+        "temperature",
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "seed",
+    ]
+    .into_iter()
+    .filter(|name| advertised.is_some_and(|values| values.iter().any(|value| value == name)))
+    .map(str::to_owned)
+    .collect();
+    Capabilities { parameters, verified: advertised.is_some(), source: "Saved OpenAI-compatible connection /models".into(), detail: "Explicit sampling overrides require parameters advertised by this endpoint. Provider default sends no sampling override.".into() }
 }
 
 pub fn openrouter_capabilities(metadata: &Value) -> Capabilities {
@@ -222,9 +254,15 @@ pub fn apply(
             .context("Sampling capabilities must be verified for explicit overrides")?
             .validate_selection(setting)?;
     }
-    let ollama = crate::groq::model_id(name).is_none()
-        && crate::cloud::provider(name).is_none()
-        && crate::chatgpt::model_id(name).is_none();
+    let named = crate::connections::resolve(name)?;
+    let ollama = named.as_ref().map_or_else(
+        || {
+            crate::groq::model_id(name).is_none()
+                && crate::cloud::provider(name).is_none()
+                && crate::chatgpt::model_id(name).is_none()
+        },
+        |resolved| resolved.connection.kind == crate::connections::Kind::Ollama,
+    );
     let formatted = body.get("format").is_some()
         || body.get("response_format").is_some()
         || body["text"].get("format").is_some();

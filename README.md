@@ -91,9 +91,21 @@ promise unlimited access or remaining account allowance.
 Configure all connections through **Global settings → Inference providers**:
 Ollama, Groq, OpenAI (ChatGPT plan), OpenCode Zen, and OpenRouter use the same menu.
 Ollama defaults to **http://localhost:11434**; enter a remote server address there.
-Cloud-only projects do not need an Ollama URL. Connections are global, while
-project, setup, chat, and helper model choices remain separate. Selecting a local
-model saves its effective server address together with that role. Explicit
+**Add Ollama connection** saves another server with a name, such as “This computer”
+or “GPU server”; both remain available in the provider selector. **Add custom
+OpenAI-compatible connection** accepts a name, API base URL (including any `/v1`
+or proxy path), and an optional API key. Each saved connection has its own live
+model catalog, refresh, connection test, and edit menu. If a custom API does not
+list models, use **M** or the manual model ID option in its model picker.
+Renaming a connection preserves project selections. Removing one reports a
+missing connection in projects using it; Chuggin never silently redirects work
+to another server. Existing Ollama settings remain available.
+
+Cloud-only and saved-connection projects do not need the legacy Ollama URL.
+Connections are global, while project, setup, chat, and helper model choices
+remain separate. Saved selections reference a stable connection ID and raw model
+ID; credentials stay in separate protected files in the user's Chuggin config
+directory, outside project configuration and request traces. Explicit
 connection edits persist globally; backing out of a model picker does not change
 model choices. Existing saved settings take precedence. Brave is optional and
 disabled until configured.
@@ -191,6 +203,38 @@ file hashes detect changes independently of Git. Hash records are not file backu
 The model can use Git through shell commands if it chooses. Mode is fixed
 for a saved session to avoid silently mixing its history with goal-driven
 instructions; start in a new directory to choose another mode.
+
+### Self-profile experiment
+
+Unassigned sessions can optionally keep a profile written by the model itself.
+Choose **Project settings → More project settings → Self-profile experiment**
+(also available through observation tab **5 Settings**). The variants are:
+
+- **Baseline:** the existing unassigned conversation, with no profile tools.
+- **Editable personality:** a blank list of tendencies the model may choose and
+  revise. No initial traits are assigned.
+- **Personality + interests/questions:** blank tendencies, interests, open
+  questions, intentions and reflections. The model may choose activities without
+  waiting for instructions, change its mind, or remain quiet. There is no required
+  hobby, productivity target or outcome.
+
+Existing and new sessions start on Baseline until you choose otherwise. Each
+enabled variant keeps a separate profile and immutable revision history. The
+settings menu can show the current profile and its revisions, including when
+Baseline is selected. `read_self_profile` and `update_self_profile` let the model
+inspect and revise its own entries, with a reason and optional evidence. Stale
+writes are rejected and retries do not create duplicate revisions.
+
+The profile is fallible model-authored data, kept separate from human directions
+and tool permissions. Its current snapshot is provided on startup and after a
+context handoff; updates append only when its revision changes, preserving the
+conversation prefix for provider caching. There is no separate inference agent
+or extra model request for profile maintenance. Repetition protection, pause,
+active hours and provider recovery continue to apply.
+
+Switching variants preserves ordinary conversation, files and previous tool
+results. For comparisons starting from the same conditions, use separate fresh
+session directories rather than switching an established conversation.
 
 ### Private Linux computer (Podman)
 

@@ -323,7 +323,7 @@ impl Controller {
             .as_ref()
             .map(|l| json!({"session":l.session,"granted":l.granted}));
         Ok(
-            json!({"version":env!("CARGO_PKG_VERSION"),"config":self.path,"project":c.repo,"running":self.running.load(Ordering::SeqCst),"closing":self.closing.load(Ordering::SeqCst),"paused":self.controls.is_paused(),"pause_requested":self.controls.pause_requested(),"manual_pause":self.controls.manual_pause(),"holds":self.controls.reasons(),"schedule":self.controls.schedule_status().ok(),"stop_requested":self.stop.load(Ordering::SeqCst),"active_commands":project::active_checks(),"editing":lease,"interrupted_editing":read_json(&c.state_dir.join("operator/editing.json")).ok(),"interrupted_controller":read_json(&c.state_dir.join("operator/interrupted-controller.json")).ok(),"generation":self.generation.load(Ordering::SeqCst),"model":c.model,"activity_mode":c.activity_mode,"goal":c.goal,"state":read_json(&c.state_dir.join("state.json")).ok().map(|v|compact_state(&v)),"active_elapsed_seconds":self.elapsed(),"nudges":crate::nudge::read(&c.state_dir)?,"last_error":self.last_error.lock().unwrap().clone()}),
+            json!({"version":env!("CARGO_PKG_VERSION"),"config":self.path,"project":c.repo,"running":self.running.load(Ordering::SeqCst),"closing":self.closing.load(Ordering::SeqCst),"paused":self.controls.is_paused(),"pause_requested":self.controls.pause_requested(),"manual_pause":self.controls.manual_pause(),"holds":self.controls.reasons(),"schedule":self.controls.schedule_status().ok(),"stop_requested":self.stop.load(Ordering::SeqCst),"active_commands":project::active_checks(),"editing":lease,"interrupted_editing":read_json(&c.state_dir.join("operator/editing.json")).ok(),"interrupted_controller":read_json(&c.state_dir.join("operator/interrupted-controller.json")).ok(),"generation":self.generation.load(Ordering::SeqCst),"model":c.model,"activity_mode":c.activity_mode,"self_profile":c.self_profile,"goal":c.goal,"state":read_json(&c.state_dir.join("state.json")).ok().map(|v|compact_state(&v)),"active_elapsed_seconds":self.elapsed(),"nudges":crate::nudge::read(&c.state_dir)?,"last_error":self.last_error.lock().unwrap().clone()}),
         )
     }
     pub fn begin_edit(&self, session: &str) -> Result<Value> {
@@ -514,7 +514,8 @@ impl Controller {
             ]
             .contains(&key.as_str());
             ensure!(
-                ordinary || (human && ["ollama_url", "helpers"].contains(&key.as_str())),
+                ordinary
+                    || (human && ["ollama_url", "helpers", "self_profile"].contains(&key.as_str())),
                 "Setting {key} is managed in human connection setup"
             );
             config[key] = value.clone();

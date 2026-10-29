@@ -83,6 +83,14 @@ impl Capabilities {
 
 /// Metadata only: no chat requests, prompts, or inference probes are sent.
 pub fn discover(ollama_url: &str, name: &str) -> Result<Capabilities> {
+    if let Some(resolved) = crate::connections::resolve(name)? {
+        let metadata = crate::connections::metadata(name)?
+            .context("Connection model metadata is unavailable")?;
+        return Ok(match resolved.connection.kind {
+            crate::connections::Kind::Ollama => ollama_capabilities(&metadata),
+            crate::connections::Kind::OpenAICompatible => compatible_capabilities(&metadata),
+        });
+    }
     if crate::chatgpt::model_id(name).is_some() {
         return Ok(chatgpt_capabilities(&crate::chatgpt::model_info(name)?));
     }
@@ -160,6 +168,15 @@ pub fn chatgpt_capabilities(metadata: &Value) -> Capabilities {
         .get("default_reasoning_effort")
         .filter(|value| value.is_string())
         .cloned();
+    capabilities
+}
+
+/// Generic endpoints need explicit per-model metadata before any override.
+/// They never inherit Ollama's `think` parameter or a vendor-specific mapping.
+pub fn compatible_capabilities(metadata: &Value) -> Capabilities {
+    let mut capabilities = chatgpt_capabilities(metadata);
+    capabilities.source = "Saved OpenAI-compatible connection /models".into();
+    capabilities.detail = "Only reasoning efforts advertised by this endpoint can be selected. Model default sends no reasoning override.".into();
     capabilities
 }
 
@@ -287,7 +304,15 @@ pub fn apply(
     capabilities
         .context("Thinking capabilities must be discovered for an explicit setting")?
         .validate_selection(setting)?;
-    if crate::chatgpt::model_id(name).is_some() {
+    if crate::connections::resolve(name)?.is_some_and(|resolved| {
+        resolved.connection.kind == crate::connections::Kind::OpenAICompatible
+    }) {
+        body["reasoning_effort"] = match setting {
+            Setting::Off => json!("none"),
+            Setting::Effort(level) => json!(level),
+            _ => anyhow::bail!("This endpoint does not advertise this reasoning override"),
+        };
+    } else if crate::chatgpt::model_id(name).is_some() {
         body["reasoning"] = match setting {
             Setting::Off => json!({"effort":"none"}),
             Setting::Effort(level) => json!({"effort":level}),

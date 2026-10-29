@@ -128,7 +128,7 @@ impl ActionWatch {
             }
             return None;
         }
-        let unchanged_edit = matches!(name, "edit_file" | "write_file")
+        let unchanged_edit = matches!(name, "edit_file" | "write_file" | "update_self_profile")
             && (result["ok"] == false || output["changed"] == false);
         let repeated_message = name == "send_message" && output["changed"] == false;
         let notebook_read =
@@ -144,6 +144,7 @@ impl ActionWatch {
                 "read_file"
                     | "read_progress_note"
                     | "read_context_memory"
+                    | "read_self_profile"
                     | "read_task_evidence"
                     | "read_history"
                     | "search_history"
@@ -161,9 +162,13 @@ impl ActionWatch {
             || (name == "finish_task"
                 && (output["completion_recorded"] == false || result["ok"] == false));
         if !watch {
-            if matches!(name, "save_progress_note" | "command_status") {
-                // Narration and passive status polls do not erase already read
-                // evidence, and a long-running process may legitimately wait.
+            if matches!(
+                name,
+                "save_progress_note" | "command_status" | "update_self_profile"
+            ) {
+                // Narration, preferences and passive polls do not erase already
+                // read evidence. Changing a self-description is not evidence of
+                // a change in the environment.
                 return None;
             }
             // Commands can have arbitrary side effects. Do not infer that identical
@@ -240,10 +245,10 @@ impl ActionWatch {
             self.known_actions.push(fingerprint);
         }
         trim_front(&mut self.known_actions, ACTION_HISTORY_LIMIT);
-        if new_evidence {
+        if new_evidence && !matches!(name, "read_self_profile" | "update_self_profile") {
             self.evidence_revision = self.evidence_revision.saturating_add(1);
             self.clear_suspicion();
-        } else {
+        } else if !new_evidence {
             self.stale_count = self.stale_count.saturating_add(1);
             if !self.stale_actions.contains(&stale_signature)
                 && self.stale_actions.len() < STALE_PATTERN_LIMIT
@@ -685,9 +690,41 @@ mod tests {
                     ),
                     None
                 );
+                let revision = watch.evidence_revision;
+                assert_eq!(
+                    watch.observe(
+                        "update_self_profile",
+                        &json!({"expected_revision":pass,"reason":"A revised self-description"}),
+                        &json!({"ok":true,"result":{"changed":true,"revision":pass+1}})
+                    ),
+                    None
+                );
+                assert_eq!(watch.evidence_revision, revision);
             }
         }
         assert!(watch.take_notice());
+    }
+
+    #[test]
+    fn profile_reads_are_observations_without_environment_progress_credit() {
+        let mut watch = ActionWatch::default();
+        let mut intervened = false;
+        for _ in 0..50 {
+            intervened |= watch
+                .observe(
+                    "read_self_profile",
+                    &json!({"action":"read"}),
+                    &json!({"ok":true,"result":{"revision":1,"profile":{"tendencies":[]}}}),
+                )
+                .is_some();
+        }
+        assert!(intervened);
+        assert_eq!(watch.evidence_revision, 0);
+        let stale = watch.stale_count;
+        watch.observe("read_self_profile", &json!({"action":"read","revision":2}),
+            &json!({"ok":true,"result":{"revision":2,"profile":{"tendencies":["Revised preference"]}}}));
+        assert_eq!(watch.evidence_revision, 0);
+        assert_eq!(watch.stale_count, stale);
     }
 
     #[test]
