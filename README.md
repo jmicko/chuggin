@@ -82,7 +82,8 @@ output for scripts and redirected logs.
 New installations have no model preselected. **Project model** opens a provider
 selector, followed by the provider's live model catalog. Use arrow keys to choose,
 **/** to search, **R** to refresh, **C** for the connection, and **Esc** to return to
-providers. Refresh works without restarting or updating Chuggin. Each model shows
+providers. **PgUp/PgDn** pages through the list; **Alt+PgUp/PgDn** scrolls model
+details. Refresh works without restarting or updating Chuggin. Each model shows
 its pricing category and any context/output limits supplied by the catalog.
 **A** shows unavailable, paid, or unconfirmed entries with an explanation; paid or
 unconfirmed Zen/OpenRouter entries cannot be selected. Free pricing does not

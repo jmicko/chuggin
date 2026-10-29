@@ -1,5 +1,7 @@
 //! Full-screen observation and shared interactive surfaces.
 mod messages;
+#[cfg(test)]
+mod model_picker_tests;
 use crate::{
     events::{self, Event},
     runner,
@@ -496,6 +498,87 @@ fn render_selection_footer(
     f.render_widget(p(footer.to_owned()).fg(MUTED), rows[3]);
 }
 
+/// Keep catalog and action rows in the same viewport while their details change.
+fn render_model_selection(
+    f: &mut Frame,
+    title: &str,
+    items: &[String],
+    state: &mut ListState,
+    detail: &str,
+    footer: &str,
+    detail_offset: u16,
+) -> u16 {
+    base(f);
+    let area = f.area().inner(Margin::new(3, 1));
+    let width = area.width.max(1) as usize;
+    let header = textwrap::wrap(&format!("CHUGGIN  /  {title}"), width)
+        .into_iter()
+        .map(|line| Line::from(line.into_owned()))
+        .collect::<Vec<_>>();
+    let header_height = (header.len() as u16).saturating_add(1);
+    // Catalog geometry depends only on the terminal size. Selection, search and
+    // model metadata must not move or resize the list underneath the user.
+    let footer_height = if width < 72 { 4 } else { 3 };
+    let available = area.height.saturating_sub(header_height + footer_height);
+    let details_height = if available >= 8 {
+        (available / 3).clamp(6, 12).min(available - 4)
+    } else {
+        0
+    };
+    let rows = Layout::vertical([
+        Constraint::Length(header_height),
+        Constraint::Length(details_height),
+        Constraint::Min(0),
+        Constraint::Length(footer_height),
+    ])
+    .split(area);
+    f.render_widget(Paragraph::new(header).fg(ACCENT).bold(), rows[0]);
+    let mut detail_offset = detail_offset;
+    if details_height > 0 {
+        let details = detail
+            .lines()
+            .flat_map(|line| {
+                if line.is_empty() {
+                    vec![Line::from("")]
+                } else {
+                    textwrap::wrap(line, area.width.saturating_sub(4).max(1) as usize)
+                        .into_iter()
+                        .map(|line| Line::from(line.into_owned()))
+                        .collect()
+                }
+            })
+            .collect::<Vec<_>>();
+        let max_scroll = details
+            .len()
+            .saturating_sub(rows[1].height.saturating_sub(2) as usize);
+        detail_offset = detail_offset.min(max_scroll.min(u16::MAX as usize) as u16);
+        f.render_widget(
+            Paragraph::new(details)
+                .scroll((detail_offset, 0))
+                .block(panel("Model details · Alt+PgUp / PgDn scroll")),
+            rows[1],
+        );
+    }
+    let choices = items.iter().map(|item| {
+        ListItem::new(Text::from(
+            textwrap::wrap(item, area.width.saturating_sub(7).max(1) as usize)
+                .into_iter()
+                .map(|line| Line::from(line.into_owned()))
+                .collect::<Vec<_>>(),
+        ))
+    });
+    f.render_stateful_widget(
+        List::new(choices)
+            .block(panel("Choose an option"))
+            .highlight_symbol(" › ")
+            .highlight_style(Style::default().bg(Color::Rgb(47, 42, 70)).fg(ACCENT)),
+        rows[2],
+        state,
+    );
+    f.render_widget(p(footer.to_owned()).fg(MUTED), rows[3]);
+    detail_offset
+}
+
 /// A catalog is inspected locally; neither filtering nor selecting a row sends
 /// project content to the provider. Refresh and connection editing stay explicit.
 pub fn select_model(
@@ -512,6 +595,9 @@ pub fn select_model(
     let mut error = String::new();
     let mut initial = true;
     let mut index = 0usize;
+    let mut list_state = ListState::default();
+    let mut detail_offset = 0u16;
+    let mut previous_detail = String::new();
     loop {
         let needle = query.to_lowercase();
         let visible: Vec<usize> = entries
@@ -575,6 +661,10 @@ pub fn select_model(
                 format!("\n{error}")
             }
         );
+        if detail != previous_detail {
+            detail_offset = 0;
+            previous_detail.clone_from(&detail);
+        }
         if !active() {
             notice(detail);
             return Ok(match crate::menu::select(title, &rows, index)? {
@@ -587,22 +677,23 @@ pub fn select_model(
                 None => Action::Provider,
             });
         }
+        list_state.select(Some(index));
         draw(|f| {
-            render_selection_footer(
+            detail_offset = render_model_selection(
                 f,
                 title,
                 &rows,
-                index,
-                0,
+                &mut list_state,
                 &detail,
                 if searching {
                     "Type to search · Enter browse · Esc clear search"
                 } else if manual {
-                    "↑ ↓ select · Enter choose · / search · R refresh\nC connection · M model ID · A all entries · Esc providers"
+                    "↑ ↓ select · Enter choose · / search · R refresh\nC connection · M model ID · A all · Alt+PgUp/PgDn details · Esc providers"
                 } else {
-                    "↑ ↓ select · Enter choose · / search · R refresh\nC connection · A all entries · Esc providers"
+                    "↑ ↓ select · Enter choose · / search · R refresh\nC connection · A all · Alt+PgUp/PgDn details · Esc providers"
                 },
-            )
+                detail_offset,
+            );
         })?;
         if let Some(event) = input()? {
             if let Input::Paste(text) = &event {
@@ -611,6 +702,16 @@ pub fn select_model(
                 searching = true;
             }
             if let Some(key) = pressed(&event) {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    match key.code {
+                        KeyCode::PageUp => detail_offset = detail_offset.saturating_sub(4),
+                        KeyCode::PageDown => detail_offset = detail_offset.saturating_add(4),
+                        _ => {}
+                    }
+                    if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+                        continue;
+                    }
+                }
                 if searching {
                     match key.code {
                         KeyCode::Esc => {
@@ -3454,11 +3555,13 @@ mod tests {
         let choices: Vec<String> = (0..80).map(|i| format!("model-{i} · Free")).collect();
         for (width, height) in [(110, 36), (80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|f| render_selection_footer(
-                f, "Choose model for this project", &choices, 63, 0,
+            let mut state = ListState::default().with_selected(Some(63));
+            terminal.draw(|f| {render_model_selection(
+                f, "Choose model for this project", &choices, &mut state,
                 "OpenCode Zen · checked 12:34:56\nSelected model: model-63\nModel ID: zen/model-63\nFree · context: 128000 tokens\nCatalog refresh does not generate a response.",
                 "↑ ↓ select · Enter choose · / search · R refresh\nC connection · A all entries · Esc providers",
-            )).unwrap();
+                0,
+            );}).unwrap();
             let text = screen_text(&terminal);
             assert!(text.contains("Selected model: model-63"));
             assert!(text.contains("zen/model-63"));
