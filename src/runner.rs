@@ -320,6 +320,8 @@ struct Conversation {
     operator_revision: u64,
     migration_handoff_seen: Option<String>,
     migration_handoff: Option<Value>,
+    computer_reset_seen: Option<String>,
+    computer_reset_handoff: Option<Value>,
     helper_links: std::collections::BTreeMap<String, String>,
     last_context_usage: Option<crate::context_usage::Usage>,
     mailbox_notice: Option<String>,
@@ -1600,6 +1602,54 @@ fn finish_migration_handoff(session: &mut Conversation) {
         }
     }
 }
+fn start_computer_reset_handoff(c: &Config, session: &mut Conversation) -> Result<()> {
+    if !c.execution.is_private() {
+        return Ok(());
+    }
+    let bytes = match fs::read(c.state_dir.join("computer/reset-notice.json")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        bytes.len() <= 16384,
+        "Private-computer reset notice is too large"
+    );
+    let _: Value = serde_json::from_slice(&bytes)?;
+    use sha2::Digest;
+    let id = format!("{:x}", sha2::Sha256::digest(&bytes));
+    if session.computer_reset_seen.as_ref() == Some(&id) {
+        return Ok(());
+    }
+    finish_computer_reset_handoff(session);
+    let note = json!({"kind":"computer_reset","id":id,
+        "instruction":"The user deleted this session's previous private computer. Its replacement is a fresh Linux installation: files and applications created inside the previous computer are gone. Conversation, self-profile, notes and human messages were retained. Earlier file, command and application observations describe the old installation; inspect the current computer before relying on them. This is a one-time environment-change notice, not an assigned activity, recurring audit, or instruction to repeat tests."});
+    session.computer_reset_seen = Some(id);
+    session
+        .messages
+        .push(json!({"role":"user","content":note.to_string()}));
+    session.computer_reset_handoff = Some(note);
+    crate::events::log("Private computer was replaced; one-time context notice added.".into());
+    Ok(())
+}
+
+fn finish_computer_reset_handoff(session: &mut Conversation) {
+    let Some(note) = session.computer_reset_handoff.take() else {
+        return;
+    };
+    for message in &mut session.messages {
+        if message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .is_some_and(|value| value["kind"] == "computer_reset" && value["id"] == note["id"])
+        {
+            message["content"] = json!(json!({"kind":"computer_reset_history","id":note["id"],
+                "summary":"The private computer was replaced. Observations before that reset concern its old installation. The first work interval after the one-time notice has ended; the reset itself is not a recurring task."}).to_string());
+        }
+    }
+}
+
 fn start_migration_handoff(c: &Config, s: &State, session: &mut Conversation) -> Result<()> {
     let path = c.state_dir.join("migration-handoff.json");
     if !path.exists() {
@@ -2195,7 +2245,13 @@ fn refresh_conversation_with_kind(
                     && content.get("reason").is_some()))
         }));
     session.memory_notice_human_count = session.memory.human_directions.len();
-    if let Some(note) = &session.migration_handoff {
+    for note in [
+        session.migration_handoff.as_ref(),
+        session.computer_reset_handoff.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let content = note.to_string();
         if !session
             .messages
@@ -3856,6 +3912,7 @@ pub fn run_controlled_with_commands(
     } else {
         session.messages.push(resumed_context);
     }
+    start_computer_reset_handoff(&c, &mut session)?;
     save_conversation(&c, &session)?;
     commands.shutdown_updates.clear();
     if !notices.is_empty() && lifecycle_path.is_file() {
@@ -4241,6 +4298,7 @@ pub fn run_controlled_with_commands(
         )?;
         session.messages.push(json!({"role":"user","content":json!({"checkpoint":state.working_ref,"task_complete":finished,"feedback":feedback,"instruction":crate::prompts::checkpoint(c.activity_mode)}).to_string()}));
         finish_migration_handoff(&mut session);
+        finish_computer_reset_handoff(&mut session);
         save_conversation(&c, &session)?;
         emit(&art, "outcome", &outcome)?;
         crate::events::log(format!(
@@ -4987,6 +5045,82 @@ mod conversation_tests {
         eprintln!(
             "Read-only replay: {frames} responses, first prose notice at response {first_prose_notice:?}, {prose_notices} prose notices, {prose_resets} prose resets, {action_interventions} action interventions"
         );
+    }
+
+    #[test]
+    fn private_computer_reset_notice_survives_handoff_and_is_delivered_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let c: Config = serde_json::from_value(json!({"repo":dir.path(),"state_dir":dir.path(),
+            "activity_mode":"type2","execution":{"kind":"podman"},"model":"unused",
+            "context_tokens":8192,"output_tokens":1024,"implementation_calls":4,
+            "retry_seconds":0}))
+        .unwrap();
+        let state = State {
+            working_workspace: dir.path().into(),
+            activity_mode: c.activity_mode,
+            execution: c.execution.clone(),
+            ..State::default()
+        };
+        let mut session = Conversation {
+            messages: vec![
+                json!({"role":"system","content":c.work_prompt()}),
+                json!({"role":"assistant","content":"An observation from the previous computer."}),
+            ],
+            ..Conversation::default()
+        };
+        start_computer_reset_handoff(&c, &mut session).unwrap();
+        assert!(session.computer_reset_handoff.is_none());
+        fs::create_dir(dir.path().join("computer")).unwrap();
+        let notice = dir.path().join("computer/reset-notice.json");
+        fs::write(
+            &notice,
+            json!({"at":"first","reason":"Deleted by the user"}).to_string(),
+        )
+        .unwrap();
+        start_computer_reset_handoff(&c, &mut session).unwrap();
+        let count = |session: &Conversation| {
+            session
+                .messages
+                .iter()
+                .filter(|message| {
+                    message["content"]
+                        .as_str()
+                        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                        .is_some_and(|value| value["kind"] == "computer_reset")
+                })
+                .count()
+        };
+        assert_eq!(count(&session), 1);
+        assert!(
+            session.messages.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("not an assigned activity")
+        );
+        save_conversation(&c, &session).unwrap();
+        let mut cold: Conversation =
+            serde_json::from_slice(&fs::read(dir.path().join("conversation.json")).unwrap())
+                .unwrap();
+        start_computer_reset_handoff(&c, &mut cold).unwrap();
+        assert_eq!(count(&cold), 1);
+        refresh_conversation(&c, &state, &mut cold, dir.path(), "Context recovery", true).unwrap();
+        assert_eq!(count(&cold), 1);
+        finish_computer_reset_handoff(&mut cold);
+        assert_eq!(count(&cold), 0);
+        start_computer_reset_handoff(&c, &mut cold).unwrap();
+        assert_eq!(count(&cold), 0);
+        fs::write(
+            &notice,
+            json!({"at":"second","reason":"Deleted again by the user"}).to_string(),
+        )
+        .unwrap();
+        start_computer_reset_handoff(&c, &mut cold).unwrap();
+        assert_eq!(count(&cold), 1);
+        let mut host = c.clone();
+        host.execution = crate::sandbox::Settings::Host;
+        let mut normal = Conversation::default();
+        start_computer_reset_handoff(&host, &mut normal).unwrap();
+        assert!(normal.messages.is_empty());
     }
 
     #[test]

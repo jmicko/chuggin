@@ -25,6 +25,7 @@ mod groq;
 mod history;
 mod image_tools;
 mod inference;
+mod managed_computers;
 mod mcp;
 mod menu;
 mod messenger;

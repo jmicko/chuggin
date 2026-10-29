@@ -1835,6 +1835,7 @@ pub fn settings_menu() -> Result<()> {
             format!("Default chat thinking     {}", s.chat_reasoning.label()),
             "Sampling defaults…".into(),
             "Presence · automatic away status".into(),
+            "Private computers…".into(),
             "Back".into(),
         ];
         let Some(index) =
@@ -2009,6 +2010,10 @@ pub fn settings_menu() -> Result<()> {
             }
             16 => {
                 presence_menu()?;
+                continue;
+            }
+            17 => {
+                crate::menu::private_computers()?;
                 continue;
             }
             _ => return Ok(()),

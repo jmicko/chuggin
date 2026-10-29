@@ -2,6 +2,7 @@
 mod messages;
 #[cfg(test)]
 mod model_picker_tests;
+mod self_profile;
 use crate::{
     events::{self, Event},
     runner,
@@ -264,11 +265,16 @@ fn splash(
         Line::from(model.to_owned()),
         Line::from(""),
     ];
-    detail.extend(
-        status
-            .lines()
-            .map(|line| Line::from(line.to_owned()).fg(MUTED)),
-    );
+    detail.extend(status.lines().map(|line| {
+        let styled = Line::from(line.to_owned());
+        if line.contains("private computer") && line.contains("attention") {
+            styled.fg(GOLD).bold()
+        } else if line.starts_with("Global settings → Private computers") {
+            styled.fg(CYAN)
+        } else {
+            styled.fg(MUTED)
+        }
+    }));
     detail.extend([
         Line::from(""),
         Line::from("Fresh context. Persistent progress.").fg(ACCENT),
@@ -1115,6 +1121,7 @@ struct Dashboard {
     controls: Arc<crate::run_control::RunControl>,
     chat: ChatPanel,
     messages: messages::MessagesPanel,
+    profile: self_profile::ProfilePanel,
     focused: bool,
     focus_known: bool,
     last_human_input: Option<Instant>,
@@ -1184,6 +1191,7 @@ impl Dashboard {
             controls: Arc::default(),
             chat: ChatPanel::default(),
             messages: messages::MessagesPanel::default(),
+            profile: self_profile::ProfilePanel::default(),
             focused: false,
             focus_known: false,
             last_human_input: None,
@@ -2083,7 +2091,10 @@ fn dashboard_footer(
             )
         )
     } else {
-        "P pause · Ctrl+C finish cycle · N nudge · M messages · 1–7 views · ? help".into()
+        format!(
+            "P pause · Ctrl+C finish cycle · N nudge · M messages · 1–{} views · ? help",
+            dashboard_tab_count(c.activity_mode.is_chaos())
+        )
     };
     if c.execution.is_private() {
         controls.push_str(" · F4 desktop");
@@ -2165,8 +2176,12 @@ fn dashboard_footer(
     (paragraph, height)
 }
 
+fn dashboard_tab_count(chaos: bool) -> usize {
+    if chaos { 8 } else { 7 }
+}
+
 fn dashboard_tabs(chaos: bool, selected: usize, width: usize) -> Vec<Line<'static>> {
-    let labels = [
+    let mut labels = vec![
         "1 Live",
         "2 Model",
         "3 Checks",
@@ -2175,6 +2190,9 @@ fn dashboard_tabs(chaos: bool, selected: usize, width: usize) -> Vec<Line<'stati
         "6 Assistant",
         "7 Messages",
     ];
+    if chaos {
+        labels.push("8 Profile");
+    }
     let mut rows = Vec::new();
     let mut spans = Vec::new();
     let mut used = 0;
@@ -2376,7 +2394,15 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     let log = Layout::vertical([Constraint::Length(tabs.len() as u16), Constraint::Min(2)])
         .split(body[0]);
     f.render_widget(Paragraph::new(tabs), log[0]);
-    let label = if d.tab == 6 {
+    let label = if d.tab == 7 {
+        if d.searching {
+            format!("Search profile: {}▏", d.filter)
+        } else if !d.filter.is_empty() {
+            format!("Profile filter: {} · Esc clears", d.filter)
+        } else {
+            "Self-profile · read only · ↑↓ / PgUp / PgDn scroll".into()
+        }
+    } else if d.tab == 6 {
         "Messenger · direct messages with the loop".into()
     } else if d.tab == 5 {
         "Assistant · a separate conversation".into()
@@ -2464,6 +2490,10 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
         d.chat.lines(inner.width.saturating_sub(1) as usize)
     } else if d.tab == 6 {
         d.messages.lines(inner.width.saturating_sub(1) as usize)
+    } else if d.tab == 7 {
+        d.profile.poll(c, false);
+        d.profile
+            .lines(inner.width.saturating_sub(1) as usize, &d.filter)
     } else {
         d.lines(inner.width.saturating_sub(1) as usize, if c.activity_mode.is_chaos() { "No goals, only chaos\n\nNo objective is assigned. The model may use tools, select its own activities, or generate text without a task. Responses continue in the same saved conversation. Repeated-phrase recovery stays enabled.\n\nYou retain pause, stop, schedule and timer controls. Sampling changes apply to the next request." } else { &c.goal })
     };
@@ -2732,7 +2762,7 @@ fn render_dashboard(f: &mut Frame, d: &mut Dashboard, c: &runner::Config, stoppi
     if d.help {
         let area = a.inner(Margin::new(2, 1));
         f.render_widget(Clear, area);
-        f.render_widget(p("P              Pause / continue current cycle\nT              Retry provider now; queue while paused\nCtrl+C / Q     Finish cycle, then stop\nCtrl+C again   Force stop immediately\nR              Cancel stop / resume saved run\nN              Add / manage a temporary nudge\n1–7 / Tab      Observation, settings, assistant, messages\nM              Direct messages with the looping model\n↑↓ / wheel     Scroll a few lines\nPgUp / PgDn    Scroll a page\nHome / End     Oldest / latest output\nF              Follow live output\nE              Expand / collapse command output\nF4 / Alt+D     Open private desktop; or click the top button\n/              Search current view\nEsc            Clear search / close help\n\nPause waits for the current operation; the run timer holds.\nStarted commands may finish. Full logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.").block(panel("Keyboard guide · ? / Esc closes")),area);
+        f.render_widget(p(format!("P              Pause / continue current cycle\nT              Retry provider now; queue while paused\nCtrl+C / Q     Finish cycle, then stop\nCtrl+C again   Force stop immediately\nR              Cancel stop / resume saved run\nN              Add / manage a temporary nudge\n1–{} / Tab      Observation, settings, assistant, messages{}\nM              Direct messages with the looping model\n↑↓ / wheel     Scroll a few lines\nPgUp / PgDn    Scroll a page\nHome / End     Oldest / latest output\nF              Follow live output\nE              Expand / collapse command output\nF4 / Alt+D     Open private desktop; or click the top button\n/              Search current view\nEsc            Clear search / close help\n\nPause waits for the current operation; the run timer holds.\nStarted commands may finish. Full logs stay in .chuggin/.\nResources describe this computer, not the remote GPU.", dashboard_tab_count(c.activity_mode.is_chaos()), if c.activity_mode.is_chaos() { ", profile" } else { "" })).block(panel("Keyboard guide · ? / Esc closes")),area);
     }
 }
 
@@ -2832,7 +2862,7 @@ fn dashboard_session(
     }
     let rx = events::subscribe();
     crate::engine::foreground(Some(client.clone()));
-    d.tab = initial_tab;
+    d.tab = initial_tab.min(dashboard_tab_count(config.activity_mode.is_chaos()) - 1);
     if initial_tab == 6 {
         d.focused = true;
         d.last_human_input = Some(Instant::now());
@@ -3228,18 +3258,23 @@ fn dashboard_session(
                         }
                         KeyCode::End | KeyCode::Char('f') => d.follow = true,
                         KeyCode::BackTab => {
-                            d.tab = (d.tab + 6) % 7;
-                            d.follow = !matches!(d.tab, 3 | 4);
+                            let count = dashboard_tab_count(config.activity_mode.is_chaos());
+                            d.tab = (d.tab + count - 1) % count;
+                            d.follow = !matches!(d.tab, 3 | 4 | 7);
                             d.scroll = 0;
                         }
                         KeyCode::Tab => {
-                            d.tab = (d.tab + 1) % 7;
-                            d.follow = !matches!(d.tab, 3 | 4);
+                            d.tab =
+                                (d.tab + 1) % dashboard_tab_count(config.activity_mode.is_chaos());
+                            d.follow = !matches!(d.tab, 3 | 4 | 7);
                             d.scroll = 0;
                         }
-                        KeyCode::Char(c @ '1'..='7') => {
+                        KeyCode::Char(c @ '1'..='8')
+                            if (c as u8 - b'1')
+                                < dashboard_tab_count(config.activity_mode.is_chaos()) as u8 =>
+                        {
                             d.tab = (c as u8 - b'1') as usize;
-                            d.follow = !matches!(d.tab, 3 | 4);
+                            d.follow = !matches!(d.tab, 3 | 4 | 7);
                             d.scroll = 0;
                         }
                         KeyCode::Char('/') => {
@@ -3434,7 +3469,7 @@ mod tests {
         }
     }
     #[test]
-    fn all_seven_tabs_remain_visible_when_wrapped_and_initial_focus_is_unknown() {
+    fn all_observation_tabs_remain_visible_when_wrapped_and_initial_focus_is_unknown() {
         for width in [42, 60, 80, 110] {
             let text = dashboard_tabs(true, 6, width)
                 .into_iter()
@@ -3443,6 +3478,7 @@ mod tests {
                 .join("\n");
             assert!(text.contains("6 Assistant"));
             assert!(text.contains("7 Messages"));
+            assert!(text.contains("8 Profile"));
             assert!(text.lines().all(|l| l.chars().count() <= width));
         }
         assert!(!Dashboard::new(&config()).focused);

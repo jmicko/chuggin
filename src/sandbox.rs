@@ -79,10 +79,8 @@ pub(crate) struct Target {
 }
 static TARGETS: LazyLock<Mutex<BTreeMap<PathBuf, Target>>> = LazyLock::new(Mutex::default);
 pub fn target(c: &crate::runner::Config) -> Result<Target> {
-    let root = fs::canonicalize(&c.repo)?;
-    let hash = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
     Ok(Target {
-        name: format!("chuggin-{}", &hash[..24]),
+        name: crate::managed_computers::name_for(c)?,
         state: c.state_dir.clone(),
         runtime: c.state_dir.join("computer/tool-runtime"),
         internet: matches!(c.execution, Settings::Podman { internet: true, .. }),
@@ -634,6 +632,12 @@ pub fn prepare(c: &crate::runner::Config) -> Result<()> {
         .args(["container", "exists", &t.name])
         .status()?
         .success();
+    if exists {
+        crate::managed_computers::authorize_existing(c, &t.name)?;
+    } else {
+        crate::managed_computers::authorize_missing(&t.name)?;
+    }
+    crate::managed_computers::remember(c, &t.name, None)?;
     if !exists && !podman().args(["image", "exists", &tag]).status()?.success() {
         let log = fs::File::create(t.state.join("computer/build.log"))?;
         let mut child = podman()
@@ -665,59 +669,11 @@ pub fn prepare(c: &crate::runner::Config) -> Result<()> {
     }
     crate::sandbox_network::start(&t)?;
     if !exists {
-        let Settings::Podman {
-            memory_mb,
-            cpus,
-            internet,
-        } = c.execution
-        else {
-            anyhow::bail!("Private computer is not selected")
-        };
-        let mount = format!(
-            "type=bind,src={},dst=/opt/session-runtime,ro",
-            fs::canonicalize(&t.runtime)?.display()
-        );
-        let proxy = format!(
-            "type=bind,src={},dst=/run/public-web,ro",
-            crate::sandbox_network::socket(&t)
-                .parent()
-                .unwrap()
-                .display()
-        );
-        let mut cmd = podman();
-        cmd.args([
-            "create",
-            "--name",
-            &t.name,
-            "--hostname",
-            "computer",
-            "--network=none",
-            "--security-opt=no-new-privileges",
-            "--pids-limit=512",
-            "--memory",
-            &format!("{memory_mb}m"),
-            "--cpus",
-            &cpus.to_string(),
-            "--shm-size=256m",
-            "--mount",
-            &mount,
-            "--label",
-            "io.chuggin.managed=true",
-            "--label",
-            &format!("io.chuggin.session={}", t.name),
-            "--env",
-            if internet {
-                "COMPUTER_INTERNET=1"
-            } else {
-                "COMPUTER_INTERNET=0"
-            },
-        ]);
-        cmd.args(["--mount", &proxy]);
-        cmd.arg(&tag);
-        checked(cmd.output()?)?;
+        create_instance(c, &t, &tag, None)?;
     }
     let instance = serde_json::from_slice::<Value>(&run(&["inspect", &t.name])?)?[0].clone();
     validate_instance(&t, &instance)?;
+    crate::managed_computers::verify_instance(&t.name, &instance)?;
     start_checked(c, &t)?;
     desktop::ensure(&t)?;
     start_desktop_services(&t)?;
@@ -725,7 +681,102 @@ pub fn prepare(c: &crate::runner::Config) -> Result<()> {
         &t.state.join("computer/ready.json"),
         &json!({"name":t.name,"image":instance["ImageName"].as_str().or(instance["Config"]["Image"].as_str()).unwrap_or(&tag),"storage":information["store"]["graphRoot"]}),
     )?;
+    crate::managed_computers::remember(c, &t.name, Some(&instance))?;
     register(c)
+}
+
+fn create_instance(
+    c: &crate::runner::Config,
+    t: &Target,
+    image: &str,
+    reconnect: Option<&str>,
+) -> Result<()> {
+    let Settings::Podman {
+        memory_mb,
+        cpus,
+        internet,
+    } = c.execution
+    else {
+        anyhow::bail!("Private computer is not selected")
+    };
+    let mount = format!(
+        "type=bind,src={},dst=/opt/session-runtime,ro",
+        fs::canonicalize(&t.runtime)?.display()
+    );
+    let proxy = format!(
+        "type=bind,src={},dst=/run/public-web,ro",
+        crate::sandbox_network::socket(t)
+            .parent()
+            .unwrap()
+            .display()
+    );
+    let mut cmd = podman();
+    cmd.args([
+        "create",
+        "--name",
+        &t.name,
+        "--hostname",
+        "computer",
+        "--network=none",
+        "--security-opt=no-new-privileges",
+        "--pids-limit=512",
+        "--memory",
+        &format!("{memory_mb}m"),
+        "--cpus",
+        &cpus.to_string(),
+        "--shm-size=256m",
+        "--mount",
+        &mount,
+        "--label",
+        "io.chuggin.managed=true",
+        "--label",
+        &format!("io.chuggin.session={}", t.name),
+        "--env",
+        if internet {
+            "COMPUTER_INTERNET=1"
+        } else {
+            "COMPUTER_INTERNET=0"
+        },
+    ]);
+    cmd.args(["--mount", &proxy]);
+    if let Some(transaction) = reconnect {
+        cmd.args(["--label", &format!("io.chuggin.reconnect={transaction}")]);
+    }
+    cmd.arg(image);
+    checked(cmd.output()?)?;
+    Ok(())
+}
+
+/// Called while the manager holds the moved project's ownership. Its global
+/// association is published only after this replacement passes normal checks.
+pub(crate) fn reconnect_prepare(
+    c: &crate::runner::Config,
+    name: &str,
+    image: &str,
+    transaction: &str,
+) -> Result<Value> {
+    let information = info()?;
+    c.execution.validate()?;
+    let t = Target {
+        name: name.into(),
+        state: c.state_dir.clone(),
+        runtime: c.state_dir.join("computer/tool-runtime"),
+        internet: matches!(c.execution, Settings::Podman { internet: true, .. }),
+    };
+    fs::create_dir_all(t.state.join("computer"))?;
+    stage_runtime(&t)?;
+    crate::sandbox_network::start(&t)?;
+    create_instance(c, &t, image, Some(transaction))?;
+    let instance = serde_json::from_slice::<Value>(&run(&["inspect", &t.name])?)?[0].clone();
+    validate_instance(&t, &instance)?;
+    start_checked(c, &t)?;
+    desktop::ensure(&t)?;
+    start_desktop_services(&t)?;
+    crate::setup::save(
+        &t.state.join("computer/ready.json"),
+        &json!({"name":t.name,"image":image,"storage":information["store"]["graphRoot"]}),
+    )?;
+    Ok(instance)
 }
 
 const COMPUTER_ASSETS: &[(&str, &str)] = &[
@@ -846,10 +897,9 @@ pub fn ready(c: &crate::runner::Config) -> Result<()> {
     if staged["version"] != env!("CARGO_PKG_VERSION") {
         stage_runtime(&t)?;
     }
-    validate_instance(
-        &t,
-        &serde_json::from_slice::<Value>(&run(&["inspect", &t.name])?)?[0],
-    )?;
+    let instance = serde_json::from_slice::<Value>(&run(&["inspect", &t.name])?)?[0].clone();
+    validate_instance(&t, &instance)?;
+    crate::managed_computers::remember(c, &t.name, Some(&instance))?;
     crate::sandbox_network::start(&t)?;
     start_checked(c, &t)?;
     if desktop::installed(&t) {

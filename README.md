@@ -226,6 +226,11 @@ Baseline is selected. `read_self_profile` and `update_self_profile` let the mode
 inspect and revise its own entries, with a reason and optional evidence. Stale
 writes are rejected and retries do not create duplicate revisions.
 
+Observation tab **8 Profile** shows the active profile, reasons and references
+for its latest change, and five recent revisions. It refreshes automatically
+without sending model requests. Scroll or search as in the other observation
+views; the full revision history remains available in Project settings.
+
 The profile is fallible model-authored data, kept separate from human directions
 and tool permissions. Its current snapshot is provided on startup and after a
 context handoff; updates append only when its revision changes, preserving the
@@ -313,6 +318,34 @@ not suspend its desktop or already-started applications. Use **Shut down private
 computer · keep its files** to stop it after finishing the loop and commands;
 resume/prepare starts it again. Conversation history and file-hash observations
 stay outside the container; these records are not backups of its contents.
+
+### Private-computer management
+
+The welcome screen reports private computers whose project folders or saved
+associations are missing. This is a notice: discovery never starts, stops or
+deletes a computer, and an unavailable Podman installation does not prevent
+ordinary Chuggin work. Open **Global settings → Private computers** to review all
+Chuggin-managed computers, including ones whose project folder was deleted.
+The same inventory is available under a private project's **Project tools**.
+
+For a moved project, choose **Reconnect moved project** and enter its new folder
+or `chuggin.json` path. Keep its `.chuggin` history with it. Reconnection preserves
+the private installation and files, repairs the saved paths, and backs up the
+affected configuration and state. The repair closes applications inside the
+computer; stop any Chuggin run using it first. Recovery copies are retained if
+the operation cannot complete. Reconnection does not start inference.
+
+**Delete private computer** requires a separate confirmation, with **Keep**
+selected by default. It permanently removes only the selected computer and its
+owned recovery snapshots; other computers and shared desktop images are kept.
+The project folder and conversation history remain. Resuming that project makes
+a new empty private computer and gives the model a one-time notice that its
+earlier file and application observations concern the deleted installation.
+
+Deleting a project folder through your file manager still does not delete its
+computer. Chuggin reports it for review on a later startup instead of destroying
+work when a folder might have been moved or temporarily unavailable.
+
 New installations reuse a desktop image identified by its embedded build assets;
 application-only updates do not rebuild that image. Existing installations receive
 missing desktop applications on their next idle setup/resume, using their current
