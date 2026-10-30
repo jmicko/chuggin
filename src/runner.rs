@@ -5444,7 +5444,10 @@ fn review_migration_file(path: &Path, file: &str) -> Result<()> {
     }
 }
 pub fn migration_ui(path: &Path) -> Result<bool> {
-    if !needs_migration(path)? {
+    let check = path.to_owned();
+    if !crate::ui::busy("Opening project · checking saved work", move || {
+        needs_migration(&check)
+    })? {
         return Ok(true);
     }
     migration_preview(path)?;

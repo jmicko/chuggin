@@ -147,6 +147,10 @@ pub fn home(stop: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
             match choice {
                 0 => {
                     if let Some(path) = project.as_ref() {
+                        crate::ui::loading(
+                            "Opening project",
+                            "Loading saved project settings and checking its saved work…",
+                        )?;
                         if !runner::migration_ui(path)? {
                             return Ok(());
                         }

@@ -3064,6 +3064,101 @@ mod terminal_ui {
             self.project_setting("Loop settings");
             self.choose(label);
         }
+        fn setup_next(&mut self, title: &str) {
+            self.wait(title);
+            // A field action can still be finishing its atomic draft write
+            // while its previous frame remains visible. Restore the first
+            // action before advancing, rather than assuming a redraw happened.
+            self.send(b"kkkkkkkk");
+            thread::sleep(Duration::from_millis(80));
+            self.choose("Next");
+        }
+        /// Accept the saved values on every ordinary preference page. Setup
+        /// must show these pages even when a shared model was already chosen.
+        fn setup_preferences(&mut self, chaos: bool, private: bool, helpers: bool) {
+            self.setup_preferences_with_options(chaos, private, helpers, false);
+        }
+        fn setup_preferences_with_options(
+            &mut self,
+            chaos: bool,
+            private: bool,
+            helpers: bool,
+            all: bool,
+        ) {
+            self.wait("Session mode");
+            self.choose(if chaos {
+                "No goals, only chaos"
+            } else {
+                "Work toward a goal"
+            });
+            self.setup_next("Session mode");
+            self.setup_next("Loop model");
+            if chaos {
+                self.wait("Computer environment");
+                self.choose(if private {
+                    "Private computer (Podman)"
+                } else {
+                    "This computer · direct access"
+                });
+                self.setup_next("Computer environment");
+                self.setup_next("Personality");
+            }
+            if all {
+                self.setup_preference_values(helpers);
+                self.setup_next("Additional options");
+                if !chaos {
+                    for title in ["Setup model", "Setup thinking", "Setup sampling"] {
+                        self.setup_next(title);
+                    }
+                }
+                for title in ["Chat model", "Chat thinking", "Chat sampling"] {
+                    self.setup_next(title);
+                }
+                if helpers {
+                    self.setup_next("Helper thinking");
+                    self.setup_next("Helper sampling");
+                }
+                if !chaos {
+                    self.setup_next("Goal completion");
+                }
+                for title in ["Command review", "Responses per cycle"] {
+                    self.setup_next(title);
+                }
+                if !chaos {
+                    self.setup_next("Cycle retry delay");
+                }
+                self.setup_next("Web tools");
+            } else {
+                self.setup_preference_defaults(helpers);
+            }
+        }
+        fn setup_preference_defaults(&mut self, helpers: bool) {
+            self.setup_preference_values(helpers);
+            self.wait("Additional options");
+            self.choose("Skip additional options");
+        }
+        fn setup_preference_values(&mut self, helpers: bool) {
+            for title in [
+                "Loop thinking",
+                "Loop sampling",
+                "Context window",
+                "Response limit",
+                "Investigation helpers",
+            ] {
+                self.setup_next(title);
+            }
+            if helpers {
+                self.setup_next("Helper model");
+                self.setup_next("Helper response allowance");
+            }
+            for title in ["Active hours", "Run duration", "Request timeout"] {
+                self.setup_next(title);
+            }
+        }
+        fn finish_setup_review(&mut self) {
+            self.wait("Review project setup");
+            self.choose("Finish setup");
+        }
         fn restored(&mut self) {
             self.exited(0);
         }
@@ -3093,7 +3188,11 @@ mod terminal_ui {
                     assert_eq!(status.code(), Some(code));
                     break;
                 }
-                assert!(std::time::Instant::now() < deadline);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "The terminal process did not exit:\n{}",
+                    self.parser.screen().contents()
+                );
                 thread::sleep(Duration::from_millis(20));
             }
             let mut term = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -4577,6 +4676,115 @@ mod terminal_ui {
         );
     }
     #[test]
+    fn setup_wizard_reviews_inherited_model_and_restores_changed_personality_after_save_and_exit() {
+        let server = Server::new(false, false);
+        *server.catalog.lock().unwrap() =
+            json!({"models":[{"name":"shared-model"},{"name":"project-model"}]});
+        let root = tempfile::tempdir().unwrap();
+        let settings = root.path().join(".chuggin/global/chuggin/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            json!({"model":"shared-model","ollama_url":server.url}).to_string(),
+        )
+        .unwrap();
+        let original_settings = fs::read(&settings).unwrap();
+        fs::write(root.path().join("material.txt"), "Original material\n").unwrap();
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Set up this project");
+        fs::write(root.path().join(".chuggin/test-gitconfig"), "").unwrap();
+        ui.send(b"\r");
+        ui.wait("Session mode");
+        ui.choose("No goals, only chaos");
+        ui.setup_next("Session mode");
+        ui.wait("Loop model");
+        ui.wait("shared-model");
+        ui.choose("Change");
+        ui.wait("Inference provider");
+        ui.send(b"\r");
+        ui.wait("Choose model for this project");
+        ui.wait("selectable only");
+        ui.send(b"/project-model\r");
+        ui.wait("1 models · selectable only");
+        ui.send(b"\r");
+        ui.wait("Loop model");
+        ui.wait("project-model");
+        ui.setup_next("Loop model");
+        ui.wait("Computer environment");
+        ui.choose("This computer · direct access");
+        ui.setup_next("Computer environment");
+        ui.wait("Personality");
+        ui.choose("Personality + interests/questions");
+        ui.setup_next("Personality");
+        ui.wait("Loop thinking");
+        ui.send(b"\x1b[D"); // Back to the previous page, retaining its value.
+        ui.wait("Personality");
+        ui.wait("Self-directed");
+        ui.choose("Editable personality");
+        ui.setup_next("Personality");
+        ui.wait("Loop thinking");
+        ui.choose("Save and exit");
+        ui.wait("Set up this project");
+        assert!(!root.path().join("chuggin.json").exists());
+        assert!(!root.path().join(".git").exists());
+        assert!(!root.path().join(".chuggin/state.json").exists());
+        assert!(server.requests.lock().unwrap().is_empty());
+        let draft: Value = serde_json::from_slice(
+            &fs::read(root.path().join(".chuggin/project-draft-settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(draft["model"], "project-model");
+        assert_eq!(draft["self_profile"], "personality");
+        assert_eq!(draft["execution"]["kind"], "host");
+        assert_eq!(fs::read(&settings).unwrap(), original_settings);
+        ui.send(b"q");
+        ui.restored();
+        drop(ui);
+
+        let mut ui = TerminalProcess::start(root.path());
+        ui.wait("Set up this project");
+        fs::write(root.path().join(".chuggin/test-gitconfig"), "").unwrap();
+        ui.send(b"\r");
+        ui.wait("Loop thinking"); // Resume this page, rather than restarting setup.
+        ui.setup_preference_defaults(false);
+        ui.wait("Review project setup");
+        ui.wait("project-model");
+        ui.send(b"\x1b[6~\x1b[6~");
+        ui.wait("Personality: Personality");
+        assert!(!root.path().join("chuggin.json").exists());
+        assert!(!root.path().join(".git").exists());
+        ui.finish_setup_review();
+        ui.wait("Setup complete");
+        ui.send(b"\r");
+        ui.wait("Start here");
+        ui.wait("Resume project");
+        ui.send(b"q");
+        ui.restored();
+        let config: Value =
+            serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
+        assert_eq!(config["model"], "project-model");
+        assert_eq!(config["self_profile"], "personality");
+        assert_eq!(config["execution"]["kind"], "host");
+        assert_eq!(config["activity_mode"], "type2");
+        assert!(config["checks"].as_array().unwrap().is_empty());
+        assert!(!root.path().join(".git").exists());
+        assert!(!root.path().join(".chuggin/state.json").exists());
+        assert!(!root.path().join(".chuggin/setup-wizard.json").exists());
+        assert!(
+            !root
+                .path()
+                .join(".chuggin/project-draft-settings.json")
+                .exists()
+        );
+        assert_eq!(fs::read(&settings).unwrap(), original_settings);
+        assert_eq!(
+            fs::read_to_string(root.path().join("material.txt")).unwrap(),
+            "Original material\n"
+        );
+        assert!(server.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn chaos_setup_skips_goal_and_validation_and_returns_home_without_inference() {
         let server = Server::new(false, false);
         let root = tempfile::tempdir().unwrap();
@@ -4597,13 +4805,10 @@ mod terminal_ui {
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Set up this project");
         ui.send(b"\r");
-        ui.wait("Choose a mode");
-        ui.wait("Work toward a goal");
-        ui.wait("No goals, only chaos");
-        ui.send(b"j\r");
-        ui.wait("Where should this session run?");
-        ui.wait("Private computer (Podman)");
-        ui.send(b"j\r");
+        ui.setup_preferences(true, false, false);
+        assert!(!root.path().join(".git").exists());
+        assert!(!root.path().join("chuggin.json").exists());
+        ui.finish_setup_review();
         ui.wait("Setup complete");
         ui.wait("Work has not started");
         assert!(!root.path().join(".chuggin/state.json").exists());
@@ -4676,11 +4881,20 @@ mod terminal_ui {
         let mut ui = TerminalProcess::start_with_environment(root.path(), &[("PATH", &path)]);
         ui.wait("Set up this project");
         ui.send(b"\r");
-        ui.wait("Private computer (Podman)");
-        ui.send(b"\r");
+        ui.setup_preferences(true, true, false);
+        assert!(!root.path().join("chuggin.json").exists());
+        assert!(
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .all(|line| line == "--remote=false --version")
+        );
+        ui.finish_setup_review();
         ui.wait("Podman not installed");
         ui.wait("Chuggin has installed nothing");
         ui.send(b"\x1b");
+        ui.wait("Project saved · computer setup pending");
+        ui.send(b"\r");
         ui.wait("Start here");
         ui.wait("Resume project");
         let config: Value =
@@ -5549,8 +5763,8 @@ mod terminal_ui {
         );
         ui.wait("Set up this project");
         ui.send(b"\r");
-        ui.wait("Private computer (Podman)");
-        ui.send(b"\r");
+        ui.setup_preferences(true, true, false);
+        ui.finish_setup_review();
         ui.wait("Copy install command to clipboard");
         ui.send(b"j\r");
         ui.wait("Copied to clipboard");
@@ -5587,6 +5801,8 @@ mod terminal_ui {
         ui.send(b"\r");
         ui.wait("Podman not installed");
         ui.send(b"\x1b");
+        ui.wait("Project saved · computer setup pending");
+        ui.send(b"\r");
         ui.wait("Start here");
         ui.wait("Resume project");
         ui.send(b"q");
@@ -5618,8 +5834,7 @@ mod terminal_ui {
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Set up this project");
         ui.send(b"\r");
-        ui.wait("Choose a mode");
-        ui.send(b"\r");
+        ui.setup_preferences(false, false, false);
         ui.wait("What are you working on today?");
         ui.send(b"\r");
         ui.wait("○ Software and version to recreate");
@@ -5651,8 +5866,7 @@ mod terminal_ui {
         ui.send(b"\r");
         ui.wait("Validation command");
         ui.send(b"git rev-parse HEAD\r");
-        ui.wait("First command review (seconds)");
-        ui.send(b"\r");
+        ui.finish_setup_review();
         ui.wait("Create the first commit?");
         ui.send(b"\r");
         ui.wait("Start here");
@@ -5702,16 +5916,8 @@ mod terminal_ui {
         // setup is a separate step and must not become context for the pitch.
         fs::write(root.path().join(".chuggin/test-gitconfig"), "").unwrap();
         ui.send(b"\r");
-        ui.wait("Choose a mode");
-        ui.send(b"\r");
-        ui.wait("Git author name");
-        ui.send(b"Project Operator\r");
-        ui.wait("Git author email");
-        let email_screen = ui.parser.screen().contents();
-        assert!(!email_screen.contains("Git author name"), "{email_screen}");
-        assert!(!email_screen.contains("user.name"), "{email_screen}");
-        assert!(server.requests.lock().unwrap().is_empty());
-        ui.send(b"project@example.com\r");
+        ui.setup_preferences(false, false, true);
+        assert!(!root.path().join(".git").exists());
         ui.wait("What are you working on today?");
         ui.send(b"jjjj\r");
         ui.wait("Work out a goal with AI");
@@ -5751,6 +5957,7 @@ mod terminal_ui {
         drop(ui);
         let mut ui = TerminalProcess::start(root.path());
         ui.wait("Set up this project");
+        fs::write(root.path().join(".chuggin/test-gitconfig"), "").unwrap();
         ui.send(b"\r");
         ui.wait("Continue saved setup");
         ui.send(b"\r");
@@ -5778,7 +5985,7 @@ mod terminal_ui {
         }
         ui.send(b"\r");
         ui.wait("Validation command");
-        ui.wait("Choose a check Chuggin can use");
+        ui.wait("Choose a real validation command");
         let validation_screen = ui.parser.screen().contents();
         for old in [
             "Build a useful editor.",
@@ -5791,20 +5998,27 @@ mod terminal_ui {
             );
         }
         ui.send(b"git rev-parse HEAD\r");
-        ui.wait("First command review (seconds)");
-        ui.wait("Choose when Chuggin first checks a running command");
-        let command_review_screen = ui.parser.screen().contents();
-        for old in [
-            "Choose a check Chuggin can use",
-            "Proposed project goal",
-            "Git author",
-        ] {
-            assert!(
-                !command_review_screen.contains(old),
-                "{old}: {command_review_screen}"
-            );
-        }
-        ui.send(b"\r");
+        ui.wait("Review project setup");
+        assert!(!root.path().join(".git").exists());
+        assert!(!root.path().join("chuggin.json").exists());
+        ui.choose("Back · change setup options");
+        // The default Next route visits the remaining project settings too.
+        ui.setup_preferences_with_options(false, false, true, true);
+        ui.wait("Review project setup");
+        assert_eq!(
+            server.requests.lock().unwrap().len(),
+            2,
+            "Revisiting preferences must not regenerate an accepted goal or replay its tools"
+        );
+        ui.finish_setup_review();
+        ui.wait("Git author name");
+        ui.send(b"Project Operator\r");
+        ui.wait("Git author email");
+        let email_screen = ui.parser.screen().contents();
+        assert!(!email_screen.contains("Git author name"), "{email_screen}");
+        assert!(!email_screen.contains("user.name"), "{email_screen}");
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        ui.send(b"project@example.com\r");
         ui.wait("Setup complete");
         let ready_at = std::time::Instant::now();
         ui.send(b"\r");
@@ -5817,7 +6031,19 @@ mod terminal_ui {
             serde_json::from_slice(&fs::read(root.path().join("chuggin.json")).unwrap()).unwrap();
         assert_eq!(config["goal"], "Build a useful editor. Draft 2.");
         for (key, value) in preferences.as_object().unwrap() {
-            assert_eq!(&config[key], value, "Setup lost preference {key}");
+            if key == "helpers" {
+                // Walking this typed option pins its implicit defaults too.
+                for (field, expected) in value.as_object().unwrap() {
+                    assert_eq!(
+                        &config[key][field], expected,
+                        "Setup lost helper preference {field}"
+                    );
+                }
+                assert_eq!(config[key]["reasoning"]["mode"], "default");
+                assert_eq!(config[key]["sampling"]["mode"], "legacy");
+            } else {
+                assert_eq!(&config[key], value, "Setup lost preference {key}");
+            }
         }
         assert_eq!(config["checks"][0]["timeout_seconds"], 300);
         assert!(!draft_path.exists());

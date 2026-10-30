@@ -816,6 +816,217 @@ pub fn select(title: &str, items: &[String], default: usize) -> Result<Option<us
         }
     }
 }
+
+struct WizardPage<'a> {
+    title: &'a str,
+    step: usize,
+    total: usize,
+    current: &'a str,
+    explanation: &'a str,
+    choices: &'a [String],
+}
+
+fn render_wizard_step(
+    frame: &mut Frame,
+    page: &WizardPage<'_>,
+    selected: &mut ListState,
+    offset: &mut u16,
+) {
+    base(frame);
+    let outer = frame.area().inner(Margin::new(2, 1));
+    let width = outer.width.min(100);
+    let height = outer.height.min(30);
+    let card = Rect::new(
+        outer.x + outer.width.saturating_sub(width) / 2,
+        outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let total = page.total.max(1);
+    let step = page.step.clamp(1, total);
+    let block = panel("CHUGGIN / Project setup").title(
+        Line::from(format!(" Step {step} of {total} "))
+            .right_aligned()
+            .fg(CYAN),
+    );
+    let inside = block.inner(card);
+    frame.render_widget(block, card);
+    // Every page keeps these same regions at a given terminal size. Changing a
+    // model, connection or long project path never shifts the action buttons.
+    let actions_height = if inside.height >= 24 { 8 } else { 6 };
+    let regions = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(2),
+        Constraint::Length(actions_height),
+        Constraint::Length(2),
+    ])
+    .split(inside);
+    frame.render_widget(p(clean(page.title)).fg(ACCENT).bold(), regions[0]);
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(Style::default().fg(ACCENT).bg(BG))
+            .ratio(step as f64 / total as f64)
+            .label(""),
+        regions[1],
+    );
+    let detail_width = regions[3].width.saturating_sub(4).max(1) as usize;
+    let mut details = Vec::new();
+    for (text, color) in [(page.current, CYAN), (page.explanation, FG)] {
+        if text.trim().is_empty() {
+            continue;
+        }
+        if !details.is_empty() {
+            details.push(Line::from(""));
+        }
+        for paragraph in clean(text).split('\n') {
+            if paragraph.is_empty() {
+                details.push(Line::from(""));
+            } else {
+                details.extend(
+                    textwrap::wrap(paragraph, detail_width)
+                        .into_iter()
+                        .map(|line| Line::from(line.into_owned()).fg(color)),
+                );
+            }
+        }
+    }
+    let max_offset = details
+        .len()
+        .saturating_sub(regions[3].height.saturating_sub(2) as usize);
+    *offset = (*offset).min(max_offset.min(u16::MAX as usize) as u16);
+    frame.render_widget(
+        Paragraph::new(details)
+            .scroll((*offset, 0))
+            .block(panel("Current selection · PgUp / PgDn details")),
+        regions[3],
+    );
+    let choice_width = regions[4].width.saturating_sub(7).max(1) as usize;
+    let choices = page.choices.iter().map(|choice| {
+        ListItem::new(Text::from(
+            textwrap::wrap(&clean(choice), choice_width)
+                .into_iter()
+                .map(|line| Line::from(line.into_owned()))
+                .collect::<Vec<_>>(),
+        ))
+    });
+    frame.render_stateful_widget(
+        List::new(choices)
+            .block(panel("Continue"))
+            .highlight_symbol(" › ")
+            .highlight_style(Style::default().fg(ACCENT).bg(Color::Rgb(47, 42, 70))),
+        regions[4],
+        selected,
+    );
+    frame.render_widget(
+        p("↑ ↓ select · Enter choose · ← Back\nPgUp/PgDn details · Esc save and exit").fg(MUTED),
+        regions[5],
+    );
+}
+
+/// One page of the guided setup flow. The caller owns the choices and saves its
+/// draft when this returns None; no project setting is changed by the renderer.
+pub fn wizard_step(
+    title: &str,
+    step: usize,
+    total: usize,
+    current: &str,
+    explanation: &str,
+    choices: &[String],
+    selected: usize,
+) -> Result<Option<usize>> {
+    anyhow::ensure!(!choices.is_empty(), "Setup page needs at least one action");
+    let total = total.max(1);
+    let step = step.clamp(1, total);
+    let mut index = selected.min(choices.len() - 1);
+    if !active() {
+        clear_notes();
+        notice(format!(
+            "Step {step} of {total}\n{current}\n\n{explanation}"
+        ));
+        return crate::menu::select(title, choices, index);
+    }
+    let page = WizardPage {
+        title,
+        step,
+        total,
+        current,
+        explanation,
+        choices,
+    };
+    let mut state = ListState::default().with_selected(Some(index));
+    let mut offset = 0;
+    loop {
+        state.select(Some(index));
+        draw(|frame| render_wizard_step(frame, &page, &mut state, &mut offset))?;
+        if let Some(event) = input()? {
+            if let Input::Mouse(mouse) = &event {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => offset = offset.saturating_sub(3),
+                    MouseEventKind::ScrollDown => offset = offset.saturating_add(3),
+                    _ => {}
+                }
+            }
+            if let Some(key) = pressed(&event) {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => index = index.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        index = (index + 1).min(choices.len() - 1)
+                    }
+                    KeyCode::PageUp => offset = offset.saturating_sub(5),
+                    KeyCode::PageDown => offset = offset.saturating_add(5),
+                    KeyCode::Enter => return Ok(Some(index)),
+                    KeyCode::Left => {
+                        if let Some(back) = choices.iter().position(|choice| {
+                            clean(choice).trim().to_lowercase().starts_with("back")
+                        }) {
+                            return Ok(Some(back));
+                        }
+                    }
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    _ if cancelled(key) => return Ok(None),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn render_loading(frame: &mut Frame, title: &str, detail: &str) {
+    base(frame);
+    let outer = frame.area().inner(Margin::new(3, 1));
+    let width = outer.width.min(96);
+    let height = outer.height.min(12);
+    let card = Rect::new(
+        outer.x + outer.width.saturating_sub(width) / 2,
+        outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let block = panel("CHUGGIN / Please wait");
+    let inside = block.inner(card);
+    frame.render_widget(block, card);
+    let regions = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(inside);
+    frame.render_widget(
+        p(format!("◐ {}", clean(title))).fg(ACCENT).bold(),
+        regions[0],
+    );
+    frame.render_widget(p(clean(detail)).fg(FG), regions[1]);
+}
+
+/// Flush an acknowledgement before doing work that may block the UI thread.
+/// Longer operations can follow this with busy() for an animated progress view.
+pub fn loading(title: &str, detail: &str) -> Result<()> {
+    if !active() {
+        notice(format!("{title}\n{detail}"));
+        return Ok(());
+    }
+    draw(|frame| render_loading(frame, title, detail))
+}
+
 struct Editor {
     value: String,
     cursor: usize,
@@ -2847,16 +3058,34 @@ fn dashboard_session(
     start: bool,
     initial_tab: usize,
 ) -> Result<bool> {
+    loading(
+        "Opening project",
+        "Checking the project and preparing its environment…",
+    )?;
     if (start || initial_tab == 5) && !crate::setup::ensure_computer_interactive(path)? {
         return Ok(false);
     }
-    let mut config = runner::load(path)?;
+    let config_path = path.to_owned();
+    let mut config = busy("Loading project settings", move || {
+        runner::load(&config_path)
+    })?;
     // Identity setup can prompt, so complete it on the thread that owns the terminal.
     if !config.activity_mode.is_chaos() {
         crate::setup::ensure_git_identity(&config.repo)?;
     }
+    loading(
+        "Connecting to project",
+        "Opening its background controller. Saved work is retained.",
+    )?;
     let client = crate::engine::Client::connect_interactive(path)?;
-    let mut d = Dashboard::new(&config);
+    loading(
+        "Restoring saved conversation",
+        "Loading the last session's output and progress…",
+    )?;
+    let dashboard_config = config.clone();
+    let mut d = busy("Restoring saved conversation", move || {
+        Ok(Dashboard::new(&dashboard_config))
+    })?;
     if start {
         resume_client(&client)?;
     }
@@ -3994,6 +4223,157 @@ mod tests {
         e.key(KeyCode::End);
         e.insert("\nworld");
         assert_eq!(e.value, "héllo\nworld");
+    }
+    #[test]
+    fn wizard_pages_keep_progress_actions_and_current_selection_visible() {
+        let choices = ["Next", "Change model…", "Back", "Save and exit"].map(str::to_owned);
+        for (width, height) in [(110, 36), (80, 24), (46, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut selected = ListState::default().with_selected(Some(0));
+            let mut offset = 0;
+            let mut page = WizardPage {
+                title: "Choose the main model",
+                step: 3,
+                total: 8,
+                current: "Main model: Local machine · 35b",
+                explanation: "This model continues the project between checkpoints. Choose Next to keep the current selection, or Change model to choose another provider and model.",
+                choices: &choices,
+            };
+            terminal
+                .draw(|frame| render_wizard_step(frame, &page, &mut selected, &mut offset))
+                .unwrap();
+            let text = screen_text(&terminal);
+            for label in [
+                "Step 3 of 8",
+                "Choose the main model",
+                "Current selection",
+                "Main model:",
+                "Next",
+                "Change model…",
+                "Back",
+                "Save and exit",
+            ] {
+                assert!(
+                    text.contains(label),
+                    "Missing {label} at {width}×{height}: {text}"
+                );
+            }
+            let filled = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .filter(|cell| cell.symbol() == "█" && cell.fg == ACCENT)
+                .count();
+            assert!(filled > 0, "Progress bar should have a filled segment");
+            let next_position = text.lines().position(|line| line.contains("› Next"));
+            let borders = |terminal: &Terminal<TestBackend>| {
+                let buffer = terminal.backend().buffer();
+                (0..buffer.area.height)
+                    .flat_map(|y| {
+                        (0..buffer.area.width).filter_map(move |x| {
+                            let symbol = buffer[(x, y)].symbol();
+                            matches!(symbol, "╭" | "╮" | "╰" | "╯" | "─" | "│").then_some((
+                                x,
+                                y,
+                                symbol.to_owned(),
+                            ))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let outline = borders(&terminal);
+            page.step = 8;
+            page.current = "Provider: Custom connection\nModel: a/model/with/a/long/name\nProject: /some/project/whose/path/needs/wrapping";
+            page.explanation = "Ready to save.";
+            terminal
+                .draw(|frame| render_wizard_step(frame, &page, &mut selected, &mut offset))
+                .unwrap();
+            assert_eq!(
+                borders(&terminal),
+                outline,
+                "Wizard pages must keep fixed geometry"
+            );
+            let text = screen_text(&terminal);
+            assert!(text.contains("Step 8 of 8"));
+            assert_eq!(
+                text.lines().position(|line| line.contains("› Next")),
+                next_position
+            );
+            let completed = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .filter(|cell| cell.symbol() == "█" && cell.fg == ACCENT)
+                .count();
+            assert!(
+                completed > filled,
+                "Progress should advance at the last page"
+            );
+        }
+    }
+    #[test]
+    fn wizard_details_scroll_without_moving_actions_and_tiny_windows_are_safe() {
+        let choices = ["Next", "Back", "Save and exit"].map(str::to_owned);
+        let explanation = (0..60)
+            .map(|line| format!("Detail line {line} — 🙂"))
+            .chain(std::iter::once("Last detail marker".into()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let page = WizardPage {
+            title: "Review your setup",
+            step: 8,
+            total: 8,
+            current: "Goal: a longer plan",
+            explanation: &explanation,
+            choices: &choices,
+        };
+        for (width, height) in [(110, 36), (80, 24), (46, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut selected = ListState::default().with_selected(Some(1));
+            let mut offset = u16::MAX;
+            terminal
+                .draw(|frame| render_wizard_step(frame, &page, &mut selected, &mut offset))
+                .unwrap();
+            assert!(offset > 0 && offset < u16::MAX);
+            let text = screen_text(&terminal);
+            assert!(text.contains("Last detail marker"), "{text}");
+            assert!(text.contains("› Back"), "{text}");
+            offset = 0;
+            terminal
+                .draw(|frame| render_wizard_step(frame, &page, &mut selected, &mut offset))
+                .unwrap();
+            assert!(screen_text(&terminal).contains("Goal: a longer plan"));
+        }
+        for (width, height) in [(24, 8), (10, 4), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_wizard_step(frame, &page, &mut ListState::default(), &mut 0))
+                .unwrap();
+        }
+    }
+    #[test]
+    fn loading_acknowledgement_is_visible_without_events_or_input() {
+        for (width, height) in [(110, 36), (80, 24), (46, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_loading(
+                        frame,
+                        "Opening project",
+                        "Checking saved work and preparing the environment…",
+                    )
+                })
+                .unwrap();
+            let text = screen_text(&terminal);
+            for label in ["◐", "Opening project", "Checking saved work", "Please wait"] {
+                assert!(
+                    text.contains(label),
+                    "Missing {label} at {width}×{height}: {text}"
+                );
+            }
+        }
     }
     fn config() -> runner::Config {
         runner::Config {self_profile:crate::self_profile::Variant::Baseline,execution:crate::sandbox::Settings::default(),activity_mode:crate::activity::Mode::Goal,sampling:crate::sampling::Settings::default(),setup_sampling:crate::sampling::Settings::default(),chat_sampling:crate::sampling::Settings::default(),reasoning:crate::reasoning::Setting::Default,setup_model:String::new(),setup_reasoning:crate::reasoning::Setting::Default,chat_reasoning:crate::reasoning::Setting::Default,helpers:crate::agents::Settings::default(),chat_model:String::new(),active_hours: crate::schedule::Schedule::Always,repo:"/projects/example-editor".into(),goal:"Build a complete word processor with a document model, editing, layout and reliable persistence.".into(),ollama_url:"http://localhost:11434".into(),model:"example-model:latest".into(),context_tokens:128000,output_tokens:8192,implementation_calls:48,checks:vec![],state_dir:"/nonexistent/chuggin-ui-tests".into(),retry_seconds:10,run_duration_seconds:0,allow_goal_completion:false,request_timeout_seconds:1800,command_review_seconds:120}

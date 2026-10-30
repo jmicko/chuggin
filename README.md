@@ -37,9 +37,28 @@ cd your-project
 chuggin
 ~~~
 
-The arrow-key menu highlights **Set up this project** or **Resume project**.
-Model selection, Settings, the accepted goal, Progress, and Quit are also in
-the menu. No flags are needed for everyday use.
+The arrow-key menu highlights **Set up this project** or **Resume project**,
+alongside **Project settings**, **Global settings**, and **Quit**. No flags are
+needed for everyday use.
+
+First-time setup walks through project choices one page at a time: mode, loop
+model, computer and personality for unassigned sessions, thinking, sampling,
+context, response allowance, helpers, schedule, run duration and request timeout.
+The loop model is always shown, even when a shared default is already selected.
+**Next** accepts the displayed choice; **Back** revisits an earlier page.
+**Next** continues through all remaining applicable settings, including separate
+setup/chat models, their thinking and sampling, helper controls, goal completion
+and command budgets. **Additional options → Skip additional options** accepts
+their defaults for a shorter walkthrough.
+
+Use **Save and exit**, **Esc**, or **Ctrl+S** to leave a saved draft. Starting setup
+again resumes at that page. Accepted goals and validation commands survive going
+back to change options. A final review precedes project creation, Git setup and
+private-computer preparation. The three-second success screen can be skipped
+with **Enter**; work begins when you choose **Resume project**.
+
+Resume immediately shows a loading screen while Chuggin checks the environment,
+opens its controller and restores saved output.
 
 ## Full-screen observation
 
@@ -49,6 +68,7 @@ The dashboard shows the current task and stage, model output as it arrives,
 tool actions, check output, recovery messages, and recent outcomes.
 
 - **1–7 / Tab:** switch between live activity, model output, checks, the goal, local settings, the assistant, and messages.
+- **8 Profile:** view the active self-profile in unassigned sessions.
 - **M:** open direct messages with the looping model. The status row shows new messages and your availability.
 - **Arrow keys / mouse wheel / Page Up / Page Down:** scroll without pausing work.
   Scrolling back to the bottom automatically resumes following live output.

@@ -1,4 +1,6 @@
 use crate::{model::Model, project, runner};
+mod finish;
+mod wizard;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -85,6 +87,8 @@ const DRAFT_SETTING_FIELDS: &[&str] = &[
     "ollama_url",
     "context_tokens",
     "output_tokens",
+    "implementation_calls",
+    "retry_seconds",
     "request_timeout_seconds",
     "run_duration_seconds",
     "allow_goal_completion",
@@ -854,157 +858,232 @@ pub fn ensure_computer_interactive(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-pub fn wizard() -> Result<PathBuf> {
+pub fn wizard() -> Result<Option<PathBuf>> {
     let root = std::env::current_dir()?;
     let config = root.join("chuggin.json");
     anyhow::ensure!(
         !config.exists(),
         "Project already configured; run chuggin to resume."
     );
-    if io::stdin().is_terminal() && draft_settings(&root)?.get("activity_mode").is_none() {
-        choose_activity_mode(None)?;
-    }
-    if draft_config(&root)?.activity_mode.is_chaos()
-        && draft_settings(&root)?.get("execution").is_none()
-    {
-        computer_environment(None)?;
-        anyhow::ensure!(
-            draft_settings(&root)?.get("execution").is_some(),
-            "Setup cancelled; choose a computer environment before continuing"
-        );
-    }
-    if !draft_config(&root)?.activity_mode.is_chaos() {
-        ensure_git_identity(&root)?;
-    }
-    if draft_config(&root)?.model.trim().is_empty() {
-        if io::stdin().is_terminal() {
-            choose_project_model(None)?;
-        } else {
-            configure(false)?;
+    let interactive = io::stdin().is_terminal();
+    let (goal, check, timeout, chaos) = 'preferences: loop {
+        if interactive && !wizard::configure(&root)? {
+            return Ok(None);
         }
-    }
-    let mut s = draft_config(&root)?;
-    let chaos = s.activity_mode.is_chaos();
-    if chaos
-        && draft_settings(&root)?.get("sampling").is_none()
-        && matches!(s.sampling, crate::sampling::Settings::Legacy)
-    {
-        save_draft_patch(&root, json!({"sampling":chaos_sampling_default(&s)}))?;
-        s = draft_config(&root)?;
-    }
-    let goal = if chaos {
-        String::new()
-    } else if io::stdin().is_terminal() {
-        crate::goal_setup::choose_goal(&root, &s)?
-    } else {
-        let setup_model = if s.setup_model.is_empty() {
-            &s.model
-        } else {
-            &s.setup_model
-        };
-        crate::ui::clear_notes();
-        crate::ui::notice(format!(
-            "Give a short description of this project: what you want to accomplish, any important requirements, and what a successful result would look like. Chuggin will draft a goal for you to review before work starts.\n\nProject: {}\nGoal drafting model: {} on {} (change Setup model in More project settings).",
-            root.display(),
-            crate::model_picker::display_model(setup_model),
-            crate::cloud::label(&s.ollama_url, setup_model)
-        ));
-        let draft_path = root.join(".chuggin/goal-draft.json");
-        let mut draft = if draft_path.exists() {
-            crate::ui::notice("Resuming your unfinished goal draft.".to_string());
-            serde_json::from_slice::<Draft>(&fs::read(&draft_path)?)?
-        } else {
-            Draft {
-                pitch: ask("Describe what you want to build", "")?,
-                goal: String::new(),
-                feedback: String::new(),
+        if draft_config(&root)?.activity_mode.is_chaos()
+            && draft_settings(&root)?.get("execution").is_none()
+        {
+            computer_environment(None)?;
+            anyhow::ensure!(
+                draft_settings(&root)?.get("execution").is_some(),
+                "Setup cancelled; choose a computer environment before continuing"
+            );
+        }
+        if !interactive && !draft_config(&root)?.activity_mode.is_chaos() {
+            ensure_git_identity(&root)?;
+        }
+        if draft_config(&root)?.model.trim().is_empty() {
+            if io::stdin().is_terminal() {
+                choose_project_model(None)?;
+            } else {
+                configure(false)?;
             }
+        }
+        let mut s = draft_config(&root)?;
+        let chaos = s.activity_mode.is_chaos();
+        if chaos
+            && draft_settings(&root)?.get("sampling").is_none()
+            && matches!(s.sampling, crate::sampling::Settings::Legacy)
+        {
+            save_draft_patch(&root, json!({"sampling":chaos_sampling_default(&s)}))?;
+            s = draft_config(&root)?;
+        }
+        let mut content = if interactive {
+            finish::Content::load(&root)?
+        } else {
+            finish::Content::default()
         };
-        save(&draft_path, &draft)?;
-        loop {
-            if draft.goal.is_empty() || !draft.feedback.is_empty() {
-                crate::ui::clear_notes();
-                crate::ui::notice("Drafting your project goal…".to_string());
-                let current = draft_config(&root)?;
-                let setup_model = if current.setup_model.is_empty() {
-                    &current.model
-                } else {
-                    &current.setup_model
-                };
-                let mut model = Model::new(
-                    &current.ollama_url,
-                    setup_model,
-                    current.context_tokens,
-                    current.output_tokens,
-                    Arc::new(AtomicBool::new(false)),
-                )?;
-                model.set_reasoning(current.setup_reasoning.clone());
-                model.set_sampling(current.setup_sampling.clone());
-                model.set_request_timeout(current.request_timeout_seconds);
-                let input = json!({"pitch":draft.pitch,"current_draft":draft.goal,"requested_changes":draft.feedback});
-                let result = crate::ui::busy("Drafting your project goal", move || {
-                    model.structured::<GoalReply>(
-                    "Help define a project goal for software, documents, data, or other artifacts as appropriate to the user’s pitch. Return JSON {goal: string}. Expand the user's pitch into a clear goal with concrete capabilities, quality expectations, constraints, and observable success criteria. Preserve the user's ambition and explicit version/feature targets; do not silently narrow them to an MVP. Do not invent user requirements: label assumptions and leave genuinely unspecified choices flexible. Incorporate requested revisions. Keep under 700 words. This is goal drafting only, not implementation.",
-                    input)
-                });
-                match result {
-                    Ok(value) if !value.goal.trim().is_empty() && value.goal.len() <= 12000 => {
-                        draft.goal = value.goal;
-                        draft.feedback.clear();
-                        save(&draft_path, &draft)?;
-                    }
-                    Ok(_) => {
-                        draft_recovery(&root, "The reply did not contain a usable project goal.")?;
-                        continue;
-                    }
-                    Err(e) => {
-                        draft_recovery(&root, &format!("{e:#}"))?;
-                        continue;
-                    }
-                }
+        let mut goal = if chaos {
+            String::new()
+        } else if interactive {
+            match content.goal.clone() {
+                Some(goal) => goal,
+                None => crate::goal_setup::choose_goal(&root, &s)?,
             }
+        } else {
+            let setup_model = if s.setup_model.is_empty() {
+                &s.model
+            } else {
+                &s.setup_model
+            };
             crate::ui::clear_notes();
             crate::ui::notice(format!(
-                "Proposed project goal\n\n{}\n\nAccept this goal, request changes, or return to the menu with the draft saved. Work starts when you later select Resume project.",
-                draft.goal
+                "Give a short description of this project: what you want to accomplish, any important requirements, and what a successful result would look like. Chuggin will draft a goal for you to review before work starts.\n\nProject: {}\nGoal drafting model: {} on {} (change Setup model in More project settings).",
+                root.display(),
+                crate::model_picker::display_model(setup_model),
+                crate::cloud::label(&s.ollama_url, setup_model)
             ));
-            let action = ask("Type accept, or describe the changes you want", "")?;
-            if action.eq_ignore_ascii_case("accept") {
-                break;
-            }
-            draft.feedback = action;
-            save(&draft_path, &draft)?;
-        }
-        draft.goal
-    };
-    let (check, timeout) = if chaos {
-        (Vec::new(), s.command_review_seconds as u32)
-    } else {
-        crate::ui::clear_notes();
-        crate::ui::notice("Choose a check Chuggin can use to guide refinement. All work is saved even when checks fail.\nChoose validation appropriate to this project: tests, a document linter, a data checker, or your own validation script.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
-        let check = loop {
-            let default_check = if root.join("Cargo.toml").is_file() {
-                "cargo test"
+            let draft_path = root.join(".chuggin/goal-draft.json");
+            let mut draft = if draft_path.exists() {
+                crate::ui::notice("Resuming your unfinished goal draft.".to_string());
+                serde_json::from_slice::<Draft>(&fs::read(&draft_path)?)?
             } else {
-                ""
+                Draft {
+                    pitch: ask("Describe what you want to build", "")?,
+                    goal: String::new(),
+                    feedback: String::new(),
+                }
             };
-            let text = ask("Validation command", default_check)?;
-            match shell_words::split(&text) {
-                Ok(argv) if !argv.is_empty() => break argv,
-                _ => crate::ui::notice("Enter a valid command with balanced quotes.".to_string()),
+            save(&draft_path, &draft)?;
+            loop {
+                if draft.goal.is_empty() || !draft.feedback.is_empty() {
+                    crate::ui::clear_notes();
+                    crate::ui::notice("Drafting your project goal…".to_string());
+                    let current = draft_config(&root)?;
+                    let setup_model = if current.setup_model.is_empty() {
+                        &current.model
+                    } else {
+                        &current.setup_model
+                    };
+                    let mut model = Model::new(
+                        &current.ollama_url,
+                        setup_model,
+                        current.context_tokens,
+                        current.output_tokens,
+                        Arc::new(AtomicBool::new(false)),
+                    )?;
+                    model.set_reasoning(current.setup_reasoning.clone());
+                    model.set_sampling(current.setup_sampling.clone());
+                    model.set_request_timeout(current.request_timeout_seconds);
+                    let input = json!({"pitch":draft.pitch,"current_draft":draft.goal,"requested_changes":draft.feedback});
+                    let result = crate::ui::busy("Drafting your project goal", move || {
+                        model.structured::<GoalReply>(
+                    "Help define a project goal for software, documents, data, or other artifacts as appropriate to the user’s pitch. Return JSON {goal: string}. Expand the user's pitch into a clear goal with concrete capabilities, quality expectations, constraints, and observable success criteria. Preserve the user's ambition and explicit version/feature targets; do not silently narrow them to an MVP. Do not invent user requirements: label assumptions and leave genuinely unspecified choices flexible. Incorporate requested revisions. Keep under 700 words. This is goal drafting only, not implementation.",
+                    input)
+                    });
+                    match result {
+                        Ok(value) if !value.goal.trim().is_empty() && value.goal.len() <= 12000 => {
+                            draft.goal = value.goal;
+                            draft.feedback.clear();
+                            save(&draft_path, &draft)?;
+                        }
+                        Ok(_) => {
+                            draft_recovery(
+                                &root,
+                                "The reply did not contain a usable project goal.",
+                            )?;
+                            continue;
+                        }
+                        Err(e) => {
+                            draft_recovery(&root, &format!("{e:#}"))?;
+                            continue;
+                        }
+                    }
+                }
+                crate::ui::clear_notes();
+                crate::ui::notice(format!(
+                    "Proposed project goal\n\n{}\n\nAccept this goal, request changes, or return to the menu with the draft saved. Work starts when you later select Resume project.",
+                    draft.goal
+                ));
+                let action = ask("Type accept, or describe the changes you want", "")?;
+                if action.eq_ignore_ascii_case("accept") {
+                    break;
+                }
+                draft.feedback = action;
+                save(&draft_path, &draft)?;
             }
+            draft.goal
         };
-        crate::ui::clear_notes();
-        crate::ui::notice("Choose when Chuggin first checks a running command, in seconds. This sets the first review point for commands and validation checks; the watchdog can inspect work that takes longer.".into());
-        let timeout = number(
-            "First command review (seconds)",
-            draft_config(&root)?.command_review_seconds as u32,
-            1,
-            86400,
-        )?;
-        (check, timeout)
+        if interactive && !chaos {
+            content.goal = Some(goal.clone());
+            content.save(&root)?;
+        }
+        let (mut check, timeout) = if chaos {
+            (Vec::new(), s.command_review_seconds as u32)
+        } else if interactive {
+            let command = match content.validation.clone() {
+                Some(command) => command,
+                None => finish::validation(&root, &[])?,
+            };
+            (command, s.command_review_seconds as u32)
+        } else {
+            crate::ui::clear_notes();
+            crate::ui::notice("Choose a check Chuggin can use to guide refinement. All work is saved even when checks fail.\nChoose validation appropriate to this project: tests, a document linter, a data checker, or your own validation script.\nCommands support quoted arguments; shell operators are not interpreted.".to_string());
+            let check = loop {
+                let default_check = if root.join("Cargo.toml").is_file() {
+                    "cargo test"
+                } else {
+                    ""
+                };
+                let text = ask("Validation command", default_check)?;
+                match shell_words::split(&text) {
+                    Ok(argv) if !argv.is_empty() => break argv,
+                    _ => {
+                        crate::ui::notice("Enter a valid command with balanced quotes.".to_string())
+                    }
+                }
+            };
+            crate::ui::clear_notes();
+            crate::ui::notice("Choose when Chuggin first checks a running command, in seconds. This sets the first review point for commands and validation checks; the watchdog can inspect work that takes longer.".into());
+            let timeout = number(
+                "First command review (seconds)",
+                draft_config(&root)?.command_review_seconds as u32,
+                1,
+                86400,
+            )?;
+            (check, timeout)
+        };
+        if interactive {
+            if !chaos {
+                content.validation = Some(check.clone());
+                content.save(&root)?;
+            }
+            loop {
+                let current = draft_config(&root)?;
+                match finish::review(&root, &current, &goal, &check)? {
+                    finish::Action::Finish => {
+                        break 'preferences (
+                            goal,
+                            check,
+                            current.command_review_seconds as u32,
+                            chaos,
+                        );
+                    }
+                    finish::Action::Options => {
+                        wizard::clear_progress(&root)?;
+                        continue 'preferences;
+                    }
+                    finish::Action::Goal => {
+                        goal = crate::goal_setup::choose_goal(&root, &current)?;
+                        content.goal = Some(goal.clone());
+                        content.save(&root)?;
+                    }
+                    finish::Action::Validation => {
+                        check = finish::validation(&root, &check)?;
+                        content.validation = Some(check.clone());
+                        content.save(&root)?;
+                    }
+                    finish::Action::Exit => return Ok(None),
+                }
+            }
+        }
+        break (goal, check, timeout, chaos);
     };
+    let preferences = draft_config(&root)?;
+    let accepted = finish::configuration(
+        &preferences,
+        &goal,
+        &check,
+        timeout,
+        &draft_settings(&root)?,
+        interactive,
+    )?;
+    // Validate the proposed configuration before Git changes or a runnable file.
+    runner::load_value(&config, &accepted)?;
     if !chaos {
+        if interactive {
+            ensure_git_identity(&root)?;
+        }
         // Do not accidentally initialize or commit an ancestor repository.
         let top = project::git(&root, &["rev-parse", "--show-toplevel"]).ok();
         if let Some(top) = top {
@@ -1097,21 +1176,6 @@ pub fn wizard() -> Result<PathBuf> {
             crate::ui::notice("Created the first commit.".to_string());
         }
     }
-    let preferences = draft_config(&root)?;
-    let mut accepted = json!({"repo":".","goal":goal,"state_dir":".chuggin","helpers":preferences.helpers,"active_hours":{"mode":"shared"},
-        "activity_mode":preferences.activity_mode,"execution":preferences.execution,"self_profile":preferences.self_profile,
-        "sampling":preferences.sampling,"setup_sampling":preferences.setup_sampling,"chat_sampling":preferences.chat_sampling,
-        "model":preferences.model,"setup_model":preferences.setup_model,
-        "reasoning":preferences.reasoning,"setup_reasoning":preferences.setup_reasoning,"chat_reasoning":preferences.chat_reasoning,
-        "command_review_seconds":timeout,"checks":if chaos {json!([])} else {json!([{"argv":check,"timeout_seconds":timeout}])}});
-    for (key, value) in draft_settings(&root)?.as_object().unwrap() {
-        accepted[key] = value.clone();
-    }
-    // The validation prompt is the final choice for the command review interval.
-    accepted["command_review_seconds"] = json!(timeout);
-    if chaos {
-        accepted["allow_goal_completion"] = json!(false);
-    }
     save(&config, &accepted)?;
     // Check merged project/global settings before starting.
     runner::load(&config)?;
@@ -1119,8 +1183,20 @@ pub fn wizard() -> Result<PathBuf> {
     if preferences.exists() {
         fs::remove_file(preferences)?;
     }
+    wizard::clear_progress(&root)?;
+    finish::clear(&root)?;
+    if interactive
+        && runner::load(&config)?.execution.is_private()
+        && !prepare_computer_interactive(Some(&config))?
+    {
+        crate::ui::show(
+            "Project saved · computer setup pending",
+            "Your choices are saved. The private computer is not ready yet. Choose Resume project when ready to continue its setup; no inference has started.",
+        )?;
+        return Ok(Some(config));
+    }
     crate::ui::setup_complete(&root.display().to_string())?;
-    Ok(config)
+    Ok(Some(config))
 }
 
 fn available_models(s: &Settings) -> Result<Vec<String>> {
